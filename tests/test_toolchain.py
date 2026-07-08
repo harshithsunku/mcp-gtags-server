@@ -105,9 +105,20 @@ def test_patch_embedded_prefix(tmp_path):
 
 def test_patch_embedded_prefix_rejects_longer_path(tmp_path):
     binary = tmp_path / "fake.so"
-    binary.write_bytes(b"x")
+    binary.write_bytes(b"\0/short\0")
     with pytest.raises(toolchain.SetupError):
         toolchain._patch_embedded_prefix(binary, "/short", "/much-longer-prefix")
+
+
+def test_patch_embedded_prefix_text_script(tmp_path):
+    """Shell scripts in bin/ have no NUL bytes — plain replacement, any length."""
+    old = toolchain.PLACEHOLDER_PREFIX
+    script = tmp_path / "globash"
+    script.write_text(f"#!/bin/sh\nGTAGSHOME={old}/share\nexec {old}/bin/global \"$@\"\n")
+    toolchain._patch_embedded_prefix(script, old, "/home/u/.gtags-mcp")
+    text = script.read_text()
+    assert old not in text
+    assert "/home/u/.gtags-mcp/bin/global" in text
 
 
 def test_download_checksum_mismatch(tmp_path, monkeypatch):

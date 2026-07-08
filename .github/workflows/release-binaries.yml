@@ -62,7 +62,7 @@ jobs:
           sudo mkdir -p "$PREFIX"
           sudo chown "$(id -u)" "$PREFIX"
           cd "global-${{ steps.ver.outputs.version }}"
-          ./configure --prefix="$PREFIX" --disable-gtagscscope
+          ./configure --prefix="$PREFIX" --disable-gtagscscope --with-included-ltdl
           make -j"$(getconf _NPROCESSORS_ONLN)"
           make install
           echo "PREFIX=$PREFIX" >> "$GITHUB_ENV"

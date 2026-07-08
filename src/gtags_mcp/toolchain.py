@@ -256,21 +256,38 @@ PLACEHOLDER_PREFIX = "/opt/gtags-mcp-placeholder-prefix" + "_" * 167
 
 
 def _patch_embedded_prefix(binary: Path, old_prefix: str, new_prefix: str) -> None:
-    """Rewrite NUL-terminated *old_prefix* paths inside a compiled binary."""
-    if len(new_prefix) > len(old_prefix):
-        raise SetupError(
-            f"cannot relocate {binary.name}: {new_prefix} is longer than the "
-            "placeholder prefix"
-        )
+    """Rewrite *old_prefix* paths inside an installed file.
+
+    Text files (shell/perl helper scripts) get a plain replacement. Compiled
+    binaries get conda-style patching: each NUL-terminated string is rewritten
+    in place and padded with NULs so offsets never shift — which requires the
+    new prefix to be no longer than the placeholder.
+    """
+    if not binary.is_file() or binary.is_symlink():
+        return
     data = binary.read_bytes()
     old = old_prefix.encode()
     if old not in data:
         return
     new = new_prefix.encode()
+    if b"\0" not in data:
+        # Text script: lengths may change freely.
+        binary.write_bytes(data.replace(old, new))
+        return
+    if len(new) > len(old):
+        raise SetupError(
+            f"cannot relocate {binary.name}: {new_prefix} is longer than the "
+            "placeholder prefix"
+        )
     out = bytearray()
     pos = 0
     while (idx := data.find(old, pos)) != -1:
-        end = data.index(b"\0", idx)
+        end = data.find(b"\0", idx)
+        if end == -1:
+            # Trailing occurrence without a terminator: plain replacement.
+            out += data[pos:idx] + new + data[idx + len(old) :]
+            pos = len(data)
+            break
         tail = data[idx + len(old) : end]
         patched = new + tail
         patched += b"\0" * (end - idx - len(patched))
@@ -361,8 +378,17 @@ def install_global_from_source(log) -> None:
                     f"{' '.join(args[:2])} failed:\n{proc.stderr[-2000:]}"
                 )
 
-        # --disable-gtagscscope drops the only ncurses dependency.
-        _step(["./configure", f"--prefix={home}", "--disable-gtagscscope"])
+        # --disable-gtagscscope drops the only ncurses dependency;
+        # --with-included-ltdl statically links the bundled libltdl so the
+        # result does not depend on a system libltdl.so.
+        _step(
+            [
+                "./configure",
+                f"--prefix={home}",
+                "--disable-gtagscscope",
+                "--with-included-ltdl",
+            ]
+        )
         _step(["make", f"-j{os.cpu_count() or 2}"])
         _step(["make", "install"])
 
@@ -570,11 +596,17 @@ def run_setup(with_ctags: bool = True, force: bool = False, log=print) -> int:
     else:
         log("* Installing GNU Global ...")
         try:
-            if not install_global_prebuilt(log):
+            prebuilt_ok = install_global_prebuilt(log)
+        except Exception as exc:  # noqa: BLE001 — never let prebuilt kill setup
+            log(f"  prebuilt install failed ({exc}); falling back to source build")
+            shutil.rmtree(managed_home(), ignore_errors=True)
+            prebuilt_ok = False
+        if not prebuilt_ok:
+            try:
                 install_global_from_source(log)
-        except SetupError as exc:
-            log(f"error: {exc}")
-            return 1
+            except SetupError as exc:
+                log(f"error: {exc}")
+                return 1
         log(f"  installed GNU Global {GLOBAL_VERSION}")
 
     if with_ctags:
