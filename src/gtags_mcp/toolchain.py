@@ -164,9 +164,12 @@ def runtime_env(global_path: str | None) -> dict[str, str]:
     return env
 
 
-def pygments_available() -> bool:
-    """True when ``python3 -c 'import pygments'`` succeeds."""
-    python3 = shutil.which("python3") or sys.executable
+def managed_python() -> Path:
+    """python3 shim inside the managed bin dir (created by install_pygments)."""
+    return managed_bin() / "python3"
+
+
+def _imports_pygments(python3: str) -> bool:
     try:
         probe = subprocess.run(
             [python3, "-c", "import pygments"], capture_output=True, timeout=15
@@ -174,6 +177,18 @@ def pygments_available() -> bool:
     except (OSError, subprocess.TimeoutExpired):
         return False
     return probe.returncode == 0
+
+
+def pygments_available() -> bool:
+    """True when the python3 the plugin parser will use can import Pygments.
+
+    The parser script resolves ``python3`` via PATH; the server prepends the
+    managed bin dir, so a managed python3 shim takes priority when present.
+    """
+    if managed_python().exists():
+        return _imports_pygments(str(managed_python()))
+    python3 = shutil.which("python3") or sys.executable
+    return _imports_pygments(python3)
 
 
 # --------------------------------------------------------------------------
@@ -427,25 +442,84 @@ def install_ctags(log) -> bool:
     return True
 
 
+def _try_run(args: list[str], timeout: int = 300) -> tuple[bool, str]:
+    """Run a bootstrap command; returns (ok, output tail). Never raises."""
+    try:
+        proc = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, str(exc)
+    return proc.returncode == 0, ((proc.stderr or "") + (proc.stdout or ""))[-500:]
+
+
+def _install_pygments_venv(log) -> bool:
+    """Self-contained strategy: uv-managed venv + python3 shim in managed bin.
+
+    Works even when the system python has no pip/venv (common on minimal
+    Ubuntu/Debian images). The shim wins at runtime because the server
+    prepends the managed bin dir to PATH for every spawned process.
+    """
+    uv = shutil.which("uv") or str(Path.home() / ".local" / "bin" / "uv")
+    if not Path(uv).is_file():
+        return False
+    venv = managed_home() / "pyenv"
+    ok, err = _try_run([uv, "venv", "--quiet", str(venv)])
+    if not ok:
+        log(f"  uv venv failed: {err.strip()}")
+        return False
+    ok, err = _try_run(
+        [uv, "pip", "install", "--quiet", "--python", str(venv / "bin" / "python"), "pygments"]
+    )
+    if not ok:
+        log(f"  uv pip install failed: {err.strip()}")
+        return False
+    if not _imports_pygments(str(venv / "bin" / "python3")):
+        return False
+    managed_bin().mkdir(parents=True, exist_ok=True)
+    shim = managed_python()
+    shim.unlink(missing_ok=True)
+    shim.symlink_to(venv / "bin" / "python3")
+    log(f"  installed Pygments in {venv} (python3 shim: {shim})")
+    return True
+
+
 def install_pygments(log) -> bool:
-    """Ensure the Pygments library is importable by ``python3``."""
+    """Ensure Pygments is importable by the plugin parser's python3.
+
+    Tries, in order:
+    1. already available (managed shim or system python),
+    2. a uv-managed venv inside the managed home (no system pip needed),
+    3. ``python3 -m pip install --user`` (with a PEP 668
+       ``--break-system-packages`` retry),
+    4. ``python3 -m ensurepip`` to bootstrap pip, then (3) again.
+    """
     if pygments_available():
         log("  Pygments already available; skipping")
         return True
+
+    log("  installing Pygments (self-contained venv) ...")
+    if _install_pygments_venv(log):
+        return True
+
     python3 = shutil.which("python3") or sys.executable
     log("  installing Pygments (pip --user) ...")
-    try:
-        proc = subprocess.run(
-            [python3, "-m", "pip", "install", "--user", "--quiet", "pygments"],
-            capture_output=True,
-            text=True,
-            timeout=300,
+    pip_user = [python3, "-m", "pip", "install", "--user", "--quiet", "pygments"]
+    ok, err = _try_run(pip_user)
+    if not ok and "externally-managed" in err:
+        ok, err = _try_run(pip_user + ["--break-system-packages"])
+    if not ok and "No module named pip" in err:
+        boot_ok, _ = _try_run([python3, "-m", "ensurepip", "--user"])
+        if boot_ok:
+            ok, err = _try_run(pip_user)
+            if not ok and "externally-managed" in err:
+                ok, err = _try_run(pip_user + ["--break-system-packages"])
+    if not ok:
+        log(
+            "  could not install Pygments; multi-language references disabled.\n"
+            "  Fix manually with one of:\n"
+            "    uv venv ~/.gtags-mcp/pyenv && uv pip install --python ~/.gtags-mcp/pyenv/bin/python pygments\n"
+            "    sudo apt install python3-pygments\n"
+            f"  (last error: {err.strip()})"
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        log(f"  pip install failed ({exc}); multi-language mode disabled")
-        return False
-    if proc.returncode != 0:
-        log(f"  pip install failed; multi-language mode disabled:\n{proc.stderr[-500:]}")
         return False
     return pygments_available()
 
@@ -559,5 +633,10 @@ def doctor_report(project_root: Path | None = None) -> str:
         lines.append(
             "\n  GNU Global is missing — run `gtags-mcp setup` to install it "
             "into user space (no sudo needed)."
+        )
+    elif not pygments_available():
+        lines.append(
+            "\n  Pygments is missing — multi-language references are disabled. "
+            "Re-run `gtags-mcp setup` to install it into user space."
         )
     return "\n".join(lines)

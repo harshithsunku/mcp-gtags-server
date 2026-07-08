@@ -1197,7 +1197,7 @@ def main() -> None:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=["serve", "setup", "doctor", "config"],
+        choices=["serve", "setup", "doctor", "config", "help"],
         default="serve",
         help="serve (default): run the MCP server; setup: install the "
         "gtags/ctags/Pygments toolchain into ~/.gtags-mcp without root; "
@@ -1267,6 +1267,9 @@ def main() -> None:
     if args.bin_dir:
         os.environ["GTAGS_MCP_BIN_DIR"] = args.bin_dir
 
+    if args.command == "help":
+        parser.print_help()
+        return
     if args.command == "setup":
         sys.exit(toolchain.run_setup(with_ctags=not args.no_ctags, force=args.force))
     if args.command == "doctor":
@@ -1288,9 +1291,26 @@ def main() -> None:
             flush=True,
         )
         print(_client_config_text("http", args.host, args.port), flush=True)
-        mcp.run(transport="streamable-http")
+        try:
+            mcp.run(transport="streamable-http")
+        except KeyboardInterrupt:
+            pass
         return
-    mcp.run()
+    if sys.stdin.isatty():
+        print(
+            "gtags-mcp: serving MCP over stdio — this mode is meant to be "
+            "launched by an MCP client (Claude Code, Cursor, ...), not typed "
+            "into.\n"
+            "  Maintenance commands:  gtags-mcp doctor | config | setup | help\n"
+            "  Shared background server:  gtags-mcp --transport http\n"
+            "  Press Ctrl+C to exit.",
+            file=sys.stderr,
+            flush=True,
+        )
+    try:
+        mcp.run()
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":
