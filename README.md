@@ -1,4 +1,4 @@
-# ⚡ mcp-gtags-server
+# mcp-gtags-server
 
 > **Stop letting your AI agent grep. Give it an index.**
 
@@ -19,12 +19,12 @@ Every AI coding agent — Claude Code, Cursor, Codex, you name it — answers *"
 
 **mcp-gtags-server** replaces those scans with indexed lookups powered by [GNU Global (gtags)](https://www.gnu.org/software/global/) — the same tags engine kernel and systems developers have trusted for decades — exposed to agents over the [Model Context Protocol](https://modelcontextprotocol.io/).
 
-- 🚀 **~100× faster per query** — milliseconds instead of seconds, at any codebase size
-- 🎯 **Radically less noise** — the definition, not 7,873 lines of matches
-- 🧠 **Zero index management** — first query builds the index, every query auto-refreshes it
-- 🔌 **Works everywhere MCP does** — Claude Code, Claude Desktop, Cursor, any MCP client
+- **~100× faster per query** — milliseconds instead of seconds, at any codebase size
+- **Radically less noise** — the definition, not 7,873 lines of matches
+- **Zero index management** — first query builds the index, every query auto-refreshes it
+- **Works everywhere MCP does** — Claude Code, Claude Desktop, Cursor, any MCP client
 
-## 📊 The numbers (real Linux kernel, not a toy)
+## The numbers (real Linux kernel, not a toy)
 
 Measured on a full Linux kernel checkout — **65,163 C/C++ files, 37.1 million lines** — warm page cache:
 
@@ -44,7 +44,7 @@ One-time index build: **66 s** for the whole kernel. Incremental refresh after e
 
 The speed is nice. The real win is **precision**: an agent that gets 5 exact lines instead of 7,873 noisy ones keeps its context window for actual reasoning.
 
-## 🚀 Quick start (60 seconds)
+## Quick start (60 seconds)
 
 **One command. No sudo. Works everywhere** — restricted corporate machines, containers, build servers:
 
@@ -167,7 +167,7 @@ Precedence: tool-call argument > CLI flag > environment variable > project confi
 
 </details>
 
-## 🧰 The tools
+## The tools
 
 ### Symbol-level tools — the noise killers
 
@@ -225,7 +225,7 @@ Every query tool supports `limit`/`offset` pagination with a continuation footer
 
 A few hundred lines of context total — versus tens of thousands for the grep-and-read-files equivalent.
 
-## 🌍 Multi-language projects (C + Python + more)
+## Multi-language projects (C + Python + more)
 
 Real projects mix languages — a C core with Python tooling, JS frontends, Go services. The server handles this automatically:
 
@@ -246,7 +246,7 @@ Force a specific parser label with `--label`, `GTAGS_MCP_LABEL`, or `label` in `
 
 **Honest caveats:** for plugin-parsed languages, *definitions* are as accurate as ctags, but *references* are token-based — every occurrence of the name counts, without C-grade semantic reference tracking or local-scope awareness. For C/C++ nothing changes: the native parser still does that part.
 
-## ⚙️ How it works
+## How it works
 
 ```text
 agent question ──► MCP tool ──► GTAGS index (built once, ~66s for the kernel)
@@ -260,13 +260,13 @@ agent question ──► MCP tool ──► GTAGS index (built once, ~66s for th
 - **Files changed?** A debounced incremental refresh runs **in the background**: queries always answer instantly from the current index while `global -u` catches up behind the scenes. Measured on the kernel: queries return in 0.02s while the 25s freshness check runs invisibly. Staleness is bounded by the debounce window; call `update_index` for a synchronous, guaranteed-fresh barrier right after edits.
 - **Huge result?** Pagination footers tell the agent exactly how to fetch the next page — or the tool itself suggests a narrower one (`find_callers` on a symbol used in 500+ files points to `summarize_references`).
 
-## ❓ FAQ
+## FAQ
 
 **Why gtags instead of a language server (LSP)?**
 LSP servers give richer semantics but need a working build configuration, per-editor setup, and serious warm-up time on large trees. gtags indexes 37M lines in about a minute with *zero* configuration, handles the kernel-scale codebases LSPs choke on, and its fuzzy parser doesn't care whether the code currently compiles. For C/C++ navigation questions — definition, references, callers — it's the pragmatic sweet spot.
 
 **What languages?**
-C, C++, Yacc, Java, PHP, and assembly natively — plus Python, Go, Rust, JS/TS, Ruby, and ~150 others via the ctags/Pygments plugin parsers (see [Multi-language projects](#-multi-language-projects-c--python--more)).
+C, C++, Yacc, Java, PHP, and assembly natively — plus Python, Go, Rust, JS/TS, Ruby, and ~150 others via the ctags/Pygments plugin parsers (see [Multi-language projects](#multi-language-projects-c--python--more)).
 
 **Does the agent have to manage the index?**
 No. That's the point. Build-on-first-query, background refresh with adaptive debounce, zero blocking — queries never wait for index maintenance. The explicit `index_project`/`update_index` tools exist only as escape hatches (`update_index` doubles as a synchronous freshness barrier after edits).
@@ -274,7 +274,7 @@ No. That's the point. Build-on-first-query, background refresh with adaptive deb
 **Will it fight my agent's built-in tools?**
 The tool descriptions are written to steer the model: they say *when* to use indexed lookups instead of grep. In practice agents pick the faster, narrower tool naturally.
 
-## 🛠️ Development
+## Development
 
 ```bash
 git clone https://github.com/harshithsunku/mcp-gtags-server
@@ -287,7 +287,7 @@ Tests build a real C project in a temp dir and exercise auto-indexing, auto-refr
 
 Release flow: bump `version` in `pyproject.toml`, tag `vX.Y.Z`, push — CI publishes to PyPI and users pick the update up on their next installer re-run. Prebuilt GNU Global binaries are rebuilt by tagging `global-v<version>`.
 
-## 🗺️ Roadmap
+## Roadmap
 
 - [x] Multi-level call hierarchy (`call_hierarchy`, depth 1–5) for transitive impact analysis
 - [x] Outgoing call graph (`find_callees`), symbol overview cards (`symbol_info`), project orientation (`project_overview`)
@@ -300,6 +300,6 @@ Release flow: bump `version` in `pyproject.toml`, tag `vX.Y.Z`, push — CI publ
 
 Contributions welcome — open an issue or PR.
 
-## 📄 License
+## License
 
 [MIT](LICENSE) © Harshith Sunku
