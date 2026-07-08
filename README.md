@@ -2,10 +2,18 @@
 
 > **Stop letting your AI agent grep. Give it an index.**
 
+[![PyPI](https://img.shields.io/pypi/v/mcp-gtags-server)](https://pypi.org/project/mcp-gtags-server/)
+[![CI](https://github.com/harshithsunku/mcp-gtags-server/actions/workflows/ci.yml/badge.svg)](https://github.com/harshithsunku/mcp-gtags-server/actions/workflows/ci.yml)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![MCP](https://img.shields.io/badge/protocol-MCP-8A2BE2)](https://modelcontextprotocol.io/)
 [![Powered by GNU Global](https://img.shields.io/badge/powered%20by-GNU%20Global-orange)](https://www.gnu.org/software/global/)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/harshithsunku/mcp-gtags-server/main/scripts/install.sh | bash
+```
+
+*One command, no sudo, everything in user space — when it finishes, an MCP server is running and the client config is on your screen.*
 
 Every AI coding agent — Claude Code, Cursor, Codex, you name it — answers *"where is this function defined?"* the same way: **grep the entire tree**. On a million-line C/C++ codebase that's a full scan per question, and the output is a firehose: every comment, string literal, and unrelated match, dumped straight into the model's context window.
 
@@ -271,12 +279,13 @@ The tool descriptions are written to steer the model: they say *when* to use ind
 ```bash
 git clone https://github.com/harshithsunku/mcp-gtags-server
 cd mcp-gtags-server
-uv venv && uv pip install -e ".[dev]"
-pytest                        # 21 tests; auto-skip if GNU Global is absent
+uv run --extra dev pytest       # 51 tests; e2e tests auto-skip if GNU Global is absent
 npx @modelcontextprotocol/inspector gtags-mcp    # poke at it interactively
 ```
 
-Tests build a real C project in a temp dir and exercise auto-indexing, auto-refresh, caller mapping, body extraction, and pagination end-to-end.
+Tests build a real C project in a temp dir and exercise auto-indexing, auto-refresh, caller mapping, body extraction, pagination, user-space binary discovery, and config layering end-to-end.
+
+Release flow: bump `version` in `pyproject.toml`, tag `vX.Y.Z`, push — CI publishes to PyPI and users pick the update up on their next installer re-run. Prebuilt GNU Global binaries are rebuilt by tagging `global-v<version>`.
 
 ## 🗺️ Roadmap
 
@@ -284,6 +293,8 @@ Tests build a real C project in a temp dir and exercise auto-indexing, auto-refr
 - [x] Outgoing call graph (`find_callees`), symbol overview cards (`symbol_info`), project orientation (`project_overview`)
 - [x] Dead-code candidates (`find_dead_symbols`) and header blast radius (`find_includers`)
 - [x] Multi-language projects (Python, Go, Rust, JS, ... via ctags/Pygments plugin parsers, auto-detected)
+- [x] One-line no-sudo installer with user-space toolchain bootstrap and release-driven updates
+- [x] Background HTTP (streamable) transport — one server shared by many clients/devices
 - [ ] Structured (JSON) result variants for machine-readable output
 - [ ] Published benchmarks vs LSP-based MCP servers
 
