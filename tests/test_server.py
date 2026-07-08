@@ -1,20 +1,19 @@
 """End-to-end tests for the gtags MCP tools against a tiny C project."""
 
-import shutil
 import textwrap
 
 import pytest
 
-from gtags_mcp import server
+from gtags_mcp import server, toolchain
 
 requires_global = pytest.mark.skipif(
-    shutil.which("global") is None or shutil.which("gtags") is None,
+    toolchain.find_global() is None or toolchain.find_gtags() is None,
     reason="GNU Global not installed",
 )
 
 requires_pygments = pytest.mark.skipif(
-    shutil.which("global") is None
-    or shutil.which("gtags") is None
+    toolchain.find_global() is None
+    or toolchain.find_gtags() is None
     or not server._plugin_deps_available(),
     reason="ctags + Pygments plugin parser not available",
 )

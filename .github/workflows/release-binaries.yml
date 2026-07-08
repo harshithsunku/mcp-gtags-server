@@ -1,0 +1,122 @@
+name: Build prebuilt GNU Global binaries
+
+# Builds relocatable GNU Global binaries with a long placeholder prefix that
+# `gtags-mcp setup` patches to the user's ~/.gtags-mcp (conda-style
+# relocation). Assets are attached to the release for tag `global-v<version>`
+# and picked up automatically by setup on every user machine.
+#
+# Trigger by pushing a tag like `global-v6.6.15`, or manually.
+
+on:
+  push:
+    tags:
+      - "global-v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "GNU Global version to build (e.g. 6.6.15)"
+        required: true
+        default: "6.6.15"
+
+permissions:
+  contents: write
+
+env:
+  GLOBAL_SHA256: cf0937cb3ed521b2ab1acfa7aff45103040b860bb642c4c2f094ac3a3fe86024
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            platform: linux-x86_64
+          - runner: ubuntu-22.04-arm
+            platform: linux-aarch64
+          - runner: macos-13
+            platform: macos-x86_64
+          - runner: macos-latest
+            platform: macos-aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Resolve version
+        id: ver
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            echo "version=${GITHUB_REF_NAME#global-v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download and verify source
+        run: |
+          curl -fsSLO "https://ftp.gnu.org/gnu/global/global-${{ steps.ver.outputs.version }}.tar.gz"
+          echo "${GLOBAL_SHA256}  global-${{ steps.ver.outputs.version }}.tar.gz" | shasum -a 256 -c -
+          tar xzf "global-${{ steps.ver.outputs.version }}.tar.gz"
+
+      - name: Build with placeholder prefix
+        run: |
+          # Must match PLACEHOLDER_PREFIX in src/gtags_mcp/toolchain.py:
+          # "/opt/gtags-mcp-placeholder-prefix" + 167 underscores (200 chars).
+          PREFIX="/opt/gtags-mcp-placeholder-prefix$(printf '_%.0s' $(seq 1 167))"
+          sudo mkdir -p "$PREFIX"
+          sudo chown "$(id -u)" "$PREFIX"
+          cd "global-${{ steps.ver.outputs.version }}"
+          ./configure --prefix="$PREFIX" --disable-gtagscscope
+          make -j"$(getconf _NPROCESSORS_ONLN)"
+          make install
+          echo "PREFIX=$PREFIX" >> "$GITHUB_ENV"
+
+      - name: Smoke test
+        run: |
+          mkdir smoke && cd smoke
+          printf 'int foo(int x){return x;}\nint main(void){return foo(1);}\n' > a.c
+          "$PREFIX/bin/gtags"
+          "$PREFIX/bin/global" -x foo | grep -q a.c
+
+      - name: Package
+        run: |
+          STAGE="global-${{ steps.ver.outputs.version }}-${{ matrix.platform }}"
+          mkdir "$STAGE"
+          cp -R "$PREFIX/bin" "$PREFIX/lib" "$PREFIX/share" "$STAGE/"
+          tar czf "$STAGE.tar.gz" "$STAGE"
+          shasum -a 256 "$STAGE.tar.gz"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: global-${{ steps.ver.outputs.version }}-${{ matrix.platform }}
+          path: global-${{ steps.ver.outputs.version }}-${{ matrix.platform }}.tar.gz
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve version
+        id: ver
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            echo "version=${GITHUB_REF_NAME#global-v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: sha256sum global-*.tar.gz > checksums.txt && cat checksums.txt
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="global-v${{ steps.ver.outputs.version }}"
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --title "GNU Global ${{ steps.ver.outputs.version }} prebuilt binaries" \
+              --notes "Relocatable user-space GNU Global binaries consumed by \`gtags-mcp setup\`. Not for direct use."
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber \
+            global-*.tar.gz checksums.txt

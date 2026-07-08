@@ -38,28 +38,36 @@ The speed is nice. The real win is **precision**: an agent that gets 5 exact lin
 
 ## 🚀 Quick start (60 seconds)
 
-**1. Install GNU Global** (the `gtags`/`global` binaries):
+**One command. No sudo. Works everywhere** — restricted corporate machines, containers, build servers:
 
 ```bash
-sudo apt install global      # Debian/Ubuntu
-sudo dnf install global      # Fedora
-brew install global          # macOS
+curl -fsSL https://raw.githubusercontent.com/harshithsunku/mcp-gtags-server/main/scripts/install.sh | bash
 ```
 
-**2. Install the server:**
+Everything lands in your home directory — the server (via `uv`), GNU Global, universal-ctags, and Pygments (in `~/.gtags-mcp`). When it finishes, an MCP server is **already running in the background** and the exact client configuration is printed to your console:
 
-```bash
-uv tool install mcp-gtags-server        # or: pip install mcp-gtags-server
+```text
+==> All set! Connect your tools with the configuration below:
+
+MCP client configuration (HTTP transport):
+
+  Claude Code (once per device, all repos):
+      claude mcp add --scope user --transport http gtags http://127.0.0.1:8383/mcp
+
+  Cursor / any MCP client — global settings or .mcp.json:
+      {
+        "mcpServers": {
+          "gtags": { "url": "http://127.0.0.1:8383/mcp" }
+        }
+      }
 ```
 
-**3. Hook it up to your agent:**
+**Re-run the same command any time:**
 
-```bash
-# Claude Code — one command:
-claude mcp add gtags -- gtags-mcp
-```
+- Up to date? → *"Already installed and up to date — nothing to install"*, and the config is printed again.
+- New release on GitHub/PyPI? → the package updates, an outdated gtags toolchain is wiped and reinstalled automatically, and the background server restarts on the new version.
 
-Or in your project's `.mcp.json` (Claude Code, Cursor, and most MCP clients):
+Prefer stdio (client-launched processes) over a background server? That works too — `GTAGS_MCP_NO_SERVER=1` skips the server, and any client can use:
 
 ```json
 {
@@ -71,7 +79,41 @@ Or in your project's `.mcp.json` (Claude Code, Cursor, and most MCP clients):
 }
 ```
 
-That's it. No indexing step, no configuration. Ask your agent *"who calls `tcp_v4_rcv`?"* — the first query builds the index automatically, and every query after that is answered in milliseconds.
+That's it. No indexing step, no configuration, **no per-repo setup** — 20 repos need zero extra installs. Ask your agent *"who calls `tcp_v4_rcv`?"* — the first query in any repo builds that repo's index automatically, and every query after that is answered in milliseconds. Run `gtags-mcp doctor` any time to see what the server detects, or `gtags-mcp config` to re-print the client configuration.
+
+<details>
+<summary><b>Background server details</b> (network access, port, lifecycle)</summary>
+
+The installer runs `gtags-mcp --transport http --host 127.0.0.1 --port 8383` in the background (pid: `~/.gtags-mcp/server.pid`, log: `~/.gtags-mcp/server.log`). Environment overrides for the installer:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `GTAGS_MCP_PORT` | `8383` | HTTP port |
+| `GTAGS_MCP_HOST` | `127.0.0.1` | Bind address — set `0.0.0.0` to reach the server from other devices at `http://<machine-ip>:8383/mcp` |
+| `GTAGS_MCP_NO_SERVER` | unset | `1` = don't start a background server |
+
+**Security note:** the HTTP endpoint is unauthenticated. It binds localhost by default; only bind `0.0.0.0` on networks you trust.
+
+</details>
+
+<details>
+<summary><b>Manual install</b> (prefer system packages, or already have Global)</summary>
+
+```bash
+# 1. GNU Global — EITHER user-space (no sudo):
+gtags-mcp setup
+#    OR a system package:
+sudo apt install global      # Debian/Ubuntu
+sudo dnf install global      # Fedora
+brew install global          # macOS
+
+# 2. The server:
+uv tool install mcp-gtags-server        # or: pip install mcp-gtags-server
+```
+
+The server finds binaries in this order: `--bin-dir`/`GTAGS_MCP_BIN_DIR`/config `bin_dir` → `~/.gtags-mcp/bin` → `PATH` → `~/.local/bin`.
+
+</details>
 
 <details>
 <summary><b>Claude Desktop</b> config</summary>
@@ -94,7 +136,26 @@ Add to `claude_desktop_config.json` (pin the project since Desktop doesn't launc
 <details>
 <summary><b>Pin a project root</b> explicitly</summary>
 
-The default project root is the server's working directory. Override with `--root /path` or the `GTAGS_MCP_ROOT` env var — or pass `project_root` on any individual tool call to query a different tree.
+The default project root is the server's working directory. Override with `--root /path`, the `GTAGS_MCP_ROOT` env var, or `root` in a config file — or pass `project_root` on any individual tool call to query a different tree.
+
+</details>
+
+<details>
+<summary><b>Config files</b> — per-project and per-user defaults</summary>
+
+Every setting can also live in a TOML file, so teams share defaults through the repo (like `.editorconfig`):
+
+- **Project**: `.gtags-mcp.toml` at the project root
+- **User**: `~/.config/gtags-mcp/config.toml`
+
+```toml
+# .gtags-mcp.toml
+label = "native-pygments"     # force a GTAGSLABEL parser label
+bin_dir = "/opt/tools/bin"    # extra directory searched for gtags/global/ctags
+# root = "/abs/path"          # default project root (user config)
+```
+
+Precedence: tool-call argument > CLI flag > environment variable > project config > user config > built-in default.
 
 </details>
 
@@ -163,7 +224,7 @@ Real projects mix languages — a C core with Python tooling, JS frontends, Go s
 - **Native languages** (C, C++, Java, PHP, Yacc, assembly) use GNU Global's fast built-in parser.
 - **Everything else** (Python, Go, Rust, JavaScript, TypeScript, Ruby, ... ~150 languages) is indexed through Global's **ctags + Pygments plugin parsers** — same index, same tools, same queries.
 
-Enable it by installing two extra packages; the server detects them and switches to the `native-pygments` parser label on its own:
+The one-line installer (and `gtags-mcp setup`) enables this automatically — it installs universal-ctags and Pygments into user space, and the server switches to the `native-pygments` parser label on its own. Prefer system packages? Those work too:
 
 ```bash
 sudo apt install exuberant-ctags python3-pygments   # Debian/Ubuntu
@@ -173,7 +234,7 @@ brew install ctags && pip install pygments          # macOS
 
 Now `find_definition("py_util")`, `get_symbol_body` (indentation-aware for Python), `find_callees`, `call_hierarchy` — all work across every language in the tree, in one index.
 
-Force a specific parser label with `--label` or `GTAGS_MCP_LABEL` (e.g. `--label default` for native-only, `--label pygments` for plugin-everything).
+Force a specific parser label with `--label`, `GTAGS_MCP_LABEL`, or `label` in `.gtags-mcp.toml` (e.g. `default` for native-only, `pygments` for plugin-everything).
 
 **Honest caveats:** for plugin-parsed languages, *definitions* are as accurate as ctags, but *references* are token-based — every occurrence of the name counts, without C-grade semantic reference tracking or local-scope awareness. For C/C++ nothing changes: the native parser still does that part.
 

@@ -6,7 +6,9 @@ gtags index and return a narrow, precise set of lines. The server manages the
 index automatically — it builds it on first query and incrementally refreshes
 it before each query — so agents never have to think about indexing.
 
-GNU Global must be installed and on PATH (binaries: ``gtags``, ``global``).
+GNU Global (``gtags``/``global``) is resolved through user-space locations
+first (see :mod:`gtags_mcp.toolchain`); ``gtags-mcp setup`` installs it
+without root when it is missing.
 """
 
 from __future__ import annotations
@@ -14,13 +16,16 @@ from __future__ import annotations
 import argparse
 import os
 import re
-import shutil
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
+
+from . import config as config_module
+from . import toolchain
 
 mcp = FastMCP(
     "gtags-code-navigator",
@@ -63,6 +68,8 @@ _refresh_errors: dict[Path, str] = {}
 _forced_label: str | None = None
 _auto_label: str | None = None
 _auto_label_resolved = False
+# Extra binary directory forced by --bin-dir / GTAGS_MCP_BIN_DIR.
+_bin_dir: str | None = None
 
 # File extensions GNU Global's built-in parser understands.
 _NATIVE_EXTENSIONS = frozenset(
@@ -72,26 +79,16 @@ _NATIVE_EXTENSIONS = frozenset(
 
 def _plugin_deps_available() -> bool:
     """True when the ctags + Pygments plugin-parser dependencies are usable."""
-    if not any(
-        shutil.which(name) for name in ("ctags-exuberant", "universal-ctags", "ctags")
-    ):
-        return False
-    try:
-        probe = subprocess.run(
-            ["python3", "-c", "import pygments"],
-            capture_output=True,
-            timeout=15,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    return probe.returncode == 0
+    return toolchain.find_ctags(_bin_dir) is not None and toolchain.pygments_available()
 
 
-def _gtags_label() -> str | None:
-    """Resolve the GTAGSLABEL to use: forced label > auto-detected > native default."""
+def _gtags_label(root: Path | None = None) -> str | None:
+    """Resolve GTAGSLABEL: forced label > config file > auto-detected > native."""
     global _auto_label, _auto_label_resolved
     if _forced_label:
         return _forced_label
+    if configured := config_module.get_setting("label", root):
+        return configured
     if not _auto_label_resolved:
         _auto_label = "native-pygments" if _plugin_deps_available() else None
         _auto_label_resolved = True
@@ -99,17 +96,25 @@ def _gtags_label() -> str | None:
 
 
 def _check_global_installed() -> str | None:
-    if shutil.which("global") is None or shutil.which("gtags") is None:
+    if toolchain.find_global(_bin_dir) is None or toolchain.find_gtags(_bin_dir) is None:
         return (
-            "Error: GNU Global is not installed or not on PATH. "
-            "Install it first (e.g. `apt install global`, `brew install global`)."
+            "Error: GNU Global (gtags/global) was not found. "
+            "Install it into user space with `gtags-mcp setup` (no sudo needed), "
+            "or via a system package (`apt install global`, `brew install global`), "
+            "or point GTAGS_MCP_BIN_DIR / --bin-dir / `bin_dir` in .gtags-mcp.toml "
+            "at a directory containing the binaries."
         )
     return None
 
 
 def _effective_root(project_root: str | None) -> tuple[Path | None, str | None]:
-    """Resolve the project root: explicit arg > --root/env default > cwd."""
-    raw = project_root or _default_root or os.getcwd()
+    """Resolve the project root: explicit arg > --root/env default > config > cwd."""
+    raw = (
+        project_root
+        or _default_root
+        or config_module.get_setting("root")
+        or os.getcwd()
+    )
     root = Path(raw).expanduser().resolve()
     if not root.is_dir():
         return None, f"Error: project_root is not a directory: {raw}"
@@ -117,13 +122,22 @@ def _effective_root(project_root: str | None) -> tuple[Path | None, str | None]:
 
 
 def _run(args: list[str], cwd: Path, timeout: int = QUERY_TIMEOUT_SECONDS) -> tuple[str, str, int]:
-    """Run a command and return (stdout, stderr, returncode)."""
+    """Run a gtags/global command (resolved to user-space binaries) in cwd."""
+    resolver = {"global": toolchain.find_global, "gtags": toolchain.find_gtags}
+    exe = args[0]
+    if resolve := resolver.get(exe):
+        exe = resolve(_bin_dir, cwd) or exe
     env = os.environ.copy()
-    label = _gtags_label()
+    env.update(toolchain.runtime_env(exe))
+    if os.sep in exe:
+        # `global -u` re-spawns `gtags` via PATH; make sure the resolved
+        # user-space bin directory is visible to child processes too.
+        env["PATH"] = str(Path(exe).parent) + os.pathsep + env.get("PATH", "")
+    label = _gtags_label(cwd)
     if label:
         env["GTAGSLABEL"] = label
     proc = subprocess.run(
-        args,
+        [exe, *args[1:]],
         cwd=cwd,
         capture_output=True,
         text=True,
@@ -1059,7 +1073,7 @@ def index_project(project_root: str | None = None) -> str:
     if code != 0:
         return f"Error: gtags exited with code {code}: {stderr.strip() or stdout.strip()}"
     _last_update[root] = time.monotonic()
-    label = _gtags_label()
+    label = _gtags_label(root)
     if label:
         return (
             f"Indexed {root} (GTAGS, GRTAGS, GPATH created) "
@@ -1079,8 +1093,8 @@ def index_project(project_root: str | None = None) -> str:
     if non_native:
         message += (
             f" Note: {', '.join(sorted(non_native))} files were NOT indexed — "
-            "install ctags + Pygments (e.g. `apt install exuberant-ctags "
-            "python3-pygments`) to enable multi-language indexing."
+            "run `gtags-mcp setup` (installs ctags + Pygments into user space, "
+            "no sudo) to enable multi-language indexing."
         )
     return message
 
@@ -1115,18 +1129,111 @@ def update_index(project_root: str | None = None) -> str:
     return f"Index updated for {root} (synchronous — results are now current)."
 
 
+def _package_version() -> str:
+    try:
+        from importlib.metadata import version
+
+        return version("mcp-gtags-server")
+    except Exception:  # noqa: BLE001 — editable/dev installs may lack metadata
+        return "unknown"
+
+
+def _client_config_text(transport: str, host: str, port: int) -> str:
+    """Ready-to-paste MCP client configuration for this server."""
+    if transport == "http":
+        display_host = "127.0.0.1" if host in ("0.0.0.0", "::") else host
+        url = f"http://{display_host}:{port}/mcp"
+        lines = [
+            "MCP client configuration (HTTP transport):",
+            "",
+            "  Claude Code (once per device, all repos):",
+            f"      claude mcp add --scope user --transport http gtags {url}",
+            "",
+            "  Cursor / any MCP client — global settings or .mcp.json:",
+            "      {",
+            '        "mcpServers": {',
+            f'          "gtags": {{ "url": "{url}" }}',
+            "        }",
+            "      }",
+        ]
+        if host in ("0.0.0.0", "::"):
+            lines += [
+                "",
+                "  Listening on ALL interfaces — reachable on the network at",
+                f"      http://<this-machine-ip>:{port}/mcp",
+                "  WARNING: the endpoint is unauthenticated; only expose it on",
+                "  networks you trust.",
+            ]
+        return "\n".join(lines)
+    return "\n".join(
+        [
+            "MCP client configuration (stdio transport):",
+            "",
+            "  Claude Code (once per device, all repos):",
+            "      claude mcp add --scope user gtags -- gtags-mcp",
+            "",
+            "  Cursor / any MCP client — global settings or .mcp.json:",
+            "      {",
+            '        "mcpServers": {',
+            '          "gtags": { "command": "gtags-mcp" }',
+            "        }",
+            "      }",
+        ]
+    )
+
+
 def main() -> None:
-    """Entry point: run the MCP server over stdio."""
-    global _default_root, _forced_label
+    """Entry point: serve MCP over stdio/HTTP, or run a maintenance subcommand."""
+    global _default_root, _forced_label, _bin_dir
     parser = argparse.ArgumentParser(
         prog="gtags-mcp",
-        description="MCP server exposing GNU Global (gtags) code navigation over stdio.",
+        description=(
+            "MCP server exposing GNU Global (gtags) code navigation. "
+            "Subcommands: 'setup' installs the toolchain into user space "
+            "(no sudo); 'doctor' reports toolchain and config status; "
+            "'config' prints ready-to-paste MCP client configuration."
+        ),
+    )
+    parser.add_argument(
+        "command",
+        nargs="?",
+        choices=["serve", "setup", "doctor", "config"],
+        default="serve",
+        help="serve (default): run the MCP server; setup: install the "
+        "gtags/ctags/Pygments toolchain into ~/.gtags-mcp without root; "
+        "doctor: print what the server detects on this machine; "
+        "config: print MCP client configuration for this server.",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {_package_version()}",
+    )
+    parser.add_argument(
+        "--transport",
+        choices=["stdio", "http"],
+        default=os.environ.get("GTAGS_MCP_TRANSPORT", "stdio"),
+        help="serve/config: MCP transport. 'stdio' (default) for direct "
+        "client launch; 'http' runs a background-friendly streamable-HTTP "
+        "server that many clients and devices can share.",
+    )
+    parser.add_argument(
+        "--host",
+        default=os.environ.get("GTAGS_MCP_HOST", "127.0.0.1"),
+        help="serve/config with --transport http: bind address "
+        "(default 127.0.0.1; 0.0.0.0 exposes the server on the network).",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=int(os.environ.get("GTAGS_MCP_PORT", "8383")),
+        help="serve/config with --transport http: TCP port (default 8383).",
     )
     parser.add_argument(
         "--root",
         default=os.environ.get("GTAGS_MCP_ROOT"),
         help="Default project root for all tools (overrides GTAGS_MCP_ROOT; "
-        "falls back to the current working directory).",
+        "falls back to config files, then the current working directory).",
     )
     parser.add_argument(
         "--label",
@@ -1136,9 +1243,53 @@ def main() -> None:
         "'native-pygments' when ctags and Pygments are installed, enabling "
         "multi-language indexing.",
     )
+    parser.add_argument(
+        "--bin-dir",
+        default=os.environ.get("GTAGS_MCP_BIN_DIR"),
+        help="Extra directory searched first for the gtags/global/ctags "
+        "binaries (overrides GTAGS_MCP_BIN_DIR).",
+    )
+    parser.add_argument(
+        "--no-ctags",
+        action="store_true",
+        help="setup only: skip installing universal-ctags and Pygments "
+        "(disables multi-language indexing).",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="setup only: reinstall even when a toolchain is already present.",
+    )
     args = parser.parse_args()
     _default_root = args.root
     _forced_label = args.label
+    _bin_dir = args.bin_dir
+    if args.bin_dir:
+        os.environ["GTAGS_MCP_BIN_DIR"] = args.bin_dir
+
+    if args.command == "setup":
+        sys.exit(toolchain.run_setup(with_ctags=not args.no_ctags, force=args.force))
+    if args.command == "doctor":
+        root, _ = _effective_root(args.root)
+        print(f"gtags-mcp doctor (v{_package_version()})")
+        print(toolchain.doctor_report(project_root=root))
+        label = _gtags_label(root)
+        print(f"  parser label : {label or 'native (C/C++/Java/PHP/asm only)'}")
+        return
+    if args.command == "config":
+        print(_client_config_text(args.transport, args.host, args.port))
+        return
+    if args.transport == "http":
+        mcp.settings.host = args.host
+        mcp.settings.port = args.port
+        print(
+            f"gtags-mcp v{_package_version()} — streamable HTTP server on "
+            f"{args.host}:{args.port}\n",
+            flush=True,
+        )
+        print(_client_config_text("http", args.host, args.port), flush=True)
+        mcp.run(transport="streamable-http")
+        return
     mcp.run()
 
 
