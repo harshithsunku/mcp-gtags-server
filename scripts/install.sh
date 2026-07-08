@@ -7,7 +7,7 @@
 #   1. Ensures `uv` is available (~/.local/bin) — installs it if missing.
 #   2. Installs OR UPDATES the mcp-gtags-server package (release-driven:
 #      every GitHub tag published to PyPI is picked up automatically).
-#   3. Runs `gtags-mcp setup`: installs GNU Global (prebuilt binaries when
+#   3. Runs `mcp-gtags-server setup`: installs GNU Global (prebuilt binaries when
 #      available, otherwise built from source) plus universal-ctags and
 #      Pygments into ~/.gtags-mcp. On updates, outdated toolchains are
 #      wiped and reinstalled automatically.
@@ -45,7 +45,7 @@ PID_FILE="$GTAGS_HOME/server.pid"
 LOG_FILE="$GTAGS_HOME/server.log"
 
 installed_version() {
-    command -v gtags-mcp >/dev/null 2>&1 && gtags-mcp --version 2>/dev/null | awk '{print $NF}' || true
+    command -v mcp-gtags-server >/dev/null 2>&1 && mcp-gtags-server --version 2>/dev/null | awk '{print $NF}' || true
 }
 
 server_running() {
@@ -64,7 +64,7 @@ stop_server() {
 start_server() {
     mkdir -p "$GTAGS_HOME"
     say "Starting background MCP server on ${HOST}:${PORT} ..."
-    nohup gtags-mcp --transport http --host "$HOST" --port "$PORT" \
+    nohup mcp-gtags-server --transport http --host "$HOST" --port "$PORT" \
         >> "$LOG_FILE" 2>&1 &
     echo $! > "$PID_FILE"
     sleep 2
@@ -80,15 +80,15 @@ start_server() {
 print_config() {
     echo
     if server_running; then
-        gtags-mcp config --transport http --host "$HOST" --port "$PORT"
+        mcp-gtags-server config --transport http --host "$HOST" --port "$PORT"
         echo
         echo "  (Prefer per-client processes? The stdio variant also works:)"
-        echo "      claude mcp add --scope user gtags -- gtags-mcp"
+        echo "      claude mcp add --scope user gtags -- mcp-gtags-server"
     else
-        gtags-mcp config
+        mcp-gtags-server config
     fi
     echo
-    echo "  Sanity check any time:   gtags-mcp doctor"
+    echo "  Sanity check any time:   mcp-gtags-server doctor"
     echo "  No per-repo installs — every repo is indexed automatically on"
     echo "  the first query."
 }
@@ -105,7 +105,7 @@ fi
 BEFORE="$(installed_version)"
 say "Checking mcp-gtags-server ..."
 uv tool install --upgrade --quiet mcp-gtags-server
-command -v gtags-mcp >/dev/null 2>&1 || die "gtags-mcp not on PATH after install"
+command -v mcp-gtags-server >/dev/null 2>&1 || die "mcp-gtags-server not on PATH after install"
 AFTER="$(installed_version)"
 
 UPDATED=0
@@ -120,7 +120,7 @@ fi
 
 # --- 3. gtags toolchain (idempotent; self-heals after updates) ----------------
 say "Verifying gtags toolchain in $GTAGS_HOME (no sudo) ..."
-gtags-mcp setup
+mcp-gtags-server setup
 
 # --- 4. PATH persistence ------------------------------------------------------
 ensure_path_line='export PATH="$HOME/.local/bin:$PATH"'

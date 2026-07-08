@@ -171,7 +171,7 @@ def test_doctor_report_mentions_setup_when_missing(tmp_path, monkeypatch):
     # Hide any system global from the report.
     monkeypatch.setattr(toolchain.shutil, "which", lambda name: None)
     report = toolchain.doctor_report()
-    assert "gtags-mcp setup" in report
+    assert "mcp-gtags-server setup" in report
     assert "NOT FOUND" in report
 
 

@@ -7,7 +7,7 @@ index automatically — it builds it on first query and incrementally refreshes
 it before each query — so agents never have to think about indexing.
 
 GNU Global (``gtags``/``global``) is resolved through user-space locations
-first (see :mod:`gtags_mcp.toolchain`); ``gtags-mcp setup`` installs it
+first (see :mod:`gtags_mcp.toolchain`); ``mcp-gtags-server setup`` installs it
 without root when it is missing.
 """
 
@@ -99,7 +99,7 @@ def _check_global_installed() -> str | None:
     if toolchain.find_global(_bin_dir) is None or toolchain.find_gtags(_bin_dir) is None:
         return (
             "Error: GNU Global (gtags/global) was not found. "
-            "Install it into user space with `gtags-mcp setup` (no sudo needed), "
+            "Install it into user space with `mcp-gtags-server setup` (no sudo needed), "
             "or via a system package (`apt install global`, `brew install global`), "
             "or point GTAGS_MCP_BIN_DIR / --bin-dir / `bin_dir` in .gtags-mcp.toml "
             "at a directory containing the binaries."
@@ -1093,7 +1093,7 @@ def index_project(project_root: str | None = None) -> str:
     if non_native:
         message += (
             f" Note: {', '.join(sorted(non_native))} files were NOT indexed — "
-            "run `gtags-mcp setup` (installs ctags + Pygments into user space, "
+            "run `mcp-gtags-server setup` (installs ctags + Pygments into user space, "
             "no sudo) to enable multi-language indexing."
         )
     return message
@@ -1170,12 +1170,12 @@ def _client_config_text(transport: str, host: str, port: int) -> str:
             "MCP client configuration (stdio transport):",
             "",
             "  Claude Code (once per device, all repos):",
-            "      claude mcp add --scope user gtags -- gtags-mcp",
+            "      claude mcp add --scope user gtags -- mcp-gtags-server",
             "",
             "  Cursor / any MCP client — global settings or .mcp.json:",
             "      {",
             '        "mcpServers": {',
-            '          "gtags": { "command": "gtags-mcp" }',
+            '          "gtags": { "command": "mcp-gtags-server" }',
             "        }",
             "      }",
         ]
@@ -1186,7 +1186,7 @@ def main() -> None:
     """Entry point: serve MCP over stdio/HTTP, or run a maintenance subcommand."""
     global _default_root, _forced_label, _bin_dir
     parser = argparse.ArgumentParser(
-        prog="gtags-mcp",
+        prog="mcp-gtags-server",
         description=(
             "MCP server exposing GNU Global (gtags) code navigation. "
             "Subcommands: 'setup' installs the toolchain into user space "
@@ -1274,7 +1274,7 @@ def main() -> None:
         sys.exit(toolchain.run_setup(with_ctags=not args.no_ctags, force=args.force))
     if args.command == "doctor":
         root, _ = _effective_root(args.root)
-        print(f"gtags-mcp doctor (v{_package_version()})")
+        print(f"mcp-gtags-server doctor (v{_package_version()})")
         print(toolchain.doctor_report(project_root=root))
         label = _gtags_label(root)
         print(f"  parser label : {label or 'native (C/C++/Java/PHP/asm only)'}")
@@ -1286,7 +1286,7 @@ def main() -> None:
         mcp.settings.host = args.host
         mcp.settings.port = args.port
         print(
-            f"gtags-mcp v{_package_version()} — streamable HTTP server on "
+            f"mcp-gtags-server v{_package_version()} — streamable HTTP server on "
             f"{args.host}:{args.port}\n",
             flush=True,
         )
@@ -1298,11 +1298,11 @@ def main() -> None:
         return
     if sys.stdin.isatty():
         print(
-            "gtags-mcp: serving MCP over stdio — this mode is meant to be "
+            "mcp-gtags-server: serving MCP over stdio — this mode is meant to be "
             "launched by an MCP client (Claude Code, Cursor, ...), not typed "
             "into.\n"
-            "  Maintenance commands:  gtags-mcp doctor | config | setup | help\n"
-            "  Shared background server:  gtags-mcp --transport http\n"
+            "  Maintenance commands:  mcp-gtags-server doctor | config | setup | help\n"
+            "  Shared background server:  mcp-gtags-server --transport http\n"
             "  Press Ctrl+C to exit.",
             file=sys.stderr,
             flush=True,

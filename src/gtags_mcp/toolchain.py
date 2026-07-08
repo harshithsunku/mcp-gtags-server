@@ -2,7 +2,7 @@
 
 The server never assumes ``gtags``/``global`` come from a system package.
 Binaries are resolved through a search order that puts user-space locations
-first, and ``gtags-mcp setup`` can install the whole toolchain without root:
+first, and ``mcp-gtags-server setup`` can install the whole toolchain without root:
 
 1. an explicit ``bin_dir`` (tool argument, ``--bin-dir``, ``GTAGS_MCP_BIN_DIR``
    env var, or ``bin_dir`` in a config file),
@@ -577,7 +577,7 @@ def run_setup(with_ctags: bool = True, force: bool = False, log=print) -> int:
     differs from the pinned ``GLOBAL_VERSION`` (e.g. after the package was
     upgraded), the whole managed home is removed and reinstalled fresh.
     """
-    log(f"gtags-mcp setup — installing into {managed_home()} (no sudo needed)")
+    log(f"mcp-gtags-server setup — installing into {managed_home()} (no sudo needed)")
 
     managed_version = _managed_global_version()
     if managed_version and managed_version != GLOBAL_VERSION:
@@ -663,12 +663,12 @@ def doctor_report(project_root: Path | None = None) -> str:
         )
     if not find_global(project_root=project_root):
         lines.append(
-            "\n  GNU Global is missing — run `gtags-mcp setup` to install it "
+            "\n  GNU Global is missing — run `mcp-gtags-server setup` to install it "
             "into user space (no sudo needed)."
         )
     elif not pygments_available():
         lines.append(
             "\n  Pygments is missing — multi-language references are disabled. "
-            "Re-run `gtags-mcp setup` to install it into user space."
+            "Re-run `mcp-gtags-server setup` to install it into user space."
         )
     return "\n".join(lines)

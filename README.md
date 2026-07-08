@@ -17,7 +17,7 @@ curl -fsSL https://raw.githubusercontent.com/harshithsunku/mcp-gtags-server/main
 
 Every AI coding agent — Claude Code, Cursor, Codex, you name it — answers *"where is this function defined?"* the same way: **grep the entire tree**. On a million-line C/C++ codebase that's a full scan per question, and the output is a firehose: every comment, string literal, and unrelated match, dumped straight into the model's context window.
 
-**mcp-gtags-server** replaces those scans with indexed lookups powered by [GNU Global (gtags)](https://www.gnu.org/software/global/) — the same tags engine kernel and systems developers have trusted for decades — exposed to agents over the [Model Context Protocol](https://modelcontextprotocol.io/).
+**mcp-gtags-server** replaces those scans with indexed lookups powered by [GNU Global (gtags)](https://www.gnu.org/software/global/) — the same tags engine kernel and systems developers have trusted for decades — exposed to agents over the [Model Context Protocol](https://modelcontextprotocol.io/). Built for the codebases LSP-based tools can't handle: kernel-scale C/C++, trees that don't currently compile, machines you can't sudo on.
 
 - **~100× faster per query** — milliseconds instead of seconds, at any codebase size
 - **Radically less noise** — the definition, not 7,873 lines of matches
@@ -81,18 +81,18 @@ Prefer stdio (client-launched processes) over a background server? That works to
 {
   "mcpServers": {
     "gtags": {
-      "command": "gtags-mcp"
+      "command": "mcp-gtags-server"
     }
   }
 }
 ```
 
-That's it. No indexing step, no configuration, **no per-repo setup** — 20 repos need zero extra installs. Ask your agent *"who calls `tcp_v4_rcv`?"* — the first query in any repo builds that repo's index automatically, and every query after that is answered in milliseconds. Run `gtags-mcp doctor` any time to see what the server detects, or `gtags-mcp config` to re-print the client configuration.
+That's it. No indexing step, no configuration, **no per-repo setup** — 20 repos need zero extra installs. Ask your agent *"who calls `tcp_v4_rcv`?"* — the first query in any repo builds that repo's index automatically, and every query after that is answered in milliseconds. Run `mcp-gtags-server doctor` any time to see what the server detects, or `mcp-gtags-server config` to re-print the client configuration.
 
 <details>
 <summary><b>Background server details</b> (network access, port, lifecycle)</summary>
 
-The installer runs `gtags-mcp --transport http --host 127.0.0.1 --port 8383` in the background (pid: `~/.gtags-mcp/server.pid`, log: `~/.gtags-mcp/server.log`). Environment overrides for the installer:
+The installer runs `mcp-gtags-server --transport http --host 127.0.0.1 --port 8383` in the background (pid: `~/.gtags-mcp/server.pid`, log: `~/.gtags-mcp/server.log`). Environment overrides for the installer:
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -109,7 +109,7 @@ The installer runs `gtags-mcp --transport http --host 127.0.0.1 --port 8383` in 
 
 ```bash
 # 1. GNU Global — EITHER user-space (no sudo):
-gtags-mcp setup
+mcp-gtags-server setup
 #    OR a system package:
 sudo apt install global      # Debian/Ubuntu
 sudo dnf install global      # Fedora
@@ -132,7 +132,7 @@ Add to `claude_desktop_config.json` (pin the project since Desktop doesn't launc
 {
   "mcpServers": {
     "gtags": {
-      "command": "gtags-mcp",
+      "command": "mcp-gtags-server",
       "args": ["--root", "/absolute/path/to/your/project"]
     }
   }
@@ -232,7 +232,7 @@ Real projects mix languages — a C core with Python tooling, JS frontends, Go s
 - **Native languages** (C, C++, Java, PHP, Yacc, assembly) use GNU Global's fast built-in parser.
 - **Everything else** (Python, Go, Rust, JavaScript, TypeScript, Ruby, ... ~150 languages) is indexed through Global's **ctags + Pygments plugin parsers** — same index, same tools, same queries.
 
-The one-line installer (and `gtags-mcp setup`) enables this automatically — it installs universal-ctags and Pygments into user space, and the server switches to the `native-pygments` parser label on its own. Prefer system packages? Those work too:
+The one-line installer (and `mcp-gtags-server setup`) enables this automatically — it installs universal-ctags and Pygments into user space, and the server switches to the `native-pygments` parser label on its own. Prefer system packages? Those work too:
 
 ```bash
 sudo apt install exuberant-ctags python3-pygments   # Debian/Ubuntu
@@ -280,7 +280,7 @@ The tool descriptions are written to steer the model: they say *when* to use ind
 git clone https://github.com/harshithsunku/mcp-gtags-server
 cd mcp-gtags-server
 uv run --extra dev pytest       # 51 tests; e2e tests auto-skip if GNU Global is absent
-npx @modelcontextprotocol/inspector gtags-mcp    # poke at it interactively
+npx @modelcontextprotocol/inspector mcp-gtags-server    # poke at it interactively
 ```
 
 Tests build a real C project in a temp dir and exercise auto-indexing, auto-refresh, caller mapping, body extraction, pagination, user-space binary discovery, and config layering end-to-end.
