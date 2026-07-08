@@ -130,9 +130,24 @@ def find_gtags(bin_dir: str | None = None, project_root: Path | None = None) -> 
 
 
 def find_ctags(bin_dir: str | None = None, project_root: Path | None = None) -> str | None:
+    """Resolve any ctags flavour, honouring location priority over name.
+
+    A ctags in the explicit/managed user-space directories always beats one
+    on PATH, regardless of which of the known binary names it uses.
+    """
+    dirs = _search_dirs(bin_dir, project_root)
+    for directory in dirs[:-1]:
+        for name in _CTAGS_NAMES:
+            exe = directory / name
+            if exe.is_file() and os.access(exe, os.X_OK):
+                return str(exe)
     for name in _CTAGS_NAMES:
-        if found := find_tool(name, bin_dir, project_root):
+        if found := shutil.which(name):
             return found
+    for name in _CTAGS_NAMES:
+        exe = dirs[-1] / name
+        if exe.is_file() and os.access(exe, os.X_OK):
+            return str(exe)
     return None
 
 
