@@ -162,6 +162,7 @@ label = "native-pygments"     # force a GTAGSLABEL parser label
 bin_dir = "/opt/tools/bin"    # extra directory searched for gtags/global/ctags
 skip_globs = ["*.gen.c"]      # never index paths/basenames matching these globs
 respect_gitignore = true      # default: index only what `git ls-files` reports
+enrich = true                 # default: ctags kind/signature/scope on results
 # root = "/abs/path"          # default project root (user config)
 ```
 
@@ -177,7 +178,7 @@ Precedence: tool-call argument > CLI flag > environment variable > project confi
 
 | Tool | What the agent gets |
 |---|---|
-| `symbol_info` | **A one-shot overview card** — definitions, reference count, hottest files, and which tool to use next. The best first query for any unfamiliar symbol. |
+| `symbol_info` | **A one-shot overview card** — definitions (with kind, signature, and scope), reference count, hottest files, and which tool to use next. The best first query for any unfamiliar symbol. |
 | `get_symbol_body` | **Just the source of a definition.** The 271-line `tcp_v4_rcv` function — not the 3,500-line file it lives in. Handles functions, structs, and multi-line macros. |
 | `find_callers` | **The call graph, deduplicated.** Every reference mapped to its enclosing function with call counts: 245 raw lines for `ext4_mark_inode_dirty` collapse to 62 callers. |
 | `call_hierarchy` | **Multi-level impact analysis.** Who calls X, who calls *those*, up to 5 levels — a cycle-safe, capped tree instead of N rounds of grep. |
@@ -225,7 +226,9 @@ Since v0.8.0 every tool returns a **machine-readable JSON envelope by default** 
   "root": "/abs/project/root",
   "results": [
     {"symbol": "tcp_v4_rcv", "path": "net/ipv4/tcp_ipv4.c", "line": 2001,
-     "col": 5, "kind": null, "guard": null, "snippet": "int tcp_v4_rcv(struct sk_buff *skb)"}
+     "col": 5, "kind": "function", "typeref": "int", "scope": null,
+     "signature": "(struct sk_buff * skb)", "guard": null,
+     "snippet": "int tcp_v4_rcv(struct sk_buff *skb)"}
   ],
   "total": 1, "offset": 0, "truncated": false,
   "next_tools": ["get_symbol_body", "find_callers", "symbol_info"],
@@ -233,7 +236,8 @@ Since v0.8.0 every tool returns a **machine-readable JSON envelope by default** 
 }
 ```
 
-- Symbol locations always use the stable record schema `{symbol, path, line, col, kind, guard, snippet}` with repo-relative paths. `kind` (ctags metadata) and `guard` (`#ifdef` stack) are reserved for upcoming milestones and currently `null` — parsers never need to change shape.
+- Symbol locations always use the stable record schema `{symbol, path, line, col, kind, typeref, scope, signature, guard, snippet}` with repo-relative paths. Keys are only ever added, never renamed or removed — parsers never need to change shape. `guard` (`#ifdef` stack) is reserved for an upcoming milestone and currently `null`.
+- **`kind` / `typeref` / `scope` / `signature` say *what* a symbol is** (since v0.8.1): function vs. macro vs. struct vs. typedef vs. enum constant, its return/target type, its enclosing scope (`enum:color`, `struct:item`), and its parameter list — extracted per file by universal-ctags with **no build and no compile database**, cached, and filled on definition-shaped results (`find_definition`, `symbol_info`, `list_file_symbols`). When universal-ctags isn't available the fields are simply `null`; disable explicitly with `--no-enrich`, `GTAGS_MCP_ENRICH=0`, or `enrich = false` in `.gtags-mcp.toml`.
 - `next_tools` tells the agent the highest-value follow-up call for what was (or wasn't) found.
 - `total`/`offset`/`truncated` replace the text continuation footer; errors keep the envelope with an `error` field.
 - Composite tools return tool-shaped `results` (e.g. `call_hierarchy` a nested caller tree, `find_callees` `{in_tree, external}`, `symbol_info` an overview object) inside the same envelope.
@@ -324,9 +328,10 @@ Release flow: bump `version` in `pyproject.toml`, tag `vX.Y.Z`, push — CI publ
 
 ## Roadmap
 
-See [ROADMAP.md](ROADMAP.md) — structured JSON output landed in v0.8.0; next up are
-ctags metadata enrichment, `#ifdef`/config-guard awareness (the headline capability for
-kernel and firmware trees), macro-family symbol resolution, and a correctness eval harness.
+See [ROADMAP.md](ROADMAP.md) — structured JSON output landed in v0.8.0 and ctags
+metadata enrichment (kind/signature/scope on every definition) in v0.8.1; next up are
+`#ifdef`/config-guard awareness (the headline capability for kernel and firmware
+trees), macro-family symbol resolution, and a correctness eval harness.
 
 Contributions welcome — open an issue or PR.
 

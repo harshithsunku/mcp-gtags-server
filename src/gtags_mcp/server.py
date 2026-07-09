@@ -26,6 +26,7 @@ from typing import Literal
 from mcp.server.fastmcp import FastMCP
 
 from . import config as config_module
+from . import enrich
 from . import fileset
 from . import output
 from . import toolchain
@@ -77,6 +78,8 @@ _auto_label: str | None = None
 _auto_label_resolved = False
 # Extra binary directory forced by --bin-dir / GTAGS_MCP_BIN_DIR.
 _bin_dir: str | None = None
+# ctags metadata enrichment disabled by --no-enrich.
+_no_enrich = False
 
 # File extensions GNU Global's built-in parser understands.
 _NATIVE_EXTENSIONS = frozenset(
@@ -319,6 +322,7 @@ def _query_global(
     format: Format = "json",
     parse: str = "cxref",  # cxref | symbol | path — shape of `global` stdout
     record_symbol: str | None = None,
+    enrich_records: bool = False,  # ctags metadata on definition-shaped results
 ) -> str:
     """Shared plumbing for all read-only `global` queries."""
     stdout, root, err = _raw_global(flags, project_root)
@@ -345,6 +349,8 @@ def _query_global(
             if (p := line.strip())
         ]
     page, total, truncated = output.paginate(items, limit, offset)
+    if enrich_records and parse == "cxref":
+        _maybe_enrich(page, root)  # after pagination: only one page pays ctags
     extra = {} if items else {"message": empty_message}
     return output.envelope(
         tool,
@@ -366,6 +372,41 @@ def _parse_cxref(line: str) -> tuple[str, int, str, str] | None:
     symbol, lineno, path = parts[0], int(parts[1]), parts[2]
     source = parts[3] if len(parts) == 4 else ""
     return symbol, lineno, path, source
+
+
+def _enrichment_enabled(root: Path | None) -> bool:
+    """ctags metadata enrichment: --no-enrich > GTAGS_MCP_ENRICH > config > on."""
+    if _no_enrich:
+        return False
+    if env := os.environ.get("GTAGS_MCP_ENRICH"):
+        return env.strip().lower() not in ("0", "false", "no", "off")
+    return config_module.get_bool_setting("enrich", root, default=True)
+
+
+def _maybe_enrich(records: list[dict], root: Path | None) -> None:
+    """Fill kind/typeref/scope/signature on definition-shaped records in place.
+
+    Best-effort: without Universal Ctags (+json), or for files ctags cannot
+    parse, records keep their null metadata. One ctags run per distinct file,
+    cached in :mod:`gtags_mcp.enrich`.
+    """
+    if not records or root is None or not _enrichment_enabled(root):
+        return
+    if not enrich.available(_bin_dir):
+        return
+    by_path: dict[str, list[dict]] = {}
+    for rec in records:
+        by_path.setdefault(rec["path"], []).append(rec)
+    for path, recs in by_path.items():
+        tags = enrich.tags_for_file(root / path, _bin_dir)
+        if not tags:
+            continue
+        for rec in recs:
+            if tag := enrich.best_tag(tags, rec["symbol"], rec["line"]):
+                rec["kind"] = tag["kind"]
+                rec["typeref"] = tag["typeref"]
+                rec["scope"] = tag["scope"]
+                rec["signature"] = tag["signature"]
 
 
 def _extract_python_body(lines: list[str], i: int) -> list[str]:
@@ -515,7 +556,10 @@ def find_definition(
         limit: Maximum result lines to return (default 100).
         offset: Skip this many result lines (for pagination).
         format: "json" (default) for a structured envelope with
-            {symbol, path, line, col, kind, guard, snippet} records;
+            {symbol, path, line, col, kind, typeref, scope, signature,
+            guard, snippet} records — kind/typeref/scope/signature carry
+            ctags metadata (what the symbol is, its type/return type, its
+            enclosing scope, its parameter list) when available;
             "text" for lines of: symbol line-number file source-line.
     """
     flags = ["-x"] + (["-i"] if case_insensitive else []) + ["--", symbol]
@@ -527,6 +571,7 @@ def find_definition(
         limit,
         offset,
         format,
+        enrich_records=True,
     )
 
 
@@ -948,6 +993,37 @@ def find_callees(
     return "\n".join(sections) + note
 
 
+def _describe_definition(rec: dict, source: str) -> str:
+    """Render one enriched definition record for the symbol_info text card.
+
+    Falls back to the raw source line when no ctags metadata matched.
+    """
+    kind = rec.get("kind")
+    if not kind:
+        return source.strip()
+    name = rec["symbol"]
+    typeref = rec.get("typeref")
+    scope = rec.get("scope")
+    signature = rec.get("signature")
+    if kind in ("function", "prototype"):
+        desc = f"{kind} {name}{signature or '()'}"
+        return f"{desc} -> {typeref}" if typeref else desc
+    if kind == "macro":
+        return f"macro {name}{signature or ''}"
+    if kind == "typedef":
+        return f"typedef {name} = {typeref}" if typeref else f"typedef {name}"
+    if kind == "member":
+        desc = f"member {name}" + (f": {typeref}" if typeref else "")
+        return desc + (f" ({scope})" if scope else "")
+    # enumerator, struct, union, enum, class, variable, ...
+    desc = f"{kind} {name}"
+    if typeref:
+        desc += f": {typeref}"
+    if scope:
+        desc += f" ({scope})"
+    return desc
+
+
 @mcp.tool()
 def symbol_info(
     symbol: str,
@@ -957,9 +1033,11 @@ def symbol_info(
     """One-shot overview card for a symbol — the best FIRST query.
 
     Use this before anything else when you encounter an unfamiliar symbol:
-    one call returns where it's defined, how widely it's used, which files
-    use it most, and which tool to reach for next. Cheaper than any
-    combination of grep and file reads.
+    one call returns where it's defined, WHAT it is (function/macro/struct/
+    typedef/enum-constant, with signature and enclosing scope when
+    available), how widely it's used, which files use it most, and which
+    tool to reach for next. Cheaper than any combination of grep and file
+    reads.
 
     Args:
         symbol: Exact symbol name.
@@ -997,13 +1075,16 @@ def symbol_info(
         hint = "find_symbol_usages to see usage sites"
         hint_tools = ["find_symbol_usages"]
 
+    def_records = [
+        output.record(sym, path, lineno, source)
+        for sym, lineno, path, source in defs[:3]
+    ]
+    _maybe_enrich(def_records, root)
+
     if format == "json":
         info = {
             "symbol": symbol,
-            "definitions": [
-                output.record(sym, path, lineno, source)
-                for sym, lineno, path, source in defs[:3]
-            ],
+            "definitions": def_records,
             "definition_count": len(defs),
             "reference_count": len(refs),
             "file_count": len(counts),
@@ -1019,8 +1100,10 @@ def symbol_info(
 
     lines = [f"Symbol: {symbol}"]
     if defs:
-        for _, lineno, path, source in defs[:3]:
-            lines.append(f"  defined at {path}:{lineno} — {source.strip()}")
+        for rec, (_, lineno, path, source) in zip(def_records, defs[:3]):
+            lines.append(
+                f"  defined at {path}:{lineno} — {_describe_definition(rec, source)}"
+            )
         if len(defs) > 3:
             lines.append(f"  ... {len(defs) - 3} more definition(s)")
     else:
@@ -1277,7 +1360,8 @@ def list_file_symbols(
         project_root: Project directory. Omit to use the server's default.
         limit: Maximum result lines to return (default 100).
         offset: Skip this many result lines (for pagination).
-        format: "json" (default) for structured records; "text" for raw lines.
+        format: "json" (default) for structured records with ctags metadata
+            (kind/typeref/scope/signature) when available; "text" for raw lines.
     """
     return _query_global(
         "list_file_symbols",
@@ -1287,6 +1371,7 @@ def list_file_symbols(
         limit,
         offset,
         format,
+        enrich_records=True,
     )
 
 
@@ -1515,7 +1600,7 @@ def _client_config_text(transport: str, host: str, port: int) -> str:
 
 def main() -> None:
     """Entry point: serve MCP over stdio/HTTP, or run a maintenance subcommand."""
-    global _default_root, _forced_label, _bin_dir
+    global _default_root, _forced_label, _bin_dir, _no_enrich
     parser = argparse.ArgumentParser(
         prog="mcp-gtags-server",
         description=(
@@ -1581,6 +1666,13 @@ def main() -> None:
         "binaries (overrides GTAGS_MCP_BIN_DIR).",
     )
     parser.add_argument(
+        "--no-enrich",
+        action="store_true",
+        help="Disable ctags metadata enrichment — results keep null "
+        "kind/typeref/scope/signature fields (also: GTAGS_MCP_ENRICH=0, "
+        "or `enrich = false` in .gtags-mcp.toml).",
+    )
+    parser.add_argument(
         "--no-ctags",
         action="store_true",
         help="setup only: skip installing universal-ctags and Pygments "
@@ -1595,6 +1687,7 @@ def main() -> None:
     _default_root = args.root
     _forced_label = args.label
     _bin_dir = args.bin_dir
+    _no_enrich = args.no_enrich
     if args.bin_dir:
         os.environ["GTAGS_MCP_BIN_DIR"] = args.bin_dir
 
@@ -1609,6 +1702,7 @@ def main() -> None:
         print(toolchain.doctor_report(project_root=root))
         label = _gtags_label(root)
         print(f"  parser label : {label or 'native (C/C++/Java/PHP/asm only)'}")
+        print(f"  {enrich.status_line(_bin_dir)}")
         return
     if args.command == "config":
         print(_client_config_text(args.transport, args.host, args.port))

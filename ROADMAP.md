@@ -46,11 +46,11 @@ Foundation for everything below; do this first so later tools inherit it.
 **Done when:** every tool can emit parseable JSON with repo-relative paths, and indexing
 a dirty tree skips junk automatically.
 
-### 2. ctags metadata enrichment
+### 2. ctags metadata enrichment ✅ (v0.8.1)
 Cheap, high-value — uses the parser already in the stack.
 
-- [ ] Surface ctags `kind`, `typeref`, `scope`, and `signature` for C/C++ symbols.
-- [ ] Enrich `symbol_info` cards: distinguish function / macro / struct / typedef /
+- [x] Surface ctags `kind`, `typeref`, `scope`, and `signature` for C/C++ symbols.
+- [x] Enrich `symbol_info` cards: distinguish function / macro / struct / typedef /
       enum-constant, show signature and enclosing scope.
 
 **Done when:** `symbol_info` shows kind + signature + scope for C symbols with no build.

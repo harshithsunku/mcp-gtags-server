@@ -1,12 +1,13 @@
 """End-to-end tests for the gtags MCP tools against a tiny C project."""
 
 import json
+import os
 import subprocess
 import textwrap
 
 import pytest
 
-from gtags_mcp import config, server, toolchain
+from gtags_mcp import config, enrich, server, toolchain
 
 requires_global = pytest.mark.skipif(
     toolchain.find_global() is None or toolchain.find_gtags() is None,
@@ -32,12 +33,14 @@ def _drain_refresh_state():
 
 @pytest.fixture(autouse=True)
 def fresh_update_cache():
-    """Isolate debounce/refresh and config-cache state between tests."""
+    """Isolate debounce/refresh, config-cache, and enrich-cache state."""
     _drain_refresh_state()
     config.reset_cache()
+    enrich.reset_cache()
     yield
     _drain_refresh_state()
     config.reset_cache()
+    enrich.reset_cache()
 
 
 @pytest.fixture
@@ -491,7 +494,10 @@ def test_no_match_message(c_project):
 # Milestone 1: structured JSON output, junk skipping, root auto-detection
 # ---------------------------------------------------------------------------
 
-RECORD_KEYS = {"symbol", "path", "line", "col", "kind", "guard", "snippet"}
+RECORD_KEYS = {
+    "symbol", "path", "line", "col",
+    "kind", "typeref", "scope", "signature", "guard", "snippet",
+}
 
 
 @requires_global
@@ -506,7 +512,10 @@ def test_json_record_schema(c_project):
     assert record["path"] == "util.c"  # repo-relative
     assert record["line"] == 3
     assert record["col"] == 5  # 1-based position of the symbol in the snippet
-    assert record["kind"] is None and record["guard"] is None  # milestones 2-3
+    # kind is populated only when Universal Ctags (+json) is available;
+    # strict enrichment assertions live in the milestone-2 test section.
+    assert record["kind"] in (None, "function")
+    assert record["guard"] is None  # milestone 3
     assert "add_numbers" in record["snippet"]
 
 
@@ -588,3 +597,182 @@ def test_root_autodetected_from_subdirectory(c_project, monkeypatch):
     result = json.loads(server.find_definition("add_numbers"))
     assert result["root"] == str(c_project.resolve())
     assert result["results"][0]["path"] == "util.c"
+
+
+# ---------------------------------------------------------------------------
+# Milestone 2: ctags metadata enrichment (kind / typeref / scope / signature)
+# ---------------------------------------------------------------------------
+
+requires_ctags_json = pytest.mark.skipif(
+    not enrich.available(),
+    reason="Universal Ctags with JSON output not available",
+)
+
+
+@pytest.fixture
+def rich_c_project(tmp_path):
+    """A C project with one of everything enrichment can classify."""
+    (tmp_path / "types.h").write_text(
+        textwrap.dedent(
+            """\
+            #ifndef TYPES_H
+            #define TYPES_H
+            #define MAX_ITEMS 64
+            struct item;
+            int process_items(struct item *items, int count);
+            #endif
+            """
+        )
+    )
+    (tmp_path / "types.c").write_text(
+        textwrap.dedent(
+            """\
+            #include "types.h"
+
+            #define SQUARE(x) ((x) * (x))
+
+            enum color { COLOR_RED, COLOR_GREEN = 5 };
+
+            struct item {
+                unsigned long id;
+                char name[32];
+            };
+
+            typedef struct item item_t;
+
+            int process_items(struct item *items, int count)
+            {
+                int total = 0;
+                for (int i = 0; i < count; i++)
+                    total += SQUARE((int)items[i].id);
+                return total;
+            }
+            """
+        )
+    )
+    return tmp_path
+
+
+def _definition_record(symbol, root, path=None):
+    records = json.loads(server.find_definition(symbol, root))["results"]
+    if path is not None:
+        records = [r for r in records if r["path"] == path]
+    assert records, f"no definition record for {symbol}"
+    return records[0]
+
+
+@requires_global
+@requires_ctags_json
+def test_enriched_function_definition(rich_c_project):
+    rec = _definition_record("process_items", str(rich_c_project), path="types.c")
+    assert rec["kind"] == "function"
+    assert rec["typeref"] == "int"
+    assert "struct item" in rec["signature"]
+    assert rec["guard"] is None  # milestone 3 still reserved
+
+
+@requires_global
+@requires_ctags_json
+def test_enriched_kinds_across_c_constructs(rich_c_project):
+    root = str(rich_c_project)
+    enumerator = _definition_record("COLOR_GREEN", root)
+    assert enumerator["kind"] == "enumerator"
+    assert enumerator["scope"] == "enum:color"
+
+    typedef = _definition_record("item_t", root)
+    assert typedef["kind"] == "typedef"
+    assert typedef["typeref"] == "struct:item"
+
+    fn_macro = _definition_record("SQUARE", root)
+    assert fn_macro["kind"] == "macro" and fn_macro["signature"] == "(x)"
+
+    obj_macro = _definition_record("MAX_ITEMS", root)
+    assert obj_macro["kind"] == "macro" and obj_macro["signature"] is None
+
+    struct = _definition_record("item", root, path="types.c")
+    assert struct["kind"] == "struct"
+
+
+@requires_global
+@requires_ctags_json
+def test_list_file_symbols_enriched(rich_c_project):
+    result = json.loads(server.list_file_symbols("types.c", str(rich_c_project)))
+    kinds = {r["symbol"]: r["kind"] for r in result["results"]}
+    assert kinds.get("process_items") == "function"
+    assert kinds.get("item_t") == "typedef"
+    assert kinds.get("SQUARE") == "macro"
+
+
+@requires_global
+@requires_ctags_json
+def test_symbol_info_card_enriched(rich_c_project):
+    root = str(rich_c_project)
+    card = json.loads(server.symbol_info("process_items", root))["results"]
+    definition = card["definitions"][0]
+    assert definition["kind"] == "function"
+    assert definition["typeref"] == "int"
+    assert "struct item" in definition["signature"]
+
+    text = server.symbol_info("process_items", root, format="text")
+    assert "function process_items(" in text
+    assert "-> int" in text
+
+    enum_text = server.symbol_info("COLOR_GREEN", root, format="text")
+    assert "enumerator COLOR_GREEN (enum:color)" in enum_text
+
+    typedef_text = server.symbol_info("item_t", root, format="text")
+    assert "typedef item_t = struct:item" in typedef_text
+
+
+@requires_global
+@requires_ctags_json
+def test_references_and_grep_stay_unenriched(rich_c_project):
+    root = str(rich_c_project)
+    refs = json.loads(server.find_references("SQUARE", root))["results"]
+    assert refs and all(r["kind"] is None for r in refs)
+    hits = json.loads(server.grep_project("int", root))["results"]
+    assert hits and all(r["kind"] is None for r in hits)
+
+
+@requires_global
+@requires_ctags_json
+@pytest.mark.parametrize("how", ["config", "env", "flag"])
+def test_enrichment_opt_out(rich_c_project, monkeypatch, how):
+    root = str(rich_c_project)
+    if how == "config":
+        (rich_c_project / config.PROJECT_CONFIG_NAME).write_text("enrich = false\n")
+    elif how == "env":
+        monkeypatch.setenv("GTAGS_MCP_ENRICH", "0")
+    else:
+        monkeypatch.setattr(server, "_no_enrich", True)
+
+    def forbidden(*args, **kwargs):  # opt-out must never reach ctags
+        raise AssertionError("tags_for_file called despite enrichment opt-out")
+
+    monkeypatch.setattr(enrich, "tags_for_file", forbidden)
+    rec = _definition_record("process_items", root, path="types.c")
+    assert rec["kind"] is None and rec["signature"] is None
+    assert rec["typeref"] is None and rec["scope"] is None
+
+
+@requires_global
+@requires_ctags_json
+def test_enrichment_tracks_file_edits(rich_c_project):
+    root = str(rich_c_project)
+    before = _definition_record("process_items", root, path="types.c")
+    assert before["kind"] == "function"
+
+    source = (rich_c_project / "types.c").read_text()
+    (rich_c_project / "types.c").write_text(
+        source.replace(
+            "int process_items(", "/* moved */\n\nlong process_items("
+        )
+    )
+    # Nudge mtime past the index build's second so `global -u` sees the edit.
+    stat = (rich_c_project / "types.c").stat()
+    os.utime(rich_c_project / "types.c", (stat.st_atime + 2, stat.st_mtime + 2))
+    server.update_index(root)  # synchronous freshness barrier
+    after = _definition_record("process_items", root, path="types.c")
+    assert after["line"] > before["line"]
+    assert after["kind"] == "function"
+    assert after["typeref"] == "long"

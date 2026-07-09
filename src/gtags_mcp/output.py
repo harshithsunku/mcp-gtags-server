@@ -13,12 +13,17 @@ Each tool response is one JSON object with a stable envelope::
 
 Symbol-location items use one stable record schema everywhere::
 
-    { "symbol", "path", "line", "col", "kind", "guard", "snippet" }
+    { "symbol", "path", "line", "col",
+      "kind", "typeref", "scope", "signature", "guard", "snippet" }
 
-``kind`` (ctags metadata) and ``guard`` (#ifdef stack) are reserved for
-later milestones and always present as ``null`` so agent-side parsers never
-change shape. Paths are repo-relative. Errors replace ``results`` with an
-``error`` string but keep the envelope and ``next_tools``.
+``kind`` / ``typeref`` / ``scope`` / ``signature`` are ctags metadata
+(populated on definition-shaped results when Universal Ctags with JSON
+output can parse the file — see :mod:`gtags_mcp.enrich` — and ``null``
+otherwise). ``guard`` (#ifdef stack) is reserved for a later milestone and
+always ``null``. Keys are only ever *added*, never renamed or removed, so
+agent-side parsers keep working. Paths are repo-relative. Errors replace
+``results`` with an ``error`` string but keep the envelope and
+``next_tools``.
 """
 
 from __future__ import annotations
@@ -70,7 +75,17 @@ def next_tools(tool: str, has_results: bool) -> list[str]:
     return list(on_hit if has_results else on_empty)
 
 
-def record(symbol: str, path: str, line: int, snippet: str) -> dict:
+def record(
+    symbol: str,
+    path: str,
+    line: int,
+    snippet: str,
+    *,
+    kind: str | None = None,
+    typeref: str | None = None,
+    scope: str | None = None,
+    signature: str | None = None,
+) -> dict:
     """One symbol-location result in the stable record schema."""
     snippet = snippet.rstrip()
     if len(snippet) > MAX_SNIPPET_CHARS:
@@ -81,7 +96,10 @@ def record(symbol: str, path: str, line: int, snippet: str) -> dict:
         "path": path[2:] if path.startswith("./") else path,
         "line": line,
         "col": idx + 1 if idx >= 0 else None,
-        "kind": None,  # ctags enrichment (roadmap milestone 2)
+        "kind": kind,
+        "typeref": typeref,
+        "scope": scope,
+        "signature": signature,
         "guard": None,  # #ifdef stack (roadmap milestone 3)
         "snippet": snippet,
     }
