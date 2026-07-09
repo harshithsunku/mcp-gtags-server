@@ -21,10 +21,13 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import Literal
 
 from mcp.server.fastmcp import FastMCP
 
 from . import config as config_module
+from . import fileset
+from . import output
 from . import toolchain
 
 mcp = FastMCP(
@@ -39,9 +42,13 @@ mcp = FastMCP(
         "read an implementation, find_callers / call_hierarchy for impact "
         "analysis, find_callees to see what a function depends on, and "
         "summarize_references first for very widely used symbols. "
-        "The index is built and refreshed automatically — never worry about it."
+        "The index is built and refreshed automatically — never worry about it. "
+        "Every tool returns machine-readable JSON by default; pass "
+        "format='text' for the human-readable rendering."
     ),
 )
+
+Format = Literal["json", "text"]
 
 DEFAULT_LIMIT = 100
 MAX_LINE_CHARS = 200
@@ -107,21 +114,37 @@ def _check_global_installed() -> str | None:
     return None
 
 
+def _detect_root(start: Path) -> Path:
+    """Walk up from start to the nearest directory holding GTAGS or .git.
+
+    Monorepo/subdirectory support: a server launched (or queried) from deep
+    inside a tree still indexes and reports paths from the project root.
+    Falls back to start itself when no marker is found.
+    """
+    for candidate in (start, *start.parents):
+        if (candidate / "GTAGS").is_file() or (candidate / ".git").exists():
+            return candidate
+    return start
+
+
 def _effective_root(project_root: str | None) -> tuple[Path | None, str | None]:
-    """Resolve the project root: explicit arg > --root/env default > config > cwd."""
-    raw = (
-        project_root
-        or _default_root
-        or config_module.get_setting("root")
-        or os.getcwd()
-    )
+    """Resolve the project root: explicit arg > --root/env default > config
+    > auto-detected (walk up from cwd to GTAGS/.git) > cwd."""
+    raw = project_root or _default_root or config_module.get_setting("root")
+    if raw is None:
+        return _detect_root(Path(os.getcwd()).resolve()), None
     root = Path(raw).expanduser().resolve()
     if not root.is_dir():
         return None, f"Error: project_root is not a directory: {raw}"
     return root, None
 
 
-def _run(args: list[str], cwd: Path, timeout: int = QUERY_TIMEOUT_SECONDS) -> tuple[str, str, int]:
+def _run(
+    args: list[str],
+    cwd: Path,
+    timeout: int = QUERY_TIMEOUT_SECONDS,
+    input_text: str | None = None,
+) -> tuple[str, str, int]:
     """Run a gtags/global command (resolved to user-space binaries) in cwd."""
     resolver = {"global": toolchain.find_global, "gtags": toolchain.find_gtags}
     exe = args[0]
@@ -130,8 +153,8 @@ def _run(args: list[str], cwd: Path, timeout: int = QUERY_TIMEOUT_SECONDS) -> tu
     env = os.environ.copy()
     env.update(toolchain.runtime_env(exe))
     if os.sep in exe:
-        # `global -u` re-spawns `gtags` via PATH; make sure the resolved
-        # user-space bin directory is visible to child processes too.
+        # gtags spawns helpers (plugin parsers, python3 shim) via PATH; make
+        # sure the resolved user-space bin directory is visible to them too.
         env["PATH"] = str(Path(exe).parent) + os.pathsep + env.get("PATH", "")
     label = _gtags_label(cwd)
     if label:
@@ -143,17 +166,43 @@ def _run(args: list[str], cwd: Path, timeout: int = QUERY_TIMEOUT_SECONDS) -> tu
         text=True,
         timeout=timeout,
         env=env,
+        input=input_text,
     )
     return proc.stdout, proc.stderr, proc.returncode
 
 
+def _run_index(root: Path, incremental: bool) -> tuple[str, str, int]:
+    """(Re)build root's index from an explicit, junk-free file list.
+
+    The list comes from `git ls-files` (exact .gitignore semantics) or a
+    junk-aware walk, minus `skip_globs` — see :mod:`gtags_mcp.fileset` — and
+    is fed to ``gtags -f -`` so vendored/build files never enter the index.
+    Incremental mode (`gtags -i`) adds new files and drops deleted or newly
+    ignored ones, which plain ``global -u`` cannot do for a list-built index.
+    """
+    files = fileset.collect_files(
+        root,
+        skip_globs=config_module.get_list_setting("skip_globs", root),
+        respect_gitignore=config_module.get_bool_setting(
+            "respect_gitignore", root, default=True
+        ),
+    )
+    args = ["gtags"] + (["-i"] if incremental else []) + ["--skip-unreadable", "-f", "-"]
+    return _run(
+        args,
+        root,
+        timeout=INDEX_TIMEOUT_SECONDS,
+        input_text="".join(f"{f}\n" for f in files),
+    )
+
+
 def _refresh_in_background(root: Path) -> None:
-    """Thread body: run `global -u` and record outcome under the lock."""
+    """Thread body: refresh the index incrementally, record outcome under the lock."""
     started = time.monotonic()
     try:
-        _, stderr, code = _run(["global", "-u"], root, timeout=INDEX_TIMEOUT_SECONDS)
+        _, stderr, code = _run_index(root, incremental=True)
         error = (
-            f"Warning: background index refresh failed (global -u exited {code}): "
+            f"Warning: background index refresh failed (gtags -i exited {code}): "
             f"{stderr.strip()}"
             if code != 0
             else None
@@ -180,14 +229,14 @@ def _ensure_index(root: Path) -> str | None:
     """Build the index if missing; else kick a non-blocking background refresh.
 
     Queries are never blocked by refresh: they answer from the current index
-    while `global -u` catches up in a daemon thread. Staleness is bounded by
+    while `gtags -i` catches up in a daemon thread. Staleness is bounded by
     the adaptive debounce window plus the refresh duration; the update_index
     tool is the synchronous barrier when guaranteed freshness is needed.
     Returns an error string only for fatal conditions (failed full build);
     a failed *background* refresh is surfaced as a warning on the next query.
     """
     if not (root / "GTAGS").is_file():
-        stdout, stderr, code = _run(["gtags"], root, timeout=INDEX_TIMEOUT_SECONDS)
+        stdout, stderr, code = _run_index(root, incremental=False)
         if code != 0:
             return (
                 f"Error: automatic indexing failed (gtags exited {code}): "
@@ -261,21 +310,52 @@ def _raw_global(
 
 
 def _query_global(
+    tool: str,
     flags: list[str],
     project_root: str | None,
     empty_message: str,
     limit: int = DEFAULT_LIMIT,
     offset: int = 0,
+    format: Format = "json",
+    parse: str = "cxref",  # cxref | symbol | path — shape of `global` stdout
+    record_symbol: str | None = None,
 ) -> str:
     """Shared plumbing for all read-only `global` queries."""
     stdout, root, err = _raw_global(flags, project_root)
     if err:
-        return err
+        return output.error(tool, err, root) if format == "json" else err
     warning = _pop_refresh_warning(root)
-    suffix = f"\n\n{warning}" if warning else ""
-    if not stdout.strip():
-        return empty_message + suffix
-    return _paginate(stdout.rstrip(), limit, offset) + suffix
+    if format == "text":
+        suffix = f"\n\n{warning}" if warning else ""
+        if not stdout.strip():
+            return empty_message + suffix
+        return _paginate(stdout.rstrip(), limit, offset) + suffix
+    if parse == "cxref":
+        items = [
+            output.record(record_symbol or r[0], r[2], r[1], r[3])
+            for line in stdout.splitlines()
+            if (r := _parse_cxref(line))
+        ]
+    elif parse == "symbol":
+        items = [{"symbol": line.strip()} for line in stdout.splitlines() if line.strip()]
+    else:  # path
+        items = [
+            {"path": p[2:] if p.startswith("./") else p}
+            for line in stdout.splitlines()
+            if (p := line.strip())
+        ]
+    page, total, truncated = output.paginate(items, limit, offset)
+    extra = {} if items else {"message": empty_message}
+    return output.envelope(
+        tool,
+        root,
+        page,
+        total=total,
+        offset=offset,
+        truncated=truncated,
+        warning=warning,
+        **extra,
+    )
 
 
 def _parse_cxref(line: str) -> tuple[str, int, str, str] | None:
@@ -418,6 +498,7 @@ def find_definition(
     case_insensitive: bool = False,
     limit: int = DEFAULT_LIMIT,
     offset: int = 0,
+    format: Format = "json",
 ) -> str:
     """Find where a C/C++ symbol (function, struct, macro, typedef, enum) is defined.
 
@@ -426,23 +507,26 @@ def find_definition(
     site(s), not every textual occurrence, and stays fast on codebases with
     millions of lines. The index is built and refreshed automatically.
 
-    Each result line has the format: symbol line-number file source-line.
-
     Args:
         symbol: Exact symbol name, e.g. "tcp_v4_rcv" or "list_head".
         project_root: Project directory. Omit to use the server's default
-            (its working directory or the configured --root).
+            (auto-detected by walking up from its working directory).
         case_insensitive: Match the symbol ignoring case.
         limit: Maximum result lines to return (default 100).
         offset: Skip this many result lines (for pagination).
+        format: "json" (default) for a structured envelope with
+            {symbol, path, line, col, kind, guard, snippet} records;
+            "text" for lines of: symbol line-number file source-line.
     """
     flags = ["-x"] + (["-i"] if case_insensitive else []) + ["--", symbol]
     return _query_global(
+        "find_definition",
         flags,
         project_root,
         f"No definition found for symbol '{symbol}'.",
         limit,
         offset,
+        format,
     )
 
 
@@ -453,6 +537,7 @@ def find_references(
     case_insensitive: bool = False,
     limit: int = DEFAULT_LIMIT,
     offset: int = 0,
+    format: Format = "json",
 ) -> str:
     """Find all call/usage sites of a defined C/C++ symbol.
 
@@ -461,22 +546,24 @@ def find_references(
     while this returns only real reference sites from the index, instantly
     even on huge trees.
 
-    Each result line has the format: symbol line-number file source-line.
-
     Args:
         symbol: Exact symbol name whose call/usage sites you want.
         project_root: Project directory. Omit to use the server's default.
         case_insensitive: Match the symbol ignoring case.
         limit: Maximum result lines to return (default 100).
         offset: Skip this many result lines (for pagination).
+        format: "json" (default) for structured records; "text" for
+            lines of: symbol line-number file source-line.
     """
     flags = ["-rx"] + (["-i"] if case_insensitive else []) + ["--", symbol]
     return _query_global(
+        "find_references",
         flags,
         project_root,
         f"No references found for symbol '{symbol}'.",
         limit,
         offset,
+        format,
     )
 
 
@@ -485,6 +572,7 @@ def get_symbol_body(
     symbol: str,
     project_root: str | None = None,
     max_definitions: int = 3,
+    format: Format = "json",
 ) -> str:
     """Return the full source code of a symbol's definition — just the body.
 
@@ -498,20 +586,43 @@ def get_symbol_body(
         project_root: Project directory. Omit to use the server's default.
         max_definitions: If the symbol has multiple definitions, return at
             most this many bodies (default 3).
+        format: "json" (default) for {path, line, body} items; "text" for
+            "=== path:line ===" separated bodies.
     """
     stdout, root, err = _raw_global(["-x", "--", symbol], project_root)
     if err:
-        return err
+        return output.error("get_symbol_body", err, root) if format == "json" else err
     refs = [r for line in stdout.splitlines() if (r := _parse_cxref(line))]
     if not refs:
-        return f"No definition found for symbol '{symbol}'."
+        message = f"No definition found for symbol '{symbol}'."
+        if format == "json":
+            return output.envelope("get_symbol_body", root, [], message=message)
+        return message
+    omitted = max(0, len(refs) - max_definitions)
+    if format == "json":
+        items = [
+            {
+                "path": path,
+                "line": lineno,
+                "body": "\n".join(_extract_body(root / path, lineno)),
+            }
+            for _, lineno, path, _ in refs[:max_definitions]
+        ]
+        return output.envelope(
+            "get_symbol_body",
+            root,
+            items,
+            total=len(refs),
+            truncated=omitted > 0,
+            omitted_definitions=omitted,
+        )
     chunks: list[str] = []
     for _, lineno, path, _ in refs[:max_definitions]:
         body = _extract_body(root / path, lineno)
         chunks.append(f"=== {path}:{lineno} ===\n" + "\n".join(body))
-    if len(refs) > max_definitions:
+    if omitted:
         chunks.append(
-            f"... {len(refs) - max_definitions} more definition(s) not shown; "
+            f"... {omitted} more definition(s) not shown; "
             "use find_definition to list them all."
         )
     return "\n\n".join(chunks)
@@ -523,6 +634,7 @@ def find_callers(
     project_root: str | None = None,
     limit: int = DEFAULT_LIMIT,
     offset: int = 0,
+    format: Format = "json",
 ) -> str:
     """Find the FUNCTIONS that call a symbol, deduplicated, with call counts.
 
@@ -532,24 +644,42 @@ def find_callers(
     single result line. This is the highest signal-to-noise view of "who
     uses this?" on a large codebase.
 
-    Each result line has the format: caller-function  file  N call site(s) at lines ...
-
     Args:
         symbol: Exact symbol name whose callers you want.
         project_root: Project directory. Omit to use the server's default.
         limit: Maximum result lines to return (default 100).
         offset: Skip this many result lines (for pagination).
+        format: "json" (default) for {caller, path, sites} items; "text" for
+            lines of: caller-function  file  N call site(s) at lines ...
     """
+    root, _ = _effective_root(project_root)
     callers, err = _callers_of(symbol, project_root)
     if err:
+        if format == "json":
+            hints = ["summarize_references"] if "too broad" in err else None
+            return output.error("find_callers", err, root, hints=hints)
         return err
+    ranked = sorted(callers.items(), key=lambda kv: (-len(kv[1]), kv[0]))
+    if format == "json":
+        items = [
+            {"caller": caller, "path": path, "sites": sites}
+            for (caller, path), sites in ranked
+        ]
+        page, total, truncated = output.paginate(items, limit, offset)
+        extra = {} if items else {"message": f"No references found for symbol '{symbol}'."}
+        return output.envelope(
+            "find_callers",
+            root,
+            page,
+            total=total,
+            offset=offset,
+            truncated=truncated,
+            **extra,
+        )
     if not callers:
         return f"No references found for symbol '{symbol}'."
-
     rows = []
-    for (caller, path), sites in sorted(
-        callers.items(), key=lambda kv: (-len(kv[1]), kv[0])
-    ):
+    for (caller, path), sites in ranked:
         shown = ", ".join(str(n) for n in sites[:5])
         more = f", +{len(sites) - 5} more" if len(sites) > 5 else ""
         plural = "s" if len(sites) != 1 else ""
@@ -563,6 +693,7 @@ def summarize_references(
     project_root: str | None = None,
     limit: int = DEFAULT_LIMIT,
     offset: int = 0,
+    format: Format = "json",
 ) -> str:
     """Per-file reference counts for a symbol — the cheapest wide view.
 
@@ -571,27 +702,39 @@ def summarize_references(
     can see where usage concentrates and then drill into a specific file
     with find_references or find_callers. Never floods the context window.
 
-    Each result line has the format: count  file.
-
     Args:
         symbol: Exact symbol name.
         project_root: Project directory. Omit to use the server's default.
         limit: Maximum result lines to return (default 100).
         offset: Skip this many result lines (for pagination).
+        format: "json" (default) for {path, count} items plus
+            total_references; "text" for lines of: count  file.
     """
-    stdout, _, err = _raw_global(["-rx", "--", symbol], project_root)
+    stdout, root, err = _raw_global(["-rx", "--", symbol], project_root)
     if err:
-        return err
+        return output.error("summarize_references", err, root) if format == "json" else err
     refs = [r for line in stdout.splitlines() if (r := _parse_cxref(line))]
-    if not refs:
-        return f"No references found for symbol '{symbol}'."
     counts: dict[str, int] = {}
     for _, _, path, _ in refs:
         counts[path] = counts.get(path, 0) + 1
-    rows = [
-        f"{count:6d}  {path}"
-        for path, count in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
-    ]
+    ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    if format == "json":
+        items = [{"path": path, "count": count} for path, count in ranked]
+        page, total, truncated = output.paginate(items, limit, offset)
+        extra = {} if items else {"message": f"No references found for symbol '{symbol}'."}
+        return output.envelope(
+            "summarize_references",
+            root,
+            page,
+            total=total,
+            offset=offset,
+            truncated=truncated,
+            total_references=len(refs),
+            **extra,
+        )
+    if not refs:
+        return f"No references found for symbol '{symbol}'."
+    rows = [f"{count:6d}  {path}" for path, count in ranked]
     header = f"{len(refs)} references across {len(counts)} files:"
     return header + "\n" + _paginate("\n".join(rows), limit, offset)
 
@@ -601,6 +744,7 @@ def call_hierarchy(
     symbol: str,
     project_root: str | None = None,
     depth: int = 2,
+    format: Format = "json",
 ) -> str:
     """Multi-level callers tree: who calls X, who calls THOSE, and so on.
 
@@ -613,64 +757,103 @@ def call_hierarchy(
         symbol: Exact symbol name at the root of the tree.
         project_root: Project directory. Omit to use the server's default.
         depth: How many caller levels to expand (1-5, default 2).
+        format: "json" (default) for a nested {caller, path, site_count,
+            callers} tree; "text" for a box-drawing rendering.
     """
     depth = max(1, min(depth, 5))
-    stdout, _, err = _raw_global(["-x", "--", symbol], project_root)
+    stdout, root, err = _raw_global(["-x", "--", symbol], project_root)
     if err:
-        return err
+        return output.error("call_hierarchy", err, root) if format == "json" else err
     defs = [r for line in stdout.splitlines() if (r := _parse_cxref(line))]
-    if defs:
-        header = f"{symbol}  (definition: {defs[0][2]}:{defs[0][1]})"
-    else:
-        header = f"{symbol}  (no in-tree definition)"
 
-    lines = [header]
     visited = {symbol}
     state = {"nodes": 0, "capped": False}
     MAX_NODES = 150
     MAX_PER_NODE = 25
 
-    def expand(sym: str, level: int, prefix: str) -> None:
+    def expand(sym: str, level: int) -> list[dict]:
         callers, cerr = _callers_of(sym, project_root)
         if cerr:
-            lines.append(f"{prefix}└─ ({cerr})")
-            return
+            return [{"note": f"({cerr})"}]
         if not callers:
-            return
+            return []
+        children: list[dict] = []
         items = sorted(callers.items(), key=lambda kv: (-len(kv[1]), kv[0]))
-        shown = items[:MAX_PER_NODE]
-        for i, ((caller, path), sites) in enumerate(shown):
+        for (caller, path), sites in items[:MAX_PER_NODE]:
             if state["nodes"] >= MAX_NODES:
                 if not state["capped"]:
-                    lines.append(
-                        f"{prefix}└─ ... tree capped at {MAX_NODES} nodes; "
-                        "rerun with a smaller depth or start from a deeper symbol."
+                    children.append(
+                        {
+                            "note": f"... tree capped at {MAX_NODES} nodes; "
+                            "rerun with a smaller depth or start from a deeper symbol."
+                        }
                     )
                     state["capped"] = True
-                return
-            last = i == len(shown) - 1 and len(items) <= MAX_PER_NODE
-            branch = "└─ " if last else "├─ "
-            plural = "s" if len(sites) != 1 else ""
-            label = f"{caller}  {path}  ({len(sites)} site{plural})"
+                return children
+            child: dict = {"caller": caller, "path": path, "site_count": len(sites)}
             expandable = caller not in ("(file scope)",) and level < depth
             if caller == sym:
-                label += "  (recursive)"
+                child["recursive"] = True
                 expandable = False
             elif caller in visited:
-                label += "  (already shown above)"
+                child["repeated"] = True  # already shown elsewhere in the tree
                 expandable = False
-            lines.append(f"{prefix}{branch}{label}")
             state["nodes"] += 1
             if expandable:
                 visited.add(caller)
-                expand(caller, level + 1, prefix + ("   " if last else "│  "))
+                child["callers"] = expand(caller, level + 1)
+            children.append(child)
         if len(items) > MAX_PER_NODE:
-            lines.append(
-                f"{prefix}└─ ... {len(items) - MAX_PER_NODE} more callers not shown "
-                f"(use find_callers('{sym}') with offset to page through them)"
+            children.append(
+                {
+                    "note": f"... {len(items) - MAX_PER_NODE} more callers not shown "
+                    f"(use find_callers('{sym}') with offset to page through them)"
+                }
             )
+        return children
 
-    expand(symbol, 1, "")
+    callers_tree = expand(symbol, 1)
+
+    if format == "json":
+        tree = {
+            "symbol": symbol,
+            "definition": {"path": defs[0][2], "line": defs[0][1]} if defs else None,
+            "callers": callers_tree,
+        }
+        extra = {} if callers_tree else {"message": f"No references found for '{symbol}'."}
+        return output.envelope(
+            "call_hierarchy",
+            root,
+            tree,
+            total=state["nodes"],
+            truncated=state["capped"],
+            hints=output.next_tools("call_hierarchy", bool(callers_tree)),
+            **extra,
+        )
+
+    if defs:
+        lines = [f"{symbol}  (definition: {defs[0][2]}:{defs[0][1]})"]
+    else:
+        lines = [f"{symbol}  (no in-tree definition)"]
+
+    def render(children: list[dict], prefix: str) -> None:
+        for i, child in enumerate(children):
+            last = i == len(children) - 1
+            branch = "└─ " if last else "├─ "
+            if "note" in child:
+                lines.append(f"{prefix}└─ {child['note']}")
+                continue
+            plural = "s" if child["site_count"] != 1 else ""
+            label = f"{child['caller']}  {child['path']}  ({child['site_count']} site{plural})"
+            if child.get("recursive"):
+                label += "  (recursive)"
+            elif child.get("repeated"):
+                label += "  (already shown above)"
+            lines.append(f"{prefix}{branch}{label}")
+            if child.get("callers"):
+                render(child["callers"], prefix + ("   " if last else "│  "))
+
+    render(callers_tree, "")
     if len(lines) == 1:
         lines.append(f"(no references found for '{symbol}')")
     return "\n".join(lines)
@@ -680,6 +863,7 @@ def call_hierarchy(
 def find_callees(
     symbol: str,
     project_root: str | None = None,
+    format: Format = "json",
 ) -> str:
     """What functions does this function CALL? (the outgoing call graph)
 
@@ -692,13 +876,25 @@ def find_callees(
     Args:
         symbol: Exact name of the function to analyze.
         project_root: Project directory. Omit to use the server's default.
+        format: "json" (default) for {in_tree: [{symbol, path, line}],
+            external: [names]}; "text" for a sectioned listing.
     """
     stdout, root, err = _raw_global(["-x", "--", symbol], project_root)
     if err:
-        return err
+        return output.error("find_callees", err, root) if format == "json" else err
     defs = [r for line in stdout.splitlines() if (r := _parse_cxref(line))]
     if not defs:
-        return f"No definition found for symbol '{symbol}'."
+        message = f"No definition found for symbol '{symbol}'."
+        if format == "json":
+            return output.envelope(
+                "find_callees",
+                root,
+                {"in_tree": [], "external": []},
+                total=0,
+                hints=output.next_tools("get_symbol_body", False),
+                message=message,
+            )
+        return message
     _, lineno, path, _ = defs[0]
     body = "\n".join(_extract_body(root / path, lineno))
 
@@ -708,28 +904,45 @@ def find_callees(
         if name != symbol and name not in _NON_CALLS and name not in seen:
             seen.add(name)
             candidates.append(name)
-    if not candidates:
-        return f"{symbol} ({path}:{lineno}) makes no detectable calls."
 
-    note = ""
-    if len(candidates) > 40:
-        note = f"\n(analysis capped at 40 of {len(candidates)} distinct call targets)"
-        candidates = candidates[:40]
+    capped = max(0, len(candidates) - 40)
+    candidates = candidates[:40]
 
-    in_tree: list[str] = []
+    in_tree: list[dict] = []
     external: list[str] = []
     for name in candidates:
         out, _, cerr = _raw_global(["-x", "--", name], project_root)
         target = _parse_cxref(out.splitlines()[0]) if out and out.strip() else None
         if target and not cerr:
-            in_tree.append(f"  {name}  {target[2]}:{target[1]}")
+            in_tree.append({"symbol": name, "path": target[2], "line": target[1]})
         else:
             external.append(name)
 
+    if format == "json":
+        extra = {} if candidates else {
+            "message": f"{symbol} ({path}:{lineno}) makes no detectable calls."
+        }
+        return output.envelope(
+            "find_callees",
+            root,
+            {"in_tree": in_tree, "external": external},
+            total=len(in_tree) + len(external),
+            truncated=capped > 0,
+            definition={"path": path, "line": lineno},
+            capped_call_targets=capped,
+            **extra,
+        )
+    if not candidates:
+        return f"{symbol} ({path}:{lineno}) makes no detectable calls."
+    note = (
+        f"\n(analysis capped at 40 of {len(candidates) + capped} distinct call targets)"
+        if capped
+        else ""
+    )
     sections = [f"Callees of {symbol} ({path}:{lineno}):"]
     if in_tree:
         sections.append("In-tree (use get_symbol_body to read them):")
-        sections.extend(in_tree)
+        sections.extend(f"  {c['symbol']}  {c['path']}:{c['line']}" for c in in_tree)
     if external:
         sections.append(f"External/unresolved: {', '.join(external)}")
     return "\n".join(sections) + note
@@ -739,6 +952,7 @@ def find_callees(
 def symbol_info(
     symbol: str,
     project_root: str | None = None,
+    format: Format = "json",
 ) -> str:
     """One-shot overview card for a symbol — the best FIRST query.
 
@@ -750,11 +964,58 @@ def symbol_info(
     Args:
         symbol: Exact symbol name.
         project_root: Project directory. Omit to use the server's default.
+        format: "json" (default) for {definitions, reference_count,
+            file_count, top_files}; "text" for the overview card.
     """
-    defs_out, _, err = _raw_global(["-x", "--", symbol], project_root)
+    defs_out, root, err = _raw_global(["-x", "--", symbol], project_root)
     if err:
-        return err
+        return output.error("symbol_info", err, root) if format == "json" else err
     defs = [r for line in defs_out.splitlines() if (r := _parse_cxref(line))]
+
+    refs_out, _, rerr = _raw_global(["-rx", "--", symbol], project_root)
+    refs = (
+        [r for line in refs_out.splitlines() if (r := _parse_cxref(line))]
+        if refs_out and not rerr
+        else []
+    )
+    counts: dict[str, int] = {}
+    for _, _, path, _ in refs:
+        counts[path] = counts.get(path, 0) + 1
+    top = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:5]
+
+    if defs and refs:
+        if len(counts) > 50:
+            hint = "summarize_references (usage is very widespread), then find_callers on hot files"
+            hint_tools = ["summarize_references", "find_callers"]
+        else:
+            hint = "get_symbol_body to read it; find_callers or call_hierarchy for impact"
+            hint_tools = ["get_symbol_body", "find_callers", "call_hierarchy"]
+    elif defs:
+        hint = "get_symbol_body to read it"
+        hint_tools = ["get_symbol_body"]
+    else:
+        hint = "find_symbol_usages to see usage sites"
+        hint_tools = ["find_symbol_usages"]
+
+    if format == "json":
+        info = {
+            "symbol": symbol,
+            "definitions": [
+                output.record(sym, path, lineno, source)
+                for sym, lineno, path, source in defs[:3]
+            ],
+            "definition_count": len(defs),
+            "reference_count": len(refs),
+            "file_count": len(counts),
+            "top_files": [{"path": path, "count": count} for path, count in top],
+        }
+        return output.envelope(
+            "symbol_info",
+            root,
+            info,
+            total=len(defs) + len(refs),
+            hints=hint_tools,
+        )
 
     lines = [f"Symbol: {symbol}"]
     if defs:
@@ -764,32 +1025,11 @@ def symbol_info(
             lines.append(f"  ... {len(defs) - 3} more definition(s)")
     else:
         lines.append("  no in-tree definition (external symbol? try find_symbol_usages)")
-
-    refs_out, _, rerr = _raw_global(["-rx", "--", symbol], project_root)
-    refs = (
-        [r for line in refs_out.splitlines() if (r := _parse_cxref(line))]
-        if refs_out and not rerr
-        else []
-    )
     if refs:
-        counts: dict[str, int] = {}
-        for _, _, path, _ in refs:
-            counts[path] = counts.get(path, 0) + 1
-        top = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:5]
         lines.append(f"  referenced {len(refs)} time(s) across {len(counts)} file(s); top files:")
         lines.extend(f"    {count:5d}  {path}" for path, count in top)
     else:
         lines.append("  no references found")
-
-    if defs and refs:
-        if len(counts) > 50:
-            hint = "summarize_references (usage is very widespread), then find_callers on hot files"
-        else:
-            hint = "get_symbol_body to read it; find_callers or call_hierarchy for impact"
-    elif defs:
-        hint = "get_symbol_body to read it"
-    else:
-        hint = "find_symbol_usages to see usage sites"
     lines.append(f"  next: {hint}")
     return "\n".join(lines)
 
@@ -798,6 +1038,7 @@ def symbol_info(
 def project_overview(
     project_root: str | None = None,
     top: int = 15,
+    format: Format = "json",
 ) -> str:
     """High-level map of the indexed tree: size, structure, and languages.
 
@@ -808,13 +1049,13 @@ def project_overview(
     Args:
         project_root: Project directory. Omit to use the server's default.
         top: How many top-level directories to list (default 15).
+        format: "json" (default) for {file_count, directories, file_types};
+            "text" for the summary card.
     """
     stdout, root, err = _raw_global(["-P"], project_root)
     if err:
-        return err
+        return output.error("project_overview", err, root) if format == "json" else err
     paths = [p for p in stdout.splitlines() if p.strip()]
-    if not paths:
-        return "The index contains no files."
 
     dir_counts: dict[str, int] = {}
     ext_counts: dict[str, int] = {}
@@ -824,17 +1065,30 @@ def project_overview(
         dir_counts[head] = dir_counts.get(head, 0) + 1
         ext = ("." + clean.rsplit(".", 1)[1]) if "." in clean.rsplit("/", 1)[-1] else "(none)"
         ext_counts[ext] = ext_counts.get(ext, 0) + 1
+    ranked = sorted(dir_counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    top_exts = sorted(ext_counts.items(), key=lambda kv: -kv[1])[:8]
 
+    if format == "json":
+        overview = {
+            "file_count": len(paths),
+            "directories": [
+                {"name": name, "files": count} for name, count in ranked[:top]
+            ],
+            "more_directories": max(0, len(ranked) - top),
+            "file_types": [{"ext": ext, "files": count} for ext, count in top_exts],
+        }
+        extra = {} if paths else {"message": "The index contains no files."}
+        return output.envelope(
+            "project_overview", root, overview, total=len(paths), **extra
+        )
+    if not paths:
+        return "The index contains no files."
     lines = [f"Project: {root} — {len(paths)} indexed source files"]
     lines.append("Top-level directories by file count:")
-    ranked = sorted(dir_counts.items(), key=lambda kv: (-kv[1], kv[0]))
     lines.extend(f"  {count:6d}  {name}/" for name, count in ranked[:top])
     if len(ranked) > top:
         lines.append(f"  ... {len(ranked) - top} more directories")
-    lines.append("File types: " + ", ".join(
-        f"{ext} ({count})"
-        for ext, count in sorted(ext_counts.items(), key=lambda kv: -kv[1])[:8]
-    ))
+    lines.append("File types: " + ", ".join(f"{ext} ({count})" for ext, count in top_exts))
     return "\n".join(lines)
 
 
@@ -842,6 +1096,7 @@ def project_overview(
 def find_dead_symbols(
     file_path: str,
     project_root: str | None = None,
+    format: Format = "json",
 ) -> str:
     """List symbols defined in a file that have ZERO references anywhere.
 
@@ -854,29 +1109,50 @@ def find_dead_symbols(
     Args:
         file_path: Source file to audit, relative to the project root or absolute.
         project_root: Project directory. Omit to use the server's default.
+        format: "json" (default) for {symbol, path, line} items; "text"
+            for a summary listing.
     """
-    defs_out, _, err = _raw_global(["-fx", "--", file_path], project_root)
+    defs_out, root, err = _raw_global(["-fx", "--", file_path], project_root)
     if err:
-        return err
+        return output.error("find_dead_symbols", err, root) if format == "json" else err
     defs = [r for line in defs_out.splitlines() if (r := _parse_cxref(line))]
     if not defs:
-        return f"No symbols defined in '{file_path}'."
+        message = f"No symbols defined in '{file_path}'."
+        if format == "json":
+            return output.envelope("find_dead_symbols", root, [], message=message)
+        return message
 
-    note = ""
-    if len(defs) > 100:
-        note = f"\n(audit capped at the first 100 of {len(defs)} definitions)"
-        defs = defs[:100]
+    capped = len(defs) > 100
+    total_defs = len(defs)
+    defs = defs[:100]
 
-    dead = []
+    dead: list[dict] = []
     for sym, lineno, path, _ in defs:
         refs_out, _, rerr = _raw_global(["-rx", "--", sym], project_root)
         if not rerr and (not refs_out or not refs_out.strip()):
-            dead.append(f"  {sym}  {path}:{lineno}")
+            dead.append({"symbol": sym, "path": path, "line": lineno})
+
+    if format == "json":
+        extra = {} if dead else {
+            "message": f"All {len(defs)} symbols defined in '{file_path}' "
+            "are referenced somewhere."
+        }
+        return output.envelope(
+            "find_dead_symbols",
+            root,
+            dead,
+            truncated=capped,
+            checked_definitions=len(defs),
+            total_definitions=total_defs,
+            **extra,
+        )
+    note = f"\n(audit capped at the first 100 of {total_defs} definitions)" if capped else ""
     if not dead:
         return f"All {len(defs)} symbols defined in '{file_path}' are referenced somewhere." + note
+    rows = "\n".join(f"  {d['symbol']}  {d['path']}:{d['line']}" for d in dead)
     return (
         f"{len(dead)} of {len(defs)} symbols defined in '{file_path}' have no references "
-        "(dead-code candidates):\n" + "\n".join(dead) + note
+        "(dead-code candidates):\n" + rows + note
     )
 
 
@@ -886,6 +1162,7 @@ def find_includers(
     project_root: str | None = None,
     limit: int = DEFAULT_LIMIT,
     offset: int = 0,
+    format: Format = "json",
 ) -> str:
     """Which files #include this header? (C/C++ include-graph impact)
 
@@ -898,15 +1175,19 @@ def find_includers(
         project_root: Project directory. Omit to use the server's default.
         limit: Maximum result lines to return (default 100).
         offset: Skip this many result lines (for pagination).
+        format: "json" (default) for structured records; "text" for raw lines.
     """
-    base = re.escape(header_name.rsplit("/", 1)[-1])
-    pattern = f'#[[:space:]]*include[[:space:]]*["<]([^">]*/)?{base}[">]'
+    base_name = header_name.rsplit("/", 1)[-1]
+    pattern = f'#[[:space:]]*include[[:space:]]*["<]([^">]*/)?{re.escape(base_name)}[">]'
     return _query_global(
+        "find_includers",
         ["-gx", "--", pattern],
         project_root,
         f"No files include '{header_name}'.",
         limit,
         offset,
+        format,
+        record_symbol=base_name,
     )
 
 
@@ -916,6 +1197,7 @@ def find_symbol_usages(
     project_root: str | None = None,
     limit: int = DEFAULT_LIMIT,
     offset: int = 0,
+    format: Format = "json",
 ) -> str:
     """Find usages of symbols that have no definition inside the project.
 
@@ -928,13 +1210,16 @@ def find_symbol_usages(
         project_root: Project directory. Omit to use the server's default.
         limit: Maximum result lines to return (default 100).
         offset: Skip this many result lines (for pagination).
+        format: "json" (default) for structured records; "text" for raw lines.
     """
     return _query_global(
+        "find_symbol_usages",
         ["-sx", "--", symbol],
         project_root,
         f"No usages found for undefined symbol '{symbol}'.",
         limit,
         offset,
+        format,
     )
 
 
@@ -945,6 +1230,7 @@ def grep_project(
     case_insensitive: bool = False,
     limit: int = DEFAULT_LIMIT,
     offset: int = 0,
+    format: Format = "json",
 ) -> str:
     """Regex-search all indexed source files (POSIX extended regex).
 
@@ -959,14 +1245,17 @@ def grep_project(
         case_insensitive: Match the pattern ignoring case.
         limit: Maximum result lines to return (default 100).
         offset: Skip this many result lines (for pagination).
+        format: "json" (default) for structured records; "text" for raw lines.
     """
     flags = ["-gx"] + (["-i"] if case_insensitive else []) + ["--", pattern]
     return _query_global(
+        "grep_project",
         flags,
         project_root,
         f"No matches for pattern '{pattern}'.",
         limit,
         offset,
+        format,
     )
 
 
@@ -976,26 +1265,28 @@ def list_file_symbols(
     project_root: str | None = None,
     limit: int = DEFAULT_LIMIT,
     offset: int = 0,
+    format: Format = "json",
 ) -> str:
     """List every symbol defined in one source file.
 
     Use this INSTEAD of reading a whole file when you only need its API
     surface — functions, structs, macros it defines — as a compact list.
 
-    Each result line has the format: symbol line-number file source-line.
-
     Args:
         file_path: Path to the source file, relative to the project root or absolute.
         project_root: Project directory. Omit to use the server's default.
         limit: Maximum result lines to return (default 100).
         offset: Skip this many result lines (for pagination).
+        format: "json" (default) for structured records; "text" for raw lines.
     """
     return _query_global(
+        "list_file_symbols",
         ["-fx", "--", file_path],
         project_root,
         f"No symbols found in '{file_path}' (is it inside the indexed tree?).",
         limit,
         offset,
+        format,
     )
 
 
@@ -1005,6 +1296,7 @@ def complete_symbol(
     project_root: str | None = None,
     limit: int = DEFAULT_LIMIT,
     offset: int = 0,
+    format: Format = "json",
 ) -> str:
     """List defined symbols that start with the given prefix.
 
@@ -1016,13 +1308,17 @@ def complete_symbol(
         project_root: Project directory. Omit to use the server's default.
         limit: Maximum result lines to return (default 100).
         offset: Skip this many result lines (for pagination).
+        format: "json" (default) for {symbol} items; "text" for one name per line.
     """
     return _query_global(
+        "complete_symbol",
         ["-c", "--", prefix],
         project_root,
         f"No symbols starting with '{prefix}'.",
         limit,
         offset,
+        format,
+        parse="symbol",
     )
 
 
@@ -1032,6 +1328,7 @@ def find_files(
     project_root: str | None = None,
     limit: int = DEFAULT_LIMIT,
     offset: int = 0,
+    format: Format = "json",
 ) -> str:
     """Find indexed source files whose path matches a regex pattern.
 
@@ -1043,18 +1340,22 @@ def find_files(
         project_root: Project directory. Omit to use the server's default.
         limit: Maximum result lines to return (default 100).
         offset: Skip this many result lines (for pagination).
+        format: "json" (default) for {path} items; "text" for one path per line.
     """
     return _query_global(
+        "find_files",
         ["-P", "--", pattern],
         project_root,
         f"No indexed files match '{pattern}'.",
         limit,
         offset,
+        format,
+        parse="path",
     )
 
 
 @mcp.tool()
-def index_project(project_root: str | None = None) -> str:
+def index_project(project_root: str | None = None, format: Format = "json") -> str:
     """Force a full (re)build of the gtags index.
 
     Normally unnecessary — every query tool indexes automatically on first
@@ -1063,19 +1364,33 @@ def index_project(project_root: str | None = None) -> str:
 
     Args:
         project_root: Project directory. Omit to use the server's default.
+        format: "json" (default) for {status, message}; "text" for a sentence.
     """
+    def _respond(message: str, error: bool = False) -> str:
+        if format != "json":
+            return message
+        if error:
+            return output.error("index_project", message, root)
+        return output.envelope(
+            "index_project", root, {"status": "ok", "message": message}, total=None
+        )
+
+    root = None
     if err := _check_global_installed():
-        return err
+        return _respond(err, error=True)
     root, err = _effective_root(project_root)
     if err:
-        return err
-    stdout, stderr, code = _run(["gtags"], root, timeout=INDEX_TIMEOUT_SECONDS)
+        return _respond(err, error=True)
+    stdout, stderr, code = _run_index(root, incremental=False)
     if code != 0:
-        return f"Error: gtags exited with code {code}: {stderr.strip() or stdout.strip()}"
+        return _respond(
+            f"Error: gtags exited with code {code}: {stderr.strip() or stdout.strip()}",
+            error=True,
+        )
     _last_update[root] = time.monotonic()
     label = _gtags_label(root)
     if label:
-        return (
+        return _respond(
             f"Indexed {root} (GTAGS, GRTAGS, GPATH created) "
             f"using parser label '{label}' (multi-language)."
         )
@@ -1096,11 +1411,11 @@ def index_project(project_root: str | None = None) -> str:
             "run `mcp-gtags-server setup` (installs ctags + Pygments into user space, "
             "no sudo) to enable multi-language indexing."
         )
-    return message
+    return _respond(message)
 
 
 @mcp.tool()
-def update_index(project_root: str | None = None) -> str:
+def update_index(project_root: str | None = None, format: Format = "json") -> str:
     """Synchronously refresh the index — the guaranteed-freshness barrier.
 
     Query tools refresh the index automatically in the BACKGROUND, so their
@@ -1110,23 +1425,39 @@ def update_index(project_root: str | None = None) -> str:
 
     Args:
         project_root: Project directory. Omit to use the server's default.
+        format: "json" (default) for {status, message}; "text" for a sentence.
     """
+    def _respond(message: str, error: bool = False) -> str:
+        if format != "json":
+            return message
+        if error:
+            return output.error("update_index", message, root)
+        return output.envelope(
+            "update_index", root, {"status": "ok", "message": message}, total=None
+        )
+
+    root = None
     if err := _check_global_installed():
-        return err
+        return _respond(err, error=True)
     root, err = _effective_root(project_root)
     if err:
-        return err
+        return _respond(err, error=True)
     if not (root / "GTAGS").is_file():
-        return f"Error: no GTAGS index found in {root}. Run index_project first."
+        return _respond(
+            f"Error: no GTAGS index found in {root}. Run index_project first.",
+            error=True,
+        )
     _wait_for_refresh(root)  # don't race an in-flight background refresh
     started = time.monotonic()
-    _, stderr, code = _run(["global", "-u"], root, timeout=INDEX_TIMEOUT_SECONDS)
+    _, stderr, code = _run_index(root, incremental=True)
     if code != 0:
-        return f"Error: global -u exited with code {code}: {stderr.strip()}"
+        return _respond(
+            f"Error: gtags -i exited with code {code}: {stderr.strip()}", error=True
+        )
     with _refresh_lock:
         _last_update[root] = time.monotonic()
         _update_cost[root] = _last_update[root] - started
-    return f"Index updated for {root} (synchronous — results are now current)."
+    return _respond(f"Index updated for {root} (synchronous — results are now current).")
 
 
 def _package_version() -> str:

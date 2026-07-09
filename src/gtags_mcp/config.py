@@ -18,6 +18,8 @@ Recognised keys (all optional)::
     root = "/abs/path/to/project"   # default project root
     label = "native-pygments"       # GTAGSLABEL parser label to force
     bin_dir = "~/.gtags-mcp/bin"    # extra directory searched for binaries
+    skip_globs = ["*.gen.c", "third_party/*"]  # never index matching paths
+    respect_gitignore = true        # use `git ls-files` to honour .gitignore
 """
 
 from __future__ import annotations
@@ -33,7 +35,7 @@ else:  # pragma: no cover - exercised only on Python 3.10
 
 PROJECT_CONFIG_NAME = ".gtags-mcp.toml"
 
-_VALID_KEYS = frozenset({"root", "label", "bin_dir"})
+_VALID_KEYS = frozenset({"root", "label", "bin_dir", "skip_globs", "respect_gitignore"})
 
 # Caches: project configs keyed by directory, user config loaded once.
 _project_cache: dict[Path, dict] = {}
@@ -56,6 +58,17 @@ def user_config_path() -> Path:
     return root / "gtags-mcp" / "config.toml"
 
 
+def _normalize(value):
+    """Coerce a raw TOML value into a supported type, or None to drop it."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (str, int)):
+        return str(value)
+    if isinstance(value, list) and all(isinstance(v, str) for v in value):
+        return list(value)
+    return None
+
+
 def _load_toml(path: Path) -> dict:
     """Parse a TOML file, keeping only recognised keys. Empty dict on error."""
     try:
@@ -66,7 +79,11 @@ def _load_toml(path: Path) -> dict:
         return {}
     if not isinstance(data, dict):
         return {}
-    return {k: str(v) for k, v in data.items() if k in _VALID_KEYS and isinstance(v, (str, int))}
+    return {
+        k: normalized
+        for k, v in data.items()
+        if k in _VALID_KEYS and (normalized := _normalize(v)) is not None
+    }
 
 
 def load_user_config() -> dict:
@@ -90,13 +107,32 @@ def load_project_config(root: Path | None) -> dict:
     return dict(_project_cache[root])
 
 
-def get_setting(key: str, project_root: Path | None = None) -> str | None:
-    """Resolve one setting from project config, then user config.
-
-    Only the *config file* layers live here; argument/flag/env precedence is
-    applied by the callers, which pass through to this as their fallback.
-    """
+def _raw_setting(key: str, project_root: Path | None):
     value = load_project_config(project_root).get(key)
     if value is None:
         value = load_user_config().get(key)
     return value
+
+
+def get_setting(key: str, project_root: Path | None = None) -> str | None:
+    """Resolve one string setting from project config, then user config.
+
+    Only the *config file* layers live here; argument/flag/env precedence is
+    applied by the callers, which pass through to this as their fallback.
+    """
+    value = _raw_setting(key, project_root)
+    return value if isinstance(value, str) else None
+
+
+def get_list_setting(key: str, project_root: Path | None = None) -> list[str]:
+    """Resolve one list-of-strings setting (empty list when unset)."""
+    value = _raw_setting(key, project_root)
+    return value if isinstance(value, list) else []
+
+
+def get_bool_setting(
+    key: str, project_root: Path | None = None, default: bool = False
+) -> bool:
+    """Resolve one boolean setting."""
+    value = _raw_setting(key, project_root)
+    return value if isinstance(value, bool) else default

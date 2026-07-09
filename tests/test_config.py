@@ -57,6 +57,25 @@ def test_malformed_toml_is_ignored(tmp_path, user_config, capsys):
     assert "ignoring bad config" in capsys.readouterr().err
 
 
+def test_list_and_bool_settings(tmp_path, user_config):
+    (tmp_path / config.PROJECT_CONFIG_NAME).write_text(
+        'skip_globs = ["*.gen.c", "third_party/*"]\nrespect_gitignore = false\n'
+    )
+    assert config.get_list_setting("skip_globs", tmp_path) == ["*.gen.c", "third_party/*"]
+    assert config.get_bool_setting("respect_gitignore", tmp_path, default=True) is False
+    # Unset keys fall back to their defaults.
+    assert config.get_list_setting("skip_globs") == []
+    assert config.get_bool_setting("respect_gitignore", default=True) is True
+
+
+def test_wrong_typed_values_are_dropped(tmp_path, user_config):
+    (tmp_path / config.PROJECT_CONFIG_NAME).write_text(
+        'label = ["not", "a", "string"]\nskip_globs = "not-a-list"\n'
+    )
+    assert config.get_setting("label", tmp_path) is None
+    assert config.get_list_setting("skip_globs", tmp_path) == []
+
+
 def test_user_config_path_respects_xdg(monkeypatch, tmp_path):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
     assert config.user_config_path() == tmp_path / "gtags-mcp" / "config.toml"

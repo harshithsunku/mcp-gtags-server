@@ -144,7 +144,7 @@ Add to `claude_desktop_config.json` (pin the project since Desktop doesn't launc
 <details>
 <summary><b>Pin a project root</b> explicitly</summary>
 
-The default project root is the server's working directory. Override with `--root /path`, the `GTAGS_MCP_ROOT` env var, or `root` in a config file — or pass `project_root` on any individual tool call to query a different tree.
+By default the server auto-detects the project root by walking up from its working directory to the nearest `.git` or existing `GTAGS` — so queries from anywhere inside a monorepo resolve to the repo root. Override with `--root /path`, the `GTAGS_MCP_ROOT` env var, or `root` in a config file — or pass `project_root` on any individual tool call to query a different tree.
 
 </details>
 
@@ -160,6 +160,8 @@ Every setting can also live in a TOML file, so teams share defaults through the 
 # .gtags-mcp.toml
 label = "native-pygments"     # force a GTAGSLABEL parser label
 bin_dir = "/opt/tools/bin"    # extra directory searched for gtags/global/ctags
+skip_globs = ["*.gen.c"]      # never index paths/basenames matching these globs
+respect_gitignore = true      # default: index only what `git ls-files` reports
 # root = "/abs/path"          # default project root (user config)
 ```
 
@@ -211,7 +213,40 @@ ext4_mark_inode_dirty  (definition: fs/ext4/ext4_jbd2.h:138)
 | `find_files` | Indexed files whose path matches a regex | `global -P` |
 | `index_project` / `update_index` | Force rebuild / refresh (rarely needed — it's automatic) | `gtags` / `global -u` |
 
-Every query tool supports `limit`/`offset` pagination with a continuation footer, long-line truncation, and (where it makes sense) `case_insensitive` — output is *engineered* to never flood a context window.
+Every query tool supports `limit`/`offset` pagination, long-line truncation, and (where it makes sense) `case_insensitive` — output is *engineered* to never flood a context window.
+
+### Structured output (JSON by default)
+
+Since v0.8.0 every tool returns a **machine-readable JSON envelope by default** (pass `format="text"` for the previous human-readable rendering — a breaking change if you parsed the old text):
+
+```json
+{
+  "tool": "find_definition",
+  "root": "/abs/project/root",
+  "results": [
+    {"symbol": "tcp_v4_rcv", "path": "net/ipv4/tcp_ipv4.c", "line": 2001,
+     "col": 5, "kind": null, "guard": null, "snippet": "int tcp_v4_rcv(struct sk_buff *skb)"}
+  ],
+  "total": 1, "offset": 0, "truncated": false,
+  "next_tools": ["get_symbol_body", "find_callers", "symbol_info"],
+  "warning": null
+}
+```
+
+- Symbol locations always use the stable record schema `{symbol, path, line, col, kind, guard, snippet}` with repo-relative paths. `kind` (ctags metadata) and `guard` (`#ifdef` stack) are reserved for upcoming milestones and currently `null` — parsers never need to change shape.
+- `next_tools` tells the agent the highest-value follow-up call for what was (or wasn't) found.
+- `total`/`offset`/`truncated` replace the text continuation footer; errors keep the envelope with an `error` field.
+- Composite tools return tool-shaped `results` (e.g. `call_hierarchy` a nested caller tree, `find_callees` `{in_tree, external}`, `symbol_info` an overview object) inside the same envelope.
+
+### What gets indexed (junk stays out)
+
+Indexing feeds `gtags` an explicit file list instead of letting it walk the tree:
+
+- In a git repository the list comes from `git ls-files` — **`.gitignore` is respected exactly**, so build output, vendored blobs, and generated files never pollute the index. Disable with `respect_gitignore = false` in `.gtags-mcp.toml`.
+- Outside git, the tree is walked minus well-known junk directories (`.git`, `node_modules`, `build`, `dist`, `.venv`, ...).
+- `skip_globs` in `.gtags-mcp.toml` drops anything else you never want indexed.
+
+Incremental refreshes recollect the list, so newly ignored files drop out of the index and new files appear — automatically.
 
 ### The flow that saves your context window
 
@@ -249,15 +284,15 @@ Force a specific parser label with `--label`, `GTAGS_MCP_LABEL`, or `label` in `
 ## How it works
 
 ```text
-agent question ──► MCP tool ──► GTAGS index (built once, ~66s for the kernel)
+agent question ──► MCP tool ──► GTAGS index (built once, ~66s for the kernel;
+                                    │        .gitignore-aware file list)
+                 background auto-refresh (gtags -i, adaptive debounce)
                                     │
-                 background auto-refresh (global -u, adaptive debounce)
-                                    │
-                              narrow answer ──► agent context
+                       narrow JSON answer ──► agent context
 ```
 
 - **First query on a tree?** The index is built automatically (the only operation that ever blocks — and only once).
-- **Files changed?** A debounced incremental refresh runs **in the background**: queries always answer instantly from the current index while `global -u` catches up behind the scenes. Measured on the kernel: queries return in 0.02s while the 25s freshness check runs invisibly. Staleness is bounded by the debounce window; call `update_index` for a synchronous, guaranteed-fresh barrier right after edits.
+- **Files changed?** A debounced incremental refresh runs **in the background**: queries always answer instantly from the current index while `gtags -i` catches up behind the scenes. Measured on the kernel: queries return in 0.02s while the 25s freshness check runs invisibly. Staleness is bounded by the debounce window; call `update_index` for a synchronous, guaranteed-fresh barrier right after edits.
 - **Huge result?** Pagination footers tell the agent exactly how to fetch the next page — or the tool itself suggests a narrower one (`find_callers` on a symbol used in 500+ files points to `summarize_references`).
 
 ## FAQ
@@ -279,7 +314,7 @@ The tool descriptions are written to steer the model: they say *when* to use ind
 ```bash
 git clone https://github.com/harshithsunku/mcp-gtags-server
 cd mcp-gtags-server
-uv run --extra dev pytest       # 51 tests; e2e tests auto-skip if GNU Global is absent
+uv run --extra dev pytest       # 61 tests; e2e tests auto-skip if GNU Global is absent
 npx @modelcontextprotocol/inspector mcp-gtags-server    # poke at it interactively
 ```
 
@@ -289,14 +324,9 @@ Release flow: bump `version` in `pyproject.toml`, tag `vX.Y.Z`, push — CI publ
 
 ## Roadmap
 
-- [x] Multi-level call hierarchy (`call_hierarchy`, depth 1–5) for transitive impact analysis
-- [x] Outgoing call graph (`find_callees`), symbol overview cards (`symbol_info`), project orientation (`project_overview`)
-- [x] Dead-code candidates (`find_dead_symbols`) and header blast radius (`find_includers`)
-- [x] Multi-language projects (Python, Go, Rust, JS, ... via ctags/Pygments plugin parsers, auto-detected)
-- [x] One-line no-sudo installer with user-space toolchain bootstrap and release-driven updates
-- [x] Background HTTP (streamable) transport — one server shared by many clients/devices
-- [ ] Structured (JSON) result variants for machine-readable output
-- [ ] Published benchmarks vs LSP-based MCP servers
+See [ROADMAP.md](ROADMAP.md) — structured JSON output landed in v0.8.0; next up are
+ctags metadata enrichment, `#ifdef`/config-guard awareness (the headline capability for
+kernel and firmware trees), macro-family symbol resolution, and a correctness eval harness.
 
 Contributions welcome — open an issue or PR.
 

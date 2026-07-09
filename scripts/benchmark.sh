@@ -16,7 +16,7 @@ SYMBOLS=("${@:-tcp_v4_rcv}")
 cd "$TREE"
 
 now() { date +%s.%N; }
-elapsed() { echo "$2 - $1" | bc; }
+elapsed() { awk -v a="$1" -v b="$2" 'BEGIN { printf "%f", b - a }'; }
 
 echo "== Tree stats =="
 FILES=$(find . -name '*.[chS]' -o -name '*.cpp' -o -name '*.cc' -o -name '*.hpp' | wc -l)
