@@ -417,10 +417,24 @@ def write_relocated_conf(log) -> None:
 
 
 def install_ctags(log) -> bool:
-    """Install universal-ctags from its official binary releases."""
-    if find_ctags():
-        log("  ctags already available; skipping")
-        return True
+    """Install universal-ctags from its official binary releases.
+
+    An existing ctags only counts when it can actually power the server's
+    features: it must be Universal Ctags with JSON output (the metadata
+    enrichment requirement). An old Exuberant ctags on PATH is not enough —
+    we install our own into the managed bin dir, which wins discovery order.
+    """
+    if existing := find_ctags():
+        from . import enrich  # function-local: enrich imports this module
+
+        usable, detail = enrich.probe_binary(existing)
+        if usable:
+            log(f"  ctags already available (Universal +json): {existing}")
+            return True
+        log(
+            f"  found {existing} but it cannot emit JSON output ({detail}) — "
+            f"installing universal-ctags into {managed_bin()}"
+        )
     machine = platform.machine().lower()
     machine = {"amd64": "x86_64", "arm64": "aarch64"}.get(machine, machine)
     if sys.platform.startswith("linux"):

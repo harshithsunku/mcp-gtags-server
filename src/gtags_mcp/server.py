@@ -1703,6 +1703,11 @@ def main() -> None:
         label = _gtags_label(root)
         print(f"  parser label : {label or 'native (C/C++/Java/PHP/asm only)'}")
         print(f"  {enrich.status_line(_bin_dir)}")
+        if not enrich.available(_bin_dir):
+            print(
+                "    re-run `mcp-gtags-server setup` to install universal-ctags "
+                "into user space (no sudo needed)."
+            )
         return
     if args.command == "config":
         print(_client_config_text(args.transport, args.host, args.port))

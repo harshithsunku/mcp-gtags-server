@@ -178,3 +178,50 @@ def test_doctor_report_mentions_setup_when_missing(tmp_path, monkeypatch):
 def test_platform_tag():
     tag = toolchain._platform_tag()
     assert tag is None or tag.split("-")[0] in ("linux", "macos")
+
+
+# ---------------------------------------------------------------------------
+# v0.8.2: setup must not trust a ctags that can't power enrichment
+# ---------------------------------------------------------------------------
+
+
+def _probing_as(monkeypatch, existing: str, usable: bool):
+    """Route find_ctags/probe_binary to a fake existing binary."""
+    from gtags_mcp import enrich
+
+    enrich.reset_cache()
+    monkeypatch.setattr(toolchain, "find_ctags", lambda *a, **k: existing)
+    monkeypatch.setattr(
+        enrich, "probe_binary", lambda exe: (usable, f"probed {exe}")
+    )
+
+
+def test_install_ctags_skips_when_existing_is_universal_json(monkeypatch):
+    _probing_as(monkeypatch, "/fake/universal-ctags", usable=True)
+
+    def no_network(*args, **kwargs):
+        raise AssertionError("install_ctags must not download when ctags is usable")
+
+    monkeypatch.setattr(toolchain.urllib.request, "urlopen", no_network)
+    logs = []
+    assert toolchain.install_ctags(logs.append) is True
+    assert any("already available (Universal +json)" in line for line in logs)
+
+
+def test_install_ctags_replaces_exuberant(monkeypatch):
+    """An Exuberant/json-less ctags must trigger a managed install attempt."""
+    import urllib.error
+
+    _probing_as(monkeypatch, "/usr/bin/ctags", usable=False)
+    attempted = []
+
+    def fake_urlopen(request, **kwargs):
+        attempted.append(request.full_url)
+        raise urllib.error.URLError("offline test")
+
+    monkeypatch.setattr(toolchain.urllib.request, "urlopen", fake_urlopen)
+    logs = []
+    # Download fails (offline) -> graceful False, but the point is it TRIED.
+    assert toolchain.install_ctags(logs.append) is False
+    assert attempted, "expected a download attempt for universal-ctags"
+    assert any("cannot emit JSON output" in line for line in logs)

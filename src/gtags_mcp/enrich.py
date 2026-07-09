@@ -81,8 +81,12 @@ def reset_cache() -> None:
         _tags_cache.clear()
 
 
-def _probe(exe: str) -> tuple[bool, str]:
-    """Check one ctags binary for Universal Ctags with JSON output support."""
+def probe_binary(exe: str) -> tuple[bool, str]:
+    """(usable, human detail) — does this ctags emit Universal Ctags JSON?
+
+    Cached per binary path. Also used by ``toolchain.install_ctags`` so setup
+    never trusts a ctags that cannot power enrichment.
+    """
     with _lock:
         if exe in _probe_cache:
             return _probe_cache[exe]
@@ -114,7 +118,7 @@ def _probe(exe: str) -> tuple[bool, str]:
 def available(bin_dir: str | None = None) -> bool:
     """True when a Universal Ctags with JSON output can be invoked."""
     exe = toolchain.find_ctags(bin_dir)
-    return _probe(exe)[0] if exe else False
+    return probe_binary(exe)[0] if exe else False
 
 
 def status_line(bin_dir: str | None = None) -> str:
@@ -122,7 +126,7 @@ def status_line(bin_dir: str | None = None) -> str:
     exe = toolchain.find_ctags(bin_dir)
     if exe is None:
         return "metadata enrichment: unavailable (no ctags binary found)"
-    usable, detail = _probe(exe)
+    usable, detail = probe_binary(exe)
     if usable:
         return f"metadata enrichment: active ({detail})"
     return f"metadata enrichment: unavailable ({detail})"
@@ -195,7 +199,7 @@ def tags_for_file(abs_path: Path, bin_dir: str | None = None) -> dict[str, list[
         tags: dict[str, list[dict]] = {}
     else:
         exe = toolchain.find_ctags(bin_dir)
-        if exe is None or not _probe(exe)[0]:
+        if exe is None or not probe_binary(exe)[0]:
             return {}
         # The subprocess runs outside the lock; a rare duplicate ctags run on
         # a concurrent query is cheaper than serializing every enrichment.
