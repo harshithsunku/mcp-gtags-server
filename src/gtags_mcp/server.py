@@ -14,15 +14,21 @@ without root when it is missing.
 from __future__ import annotations
 
 import argparse
+import contextvars
+import functools
 import os
 import re
 import subprocess
 import sys
 import threading
 import time
+import weakref
 from pathlib import Path
 from typing import Literal
+from urllib.parse import unquote, urlparse
 
+import anyio
+from mcp import types
 from mcp.server.fastmcp import FastMCP
 
 from . import config as config_module
@@ -46,6 +52,9 @@ mcp = FastMCP(
         "analysis, find_callees to see what a function depends on, and "
         "summarize_references first for very widely used symbols. "
         "The index is built and refreshed automatically — never worry about it. "
+        "Tools operate on the client's workspace root by default; pass "
+        "project_root to target another repo (required when several "
+        "workspace roots are open). "
         "Every tool returns machine-readable JSON by default; pass "
         "format='text' for the human-readable rendering."
     ),
@@ -125,6 +134,94 @@ def _check_global_installed() -> str | None:
     return None
 
 
+# --------------------------------------------------------------------------
+# Lazy toolchain bootstrap: when gtags/global are missing, install them in a
+# background thread instead of failing every tool. Queries issued while the
+# install runs get a "retry shortly" status, never a hang — MCP clients
+# enforce per-call timeouts that a source build would blow through.
+# --------------------------------------------------------------------------
+
+_bootstrap_lock = threading.Lock()
+_bootstrap_thread: threading.Thread | None = None
+_bootstrap_log: list[str] = []  # tail of run_setup output, for status messages
+_bootstrap_error: str | None = None
+# Auto-install disabled by --no-auto-setup / GTAGS_MCP_AUTO_SETUP=0.
+_no_auto_setup = False
+
+
+def _auto_setup_enabled() -> bool:
+    if _no_auto_setup:
+        return False
+    return os.environ.get("GTAGS_MCP_AUTO_SETUP", "1").lower() not in ("0", "false", "no")
+
+
+def _bootstrap_body() -> None:
+    """Thread body: run the full toolchain setup, record the outcome."""
+    global _bootstrap_thread, _bootstrap_error, _auto_label_resolved
+
+    def log(line: object) -> None:
+        text = str(line).strip()
+        if text:
+            with _bootstrap_lock:
+                _bootstrap_log.append(text)
+                del _bootstrap_log[:-20]
+
+    error: str | None = None
+    try:
+        if toolchain.run_setup(with_ctags=True, log=log) != 0:
+            with _bootstrap_lock:
+                tail = "; ".join(_bootstrap_log[-3:])
+            error = f"setup exited with an error ({tail})"
+    except Exception as exc:  # noqa: BLE001 — must never kill the thread silently
+        error = str(exc)
+    with _bootstrap_lock:
+        _bootstrap_error = error
+        _bootstrap_thread = None
+    # The parser-label probe may have run (and missed) before ctags/Pygments
+    # existed; force a re-probe now that the toolchain is in place.
+    _auto_label_resolved = False
+
+
+def _start_bootstrap() -> None:
+    """Kick off the background toolchain install once (idempotent)."""
+    global _bootstrap_thread
+    with _bootstrap_lock:
+        if _bootstrap_thread is None and _bootstrap_error is None:
+            _bootstrap_thread = threading.Thread(
+                target=_bootstrap_body, name="gtags-mcp-bootstrap", daemon=True
+            )
+            _bootstrap_thread.start()
+
+
+def _ensure_toolchain() -> str | None:
+    """Resolve gtags/global, auto-installing them on first need.
+
+    Returns None when the toolchain is ready; otherwise a non-blocking
+    status ("installing, retry shortly") or error message for the caller.
+    """
+    missing = _check_global_installed()
+    if missing is None:
+        return None
+    if not _auto_setup_enabled():
+        return missing
+    with _bootstrap_lock:
+        failed = _bootstrap_error
+        last = _bootstrap_log[-1] if _bootstrap_log else "starting"
+    if failed:
+        return (
+            f"Error: automatic toolchain install failed: {failed}. "
+            "Run `mcp-gtags-server setup` manually to see the full log, "
+            "or install GNU Global via a system package "
+            "(`apt install global`, `brew install global`)."
+        )
+    _start_bootstrap()
+    return (
+        "The gtags toolchain is being installed automatically into user space "
+        f"(no sudo needed, one-time step). Current step: {last}. "
+        "Retry this call in ~15 seconds."
+    )
+
+
 # Index files (GTAGS/GRTAGS/GPATH) live in this folder inside the project
 # root, so they never clutter the user's tree. A pre-existing root-level
 # GTAGS (older versions, or the user's own gtags run) is respected as-is.
@@ -168,16 +265,124 @@ def _detect_root(start: Path) -> Path:
     return start
 
 
+# --------------------------------------------------------------------------
+# MCP roots protocol: clients (IDEs) advertise their open workspace folders
+# via roots/list. With a single user-level config entry serving many repos,
+# this is how the server picks the right repo when a tool call carries no
+# explicit project_root. Roots are fetched once per client session (cached
+# in a WeakKeyDictionary keyed by the session, so the shared HTTP server
+# keeps concurrent clients isolated) and handed to the sync tool bodies via
+# a ContextVar (anyio propagates context into worker threads).
+# --------------------------------------------------------------------------
+
+_session_roots: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+_roots_ctx: contextvars.ContextVar[tuple[Path, ...]] = contextvars.ContextVar(
+    "gtags_mcp_client_roots", default=()
+)
+ROOTS_FETCH_TIMEOUT_SECONDS = 3.0
+
+
+def _root_uri_to_path(uri: object) -> Path | None:
+    """file:// root URI -> existing directory Path, else None."""
+    parsed = urlparse(str(uri))
+    if parsed.scheme != "file":
+        return None
+    path = Path(unquote(parsed.path))
+    if not path.is_dir():
+        return None
+    return path.resolve()
+
+
+async def _fetch_session_roots() -> tuple[Path, ...]:
+    """Workspace roots of the current client session (cached per session).
+
+    Degrades to () — never an error — for clients without the roots
+    capability, clients that fail to answer within the timeout, and direct
+    (non-MCP) invocation from tests or the eval harness.
+    """
+    try:
+        session = mcp.get_context().session
+    except (LookupError, ValueError, AttributeError):
+        return ()  # direct invocation, no active MCP request
+    try:
+        return _session_roots[session]
+    except (KeyError, TypeError):
+        pass
+    roots: tuple[Path, ...] = ()
+    try:
+        if session.check_client_capability(
+            types.ClientCapabilities(roots=types.RootsCapability())
+        ):
+            with anyio.fail_after(ROOTS_FETCH_TIMEOUT_SECONDS):
+                result = await session.list_roots()
+            roots = tuple(
+                path for root in result.roots if (path := _root_uri_to_path(root.uri))
+            )
+    except Exception:  # noqa: BLE001 — roots are best-effort, cwd still works
+        roots = ()
+    try:
+        _session_roots[session] = roots
+    except TypeError:
+        pass
+    return roots
+
+
+async def _on_roots_changed(_notification: object) -> None:
+    """Client workspaces changed: drop cached roots so they are re-fetched."""
+    _session_roots.clear()
+
+
+mcp._mcp_server.notification_handlers[types.RootsListChangedNotification] = (
+    _on_roots_changed
+)
+
+
+def _gtags_tool(fn):
+    """Register *fn* as an MCP tool behind an async roots-aware wrapper.
+
+    The wrapper fetches the session's workspace roots (an await on the
+    client — impossible from sync code on the event loop) and then runs the
+    sync tool body in a worker thread, keeping slow gtags subprocess work
+    off the event loop. The module-level attribute stays the plain sync
+    function so tests and the eval harness call it directly; the MCP schema
+    is derived from *fn* itself through ``functools.wraps``/``__wrapped__``.
+    """
+
+    @functools.wraps(fn)
+    async def wrapper(**kwargs):
+        _roots_ctx.set(await _fetch_session_roots())
+        return await anyio.to_thread.run_sync(functools.partial(fn, **kwargs))
+
+    mcp.tool()(wrapper)
+    return fn
+
+
 def _effective_root(project_root: str | None) -> tuple[Path | None, str | None]:
     """Resolve the project root: explicit arg > --root/env default > config
-    > auto-detected (walk up from cwd to GTAGS/.git) > cwd."""
+    > client workspace roots (MCP roots protocol) > auto-detected (walk up
+    from cwd to GTAGS/.git) > cwd."""
     raw = project_root or _default_root or config_module.get_setting("root")
-    if raw is None:
-        return _detect_root(Path(os.getcwd()).resolve()), None
-    root = Path(raw).expanduser().resolve()
-    if not root.is_dir():
-        return None, f"Error: project_root is not a directory: {raw}"
-    return root, None
+    if raw is not None:
+        root = Path(raw).expanduser().resolve()
+        if not root.is_dir():
+            return None, f"Error: project_root is not a directory: {raw}"
+        return root, None
+    roots = _roots_ctx.get()
+    if len(roots) == 1:
+        return roots[0], None
+    if len(roots) > 1:
+        # Multi-root workspace: cwd can still disambiguate (stdio servers are
+        # spawned inside one of the folders); otherwise make the agent choose.
+        detected = _detect_root(Path(os.getcwd()).resolve())
+        inside = [r for r in roots if detected == r or detected.is_relative_to(r)]
+        if len(inside) == 1:
+            return inside[0], None
+        listing = ", ".join(str(r) for r in roots)
+        return None, (
+            f"Error: the client has {len(roots)} workspace roots open "
+            f"({listing}). Pass project_root=<one of them> to choose."
+        )
+    return _detect_root(Path(os.getcwd()).resolve()), None
 
 
 def _run(
@@ -355,7 +560,7 @@ def _raw_global(
     flags: list[str], project_root: str | None, _retry: bool = True
 ) -> tuple[str | None, Path | None, str | None]:
     """Resolve root, ensure the index, run `global`. Returns (stdout, root, error)."""
-    if err := _check_global_installed():
+    if err := _ensure_toolchain():
         return None, None, err
     root, err = _effective_root(project_root)
     if err:
@@ -718,7 +923,7 @@ _NON_CALLS = frozenset(
 )
 
 
-@mcp.tool()
+@_gtags_tool
 def find_definition(
     symbol: str,
     project_root: str | None = None,
@@ -744,8 +949,10 @@ def find_definition(
 
     Args:
         symbol: Exact symbol name, e.g. "tcp_v4_rcv" or "list_head".
-        project_root: Project directory. Omit to use the server's default
-            (auto-detected by walking up from its working directory).
+        project_root: Project directory. Omit to use the client's workspace
+            root (or the server's default, auto-detected by walking up from
+            its working directory); if several workspace roots are open,
+            pass the one you mean.
         case_insensitive: Match the symbol ignoring case.
         limit: Maximum result lines to return (default 100).
         offset: Skip this many result lines (for pagination).
@@ -778,7 +985,7 @@ def find_definition(
     )
 
 
-@mcp.tool()
+@_gtags_tool
 def find_references(
     symbol: str,
     project_root: str | None = None,
@@ -798,7 +1005,9 @@ def find_references(
 
     Args:
         symbol: Exact symbol name whose call/usage sites you want.
-        project_root: Project directory. Omit to use the server's default.
+        project_root: Project directory. Omit to use the client's workspace
+            root (or the server's default); if several workspace roots are
+            open, pass the one you mean.
         case_insensitive: Match the symbol ignoring case.
         limit: Maximum result lines to return (default 100).
         offset: Skip this many result lines (for pagination).
@@ -823,7 +1032,7 @@ def find_references(
     )
 
 
-@mcp.tool()
+@_gtags_tool
 def get_symbol_body(
     symbol: str,
     project_root: str | None = None,
@@ -839,7 +1048,9 @@ def get_symbol_body(
 
     Args:
         symbol: Exact symbol name, e.g. "tcp_v4_rcv".
-        project_root: Project directory. Omit to use the server's default.
+        project_root: Project directory. Omit to use the client's workspace
+            root (or the server's default); if several workspace roots are
+            open, pass the one you mean.
         max_definitions: If the symbol has multiple definitions, return at
             most this many bodies (default 3).
         format: "json" (default) for {path, line, body} items; "text" for
@@ -884,7 +1095,7 @@ def get_symbol_body(
     return "\n\n".join(chunks)
 
 
-@mcp.tool()
+@_gtags_tool
 def find_callers(
     symbol: str,
     project_root: str | None = None,
@@ -902,7 +1113,9 @@ def find_callers(
 
     Args:
         symbol: Exact symbol name whose callers you want.
-        project_root: Project directory. Omit to use the server's default.
+        project_root: Project directory. Omit to use the client's workspace
+            root (or the server's default); if several workspace roots are
+            open, pass the one you mean.
         limit: Maximum result lines to return (default 100).
         offset: Skip this many result lines (for pagination).
         format: "json" (default) for {caller, path, sites} items; "text" for
@@ -943,7 +1156,7 @@ def find_callers(
     return _paginate("\n".join(rows), limit, offset)
 
 
-@mcp.tool()
+@_gtags_tool
 def summarize_references(
     symbol: str,
     project_root: str | None = None,
@@ -960,7 +1173,9 @@ def summarize_references(
 
     Args:
         symbol: Exact symbol name.
-        project_root: Project directory. Omit to use the server's default.
+        project_root: Project directory. Omit to use the client's workspace
+            root (or the server's default); if several workspace roots are
+            open, pass the one you mean.
         limit: Maximum result lines to return (default 100).
         offset: Skip this many result lines (for pagination).
         format: "json" (default) for {path, count} items plus
@@ -995,7 +1210,7 @@ def summarize_references(
     return header + "\n" + _paginate("\n".join(rows), limit, offset)
 
 
-@mcp.tool()
+@_gtags_tool
 def call_hierarchy(
     symbol: str,
     project_root: str | None = None,
@@ -1011,7 +1226,9 @@ def call_hierarchy(
 
     Args:
         symbol: Exact symbol name at the root of the tree.
-        project_root: Project directory. Omit to use the server's default.
+        project_root: Project directory. Omit to use the client's workspace
+            root (or the server's default); if several workspace roots are
+            open, pass the one you mean.
         depth: How many caller levels to expand (1-5, default 2).
         format: "json" (default) for a nested {caller, path, site_count,
             callers} tree; "text" for a box-drawing rendering.
@@ -1115,7 +1332,7 @@ def call_hierarchy(
     return "\n".join(lines)
 
 
-@mcp.tool()
+@_gtags_tool
 def find_callees(
     symbol: str,
     project_root: str | None = None,
@@ -1131,7 +1348,9 @@ def find_callees(
 
     Args:
         symbol: Exact name of the function to analyze.
-        project_root: Project directory. Omit to use the server's default.
+        project_root: Project directory. Omit to use the client's workspace
+            root (or the server's default); if several workspace roots are
+            open, pass the one you mean.
         format: "json" (default) for {in_tree: [{symbol, path, line}],
             external: [names]}; "text" for a sectioned listing.
     """
@@ -1215,7 +1434,7 @@ MAX_GRAPH_EXPANSIONS = 200
 _MACROISH_RE = re.compile(r"[A-Z][A-Z0-9_]*")
 
 
-@mcp.tool()
+@_gtags_tool
 def reachability(
     from_symbol: str,
     to_symbol: str,
@@ -1235,7 +1454,9 @@ def reachability(
     Args:
         from_symbol: The caller end of the question ("can this reach ...").
         to_symbol: The callee end ("... this function?").
-        project_root: Project directory. Omit to use the server's default.
+        project_root: Project directory. Omit to use the client's workspace
+            root (or the server's default); if several workspace roots are
+            open, pass the one you mean.
         max_depth: Longest chain to consider, in calls (1-12, default 8).
         format: "json" (default) for {path_found, hops, depth,
             nodes_explored}; "text" for the chain rendering. Hops run from
@@ -1352,7 +1573,7 @@ def reachability(
     return "\n".join(lines)
 
 
-@mcp.tool()
+@_gtags_tool
 def blast_radius(
     git_ref: str = "HEAD",
     project_root: str | None = None,
@@ -1375,7 +1596,7 @@ def blast_radius(
             range (default HEAD = uncommitted changes; use "HEAD~1" for the
             last commit, "main..." for a whole branch).
         project_root: Project directory (must be a git work tree). Omit to
-            use the server's default.
+            use the client's workspace root (or the server's default).
         depth: Caller levels to expand beyond the changed functions (0-3,
             default 1; 0 = just list the changed functions).
         limit: Maximum results to return (default 100).
@@ -1388,7 +1609,7 @@ def blast_radius(
     if git_ref.startswith("-"):
         msg = f"Error: invalid git_ref: {git_ref!r}"
         return output.error("blast_radius", msg) if format == "json" else msg
-    if err := _check_global_installed():
+    if err := _ensure_toolchain():
         return output.error("blast_radius", err) if format == "json" else err
     root, err = _effective_root(project_root)
     if err:
@@ -1565,7 +1786,7 @@ def _describe_definition(rec: dict, source: str) -> str:
     return desc
 
 
-@mcp.tool()
+@_gtags_tool
 def symbol_info(
     symbol: str,
     project_root: str | None = None,
@@ -1589,7 +1810,9 @@ def symbol_info(
 
     Args:
         symbol: Exact symbol name.
-        project_root: Project directory. Omit to use the server's default.
+        project_root: Project directory. Omit to use the client's workspace
+            root (or the server's default); if several workspace roots are
+            open, pass the one you mean.
         format: "json" (default) for {definitions, definition_count,
             guard_variants, resolved_via, exported, reference_count,
             file_count, top_files}; "text" for the overview card.
@@ -1724,7 +1947,7 @@ def symbol_info(
     return "\n".join(lines)
 
 
-@mcp.tool()
+@_gtags_tool
 def project_overview(
     project_root: str | None = None,
     top: int = 15,
@@ -1737,7 +1960,9 @@ def project_overview(
     reading a single file.
 
     Args:
-        project_root: Project directory. Omit to use the server's default.
+        project_root: Project directory. Omit to use the client's workspace
+            root (or the server's default); if several workspace roots are
+            open, pass the one you mean.
         top: How many top-level directories to list (default 15).
         format: "json" (default) for {file_count, directories, file_types};
             "text" for the summary card.
@@ -1782,7 +2007,7 @@ def project_overview(
     return "\n".join(lines)
 
 
-@mcp.tool()
+@_gtags_tool
 def find_dead_symbols(
     file_path: str,
     project_root: str | None = None,
@@ -1798,7 +2023,9 @@ def find_dead_symbols(
 
     Args:
         file_path: Source file to audit, relative to the project root or absolute.
-        project_root: Project directory. Omit to use the server's default.
+        project_root: Project directory. Omit to use the client's workspace
+            root (or the server's default); if several workspace roots are
+            open, pass the one you mean.
         format: "json" (default) for {symbol, path, line} items; "text"
             for a summary listing.
     """
@@ -1846,7 +2073,7 @@ def find_dead_symbols(
     )
 
 
-@mcp.tool()
+@_gtags_tool
 def find_includers(
     header_name: str,
     project_root: str | None = None,
@@ -1862,7 +2089,9 @@ def find_includers(
 
     Args:
         header_name: Header file name, e.g. "tcp.h" or "net/tcp.h".
-        project_root: Project directory. Omit to use the server's default.
+        project_root: Project directory. Omit to use the client's workspace
+            root (or the server's default); if several workspace roots are
+            open, pass the one you mean.
         limit: Maximum result lines to return (default 100).
         offset: Skip this many result lines (for pagination).
         format: "json" (default) for structured records; "text" for raw lines.
@@ -1881,7 +2110,7 @@ def find_includers(
     )
 
 
-@mcp.tool()
+@_gtags_tool
 def find_symbol_usages(
     symbol: str,
     project_root: str | None = None,
@@ -1897,7 +2126,9 @@ def find_symbol_usages(
 
     Args:
         symbol: Exact symbol name.
-        project_root: Project directory. Omit to use the server's default.
+        project_root: Project directory. Omit to use the client's workspace
+            root (or the server's default); if several workspace roots are
+            open, pass the one you mean.
         limit: Maximum result lines to return (default 100).
         offset: Skip this many result lines (for pagination).
         format: "json" (default) for structured records; "text" for raw lines.
@@ -1913,7 +2144,7 @@ def find_symbol_usages(
     )
 
 
-@mcp.tool()
+@_gtags_tool
 def grep_project(
     pattern: str,
     project_root: str | None = None,
@@ -1931,7 +2162,9 @@ def grep_project(
 
     Args:
         pattern: Regex to search for, e.g. "TODO|FIXME".
-        project_root: Project directory. Omit to use the server's default.
+        project_root: Project directory. Omit to use the client's workspace
+            root (or the server's default); if several workspace roots are
+            open, pass the one you mean.
         case_insensitive: Match the pattern ignoring case.
         limit: Maximum result lines to return (default 100).
         offset: Skip this many result lines (for pagination).
@@ -1949,7 +2182,7 @@ def grep_project(
     )
 
 
-@mcp.tool()
+@_gtags_tool
 def list_file_symbols(
     file_path: str,
     project_root: str | None = None,
@@ -1964,7 +2197,9 @@ def list_file_symbols(
 
     Args:
         file_path: Path to the source file, relative to the project root or absolute.
-        project_root: Project directory. Omit to use the server's default.
+        project_root: Project directory. Omit to use the client's workspace
+            root (or the server's default); if several workspace roots are
+            open, pass the one you mean.
         limit: Maximum result lines to return (default 100).
         offset: Skip this many result lines (for pagination).
         format: "json" (default) for structured records with ctags metadata
@@ -1984,7 +2219,7 @@ def list_file_symbols(
     )
 
 
-@mcp.tool()
+@_gtags_tool
 def complete_symbol(
     prefix: str,
     project_root: str | None = None,
@@ -1999,7 +2234,9 @@ def complete_symbol(
 
     Args:
         prefix: Symbol name prefix, e.g. "tcp_" or "init".
-        project_root: Project directory. Omit to use the server's default.
+        project_root: Project directory. Omit to use the client's workspace
+            root (or the server's default); if several workspace roots are
+            open, pass the one you mean.
         limit: Maximum result lines to return (default 100).
         offset: Skip this many result lines (for pagination).
         format: "json" (default) for {symbol} items; "text" for one name per line.
@@ -2016,7 +2253,7 @@ def complete_symbol(
     )
 
 
-@mcp.tool()
+@_gtags_tool
 def find_files(
     pattern: str,
     project_root: str | None = None,
@@ -2031,7 +2268,9 @@ def find_files(
 
     Args:
         pattern: Regex matched against file paths, e.g. "net/.*\\.c$".
-        project_root: Project directory. Omit to use the server's default.
+        project_root: Project directory. Omit to use the client's workspace
+            root (or the server's default); if several workspace roots are
+            open, pass the one you mean.
         limit: Maximum result lines to return (default 100).
         offset: Skip this many result lines (for pagination).
         format: "json" (default) for {path} items; "text" for one path per line.
@@ -2048,7 +2287,7 @@ def find_files(
     )
 
 
-@mcp.tool()
+@_gtags_tool
 def index_project(project_root: str | None = None, format: Format = "json") -> str:
     """Force a full (re)build of the gtags index.
 
@@ -2057,7 +2296,9 @@ def index_project(project_root: str | None = None, format: Format = "json") -> s
     rebuild (e.g. after a large branch switch or if the index seems corrupt).
 
     Args:
-        project_root: Project directory. Omit to use the server's default.
+        project_root: Project directory. Omit to use the client's workspace
+            root (or the server's default); if several workspace roots are
+            open, pass the one you mean.
         format: "json" (default) for {status, message}; "text" for a sentence.
     """
     def _respond(message: str, error: bool = False) -> str:
@@ -2070,7 +2311,7 @@ def index_project(project_root: str | None = None, format: Format = "json") -> s
         )
 
     root = None
-    if err := _check_global_installed():
+    if err := _ensure_toolchain():
         return _respond(err, error=True)
     root, err = _effective_root(project_root)
     if err:
@@ -2115,7 +2356,7 @@ def index_project(project_root: str | None = None, format: Format = "json") -> s
     return _respond(message)
 
 
-@mcp.tool()
+@_gtags_tool
 def update_index(project_root: str | None = None, format: Format = "json") -> str:
     """Synchronously refresh the index — the guaranteed-freshness barrier.
 
@@ -2125,7 +2366,9 @@ def update_index(project_root: str | None = None, format: Format = "json") -> st
     blocks until the refresh is complete.
 
     Args:
-        project_root: Project directory. Omit to use the server's default.
+        project_root: Project directory. Omit to use the client's workspace
+            root (or the server's default); if several workspace roots are
+            open, pass the one you mean.
         format: "json" (default) for {status, message}; "text" for a sentence.
     """
     def _respond(message: str, error: bool = False) -> str:
@@ -2138,7 +2381,7 @@ def update_index(project_root: str | None = None, format: Format = "json") -> st
         )
 
     root = None
-    if err := _check_global_installed():
+    if err := _ensure_toolchain():
         return _respond(err, error=True)
     root, err = _effective_root(project_root)
     if err:
@@ -2202,14 +2445,19 @@ def _client_config_text(transport: str, host: str, port: int) -> str:
             "MCP client configuration (stdio transport):",
             "",
             "  Claude Code (once per device, all repos):",
-            "      claude mcp add --scope user gtags -- mcp-gtags-server",
+            "      claude mcp add --scope user gtags -- uvx mcp-gtags-server",
             "",
             "  Cursor / any MCP client — global settings or .mcp.json:",
             "      {",
             '        "mcpServers": {',
-            '          "gtags": { "command": "mcp-gtags-server" }',
+            '          "gtags": { "command": "uvx", "args": ["mcp-gtags-server"] }',
             "        }",
             "      }",
+            "",
+            "  (Already installed via install.sh / uv tool install? "
+            '"mcp-gtags-server" alone works too.)',
+            "  The gtags toolchain installs itself into ~/.gtags-mcp on first",
+            "  use — no other setup is needed.",
         ]
     )
 
@@ -2217,7 +2465,7 @@ def _client_config_text(transport: str, host: str, port: int) -> str:
 def main() -> None:
     """Entry point: serve MCP over stdio/HTTP, or run a maintenance subcommand."""
     global _default_root, _forced_label, _bin_dir, _no_enrich, _no_guards
-    global _no_macro_resolve
+    global _no_macro_resolve, _no_auto_setup
     parser = argparse.ArgumentParser(
         prog="mcp-gtags-server",
         description=(
@@ -2306,6 +2554,12 @@ def main() -> None:
         "or `macro_resolve = false` in .gtags-mcp.toml).",
     )
     parser.add_argument(
+        "--no-auto-setup",
+        action="store_true",
+        help="Do not auto-install the gtags/ctags toolchain on first use; "
+        "tools fail with instructions instead (also: GTAGS_MCP_AUTO_SETUP=0).",
+    )
+    parser.add_argument(
         "--no-ctags",
         action="store_true",
         help="setup only: skip installing universal-ctags and Pygments "
@@ -2336,6 +2590,7 @@ def main() -> None:
     _no_enrich = args.no_enrich
     _no_guards = args.no_guards
     _no_macro_resolve = args.no_macro_resolve
+    _no_auto_setup = args.no_auto_setup
     if args.bin_dir:
         os.environ["GTAGS_MCP_BIN_DIR"] = args.bin_dir
 
@@ -2362,6 +2617,8 @@ def main() -> None:
             )
         guard_state = "active (built-in)" if _guards_enabled(root) else "disabled"
         print(f"  guard scanning: {guard_state}")
+        auto_setup = "enabled" if _auto_setup_enabled() else "disabled"
+        print(f"  auto-setup    : {auto_setup} (toolchain installs itself on first use)")
         if root:
             db_dir = _db_dir(root)
             built = "" if (db_dir / "GTAGS").is_file() else "  (not built yet)"
@@ -2381,6 +2638,10 @@ def main() -> None:
     if args.command == "config":
         print(_client_config_text(args.transport, args.host, args.port))
         return
+    # Serving (stdio or http): if the toolchain is missing, start installing
+    # it right away so it is usually ready before the first query arrives.
+    if _auto_setup_enabled() and _check_global_installed() is not None:
+        _start_bootstrap()
     if args.transport == "http":
         mcp.settings.host = args.host
         mcp.settings.port = args.port

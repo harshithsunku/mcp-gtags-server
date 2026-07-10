@@ -34,7 +34,19 @@ case "$(uname -s)" in
     *) die "unsupported OS: $(uname -s) (Linux and macOS only)" ;;
 esac
 
-command -v curl >/dev/null 2>&1 || die "curl is required"
+# Download helper: curl, wget, or the Python that is guaranteed to exist on
+# any machine that can run this MCP server. No hard dependency on curl.
+fetch() {
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "$1"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO- "$1"
+    elif command -v python3 >/dev/null 2>&1; then
+        python3 -c 'import sys,urllib.request; sys.stdout.buffer.write(urllib.request.urlopen(sys.argv[1]).read())' "$1"
+    else
+        die "need curl, wget, or python3 to download files"
+    fi
+}
 
 export PATH="$HOME/.local/bin:$PATH"
 
@@ -79,13 +91,13 @@ start_server() {
 
 print_config() {
     echo
+    mcp-gtags-server config
     if server_running; then
-        mcp-gtags-server config --transport http --host "$HOST" --port "$PORT"
         echo
-        echo "  (Prefer per-client processes? The stdio variant also works:)"
-        echo "      claude mcp add --scope user gtags -- mcp-gtags-server"
-    else
-        mcp-gtags-server config
+        echo "  A shared background HTTP server is also running; any client can"
+        echo "  use it instead of spawning its own process:"
+        echo
+        mcp-gtags-server config --transport http --host "$HOST" --port "$PORT"
     fi
     echo
     echo "  Sanity check any time:   mcp-gtags-server doctor"
@@ -96,7 +108,7 @@ print_config() {
 # --- 1. uv ------------------------------------------------------------------
 if ! command -v uv >/dev/null 2>&1; then
     say "Installing uv (user-space Python tool manager) ..."
-    curl -fsSL https://astral.sh/uv/install.sh | sh
+    fetch https://astral.sh/uv/install.sh | sh
     export PATH="$HOME/.local/bin:$PATH"
     command -v uv >/dev/null 2>&1 || die "uv installation failed"
 fi

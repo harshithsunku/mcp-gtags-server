@@ -1094,3 +1094,20 @@ def test_root_autodetected_via_index_dir(c_project, monkeypatch):
     monkeypatch.chdir(subdir)
     result = json.loads(server.find_definition("add_numbers"))
     assert result["root"] == str(c_project.resolve())
+
+
+def test_mcp_tool_schemas_stable():
+    """The async roots wrapper must not change the registered tool schemas."""
+    import anyio
+
+    tools = {t.name: t for t in anyio.run(server.mcp.list_tools)}
+    assert len(tools) == 20
+    props = tools["find_definition"].inputSchema["properties"]
+    assert {
+        "symbol", "project_root", "case_insensitive",
+        "limit", "offset", "format", "active_config",
+    } <= set(props)
+    assert tools["find_definition"].inputSchema["required"] == ["symbol"]
+    # Every tool keeps the per-call project_root escape hatch.
+    for name, tool in tools.items():
+        assert "project_root" in tool.inputSchema["properties"], name

@@ -9,12 +9,15 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![MCP](https://img.shields.io/badge/protocol-MCP-8A2BE2)](https://modelcontextprotocol.io/)
 [![Powered by GNU Global](https://img.shields.io/badge/powered%20by-GNU%20Global-orange)](https://www.gnu.org/software/global/)
+[![Install in Cursor](https://img.shields.io/badge/Cursor-one--click%20install-black)](https://cursor.com/en/install-mcp?name=gtags&config=eyJjb21tYW5kIjoidXZ4IiwiYXJncyI6WyJtY3AtZ3RhZ3Mtc2VydmVyIl19)
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/harshithsunku/mcp-gtags-server/main/scripts/install.sh | bash
+mcp-name: io.github.harshithsunku/mcp-gtags-server
+
+```json
+{ "mcpServers": { "gtags": { "command": "uvx", "args": ["mcp-gtags-server"] } } }
 ```
 
-*One command, no sudo, everything in user space — when it finishes, an MCP server is running and the client config is on your screen.*
+*One user-level config entry, no sudo, no pre-installed anything — the whole toolchain installs itself into user space on first use, and every repo you open is served automatically.*
 
 Every AI coding agent — Claude Code, Cursor, Codex, you name it — answers *"where is this function defined?"* the same way: **grep the entire tree**. On a million-line C/C++ codebase that's a full scan per question, and the output is a firehose: every comment, string literal, and unrelated match, dumped straight into the model's context window.
 
@@ -54,48 +57,54 @@ And the answers are *measured*, not assumed: CI runs a [50-case golden eval](eva
 
 ## Quick start (60 seconds)
 
+### Option A — one config entry (recommended)
+
+Add the server **once, at user level**, and you're done — no installer, no pre-installed gtags, no per-repo setup. The only prerequisite is [`uv`](https://docs.astral.sh/uv/) (or use Option B, which installs it for you).
+
+```bash
+# Claude Code (once per device, all repos):
+claude mcp add --scope user gtags -- uvx mcp-gtags-server
+```
+
+```json
+// Cursor (~/.cursor/mcp.json), or any MCP client's global settings:
+{
+  "mcpServers": {
+    "gtags": { "command": "uvx", "args": ["mcp-gtags-server"] }
+  }
+}
+```
+
+Or click the **Cursor one-click install** badge at the top of this page.
+
+On the very first tool call the server bootstraps everything else by itself: GNU Global (prebuilt user-space binaries — no compiler, no sudo), universal-ctags, and Pygments, all into `~/.gtags-mcp`. While that one-time install runs (a few seconds on most platforms), tool calls return a *"toolchain is being installed — retry shortly"* status instead of failing. Opt out with `--no-auto-setup` or `GTAGS_MCP_AUTO_SETUP=0`.
+
+### Option B — one-line installer (shared background server)
+
 **One command. No sudo. Works everywhere** — restricted corporate machines, containers, build servers:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/harshithsunku/mcp-gtags-server/main/scripts/install.sh | bash
 ```
 
-Everything lands in your home directory — the server (via `uv`), GNU Global, universal-ctags, and Pygments (in `~/.gtags-mcp`). When it finishes, an MCP server is **already running in the background** and the exact client configuration is printed to your console:
-
-```text
-==> All set! Connect your tools with the configuration below:
-
-MCP client configuration (HTTP transport):
-
-  Claude Code (once per device, all repos):
-      claude mcp add --scope user --transport http gtags http://127.0.0.1:8383/mcp
-
-  Cursor / any MCP client — global settings or .mcp.json:
-      {
-        "mcpServers": {
-          "gtags": { "url": "http://127.0.0.1:8383/mcp" }
-        }
-      }
-```
+Everything lands in your home directory — the server (via `uv`), GNU Global, universal-ctags, and Pygments (in `~/.gtags-mcp`). When it finishes, a **shared background HTTP server** is running that every client and IDE window on the machine can point at (`http://127.0.0.1:8383/mcp`), and the exact client configuration is printed to your console.
 
 **Re-run the same command any time:**
 
 - Up to date? → *"Already installed and up to date — nothing to install"*, and the config is printed again.
 - New release on GitHub/PyPI? → the package updates, an outdated gtags toolchain is wiped and reinstalled automatically, and the background server restarts on the new version.
 
-Prefer stdio (client-launched processes) over a background server? That works too — `GTAGS_MCP_NO_SERVER=1` skips the server, and any client can use:
+### One config, many repos
 
-```json
-{
-  "mcpServers": {
-    "gtags": {
-      "command": "mcp-gtags-server"
-    }
-  }
-}
-```
+However you install it, **one user-level entry serves every repo you open** — 20 repos need zero extra installs and zero extra config. Each tool call resolves its project root down this ladder:
 
-That's it. No indexing step, no configuration, **no per-repo setup** — 20 repos need zero extra installs. Ask your agent *"who calls `tcp_v4_rcv`?"* — the first query in any repo builds that repo's index automatically, and every query after that is answered in milliseconds. Run `mcp-gtags-server doctor` any time to see what the server detects, or `mcp-gtags-server config` to re-print the client configuration.
+1. `project_root` argument on the tool call (agents pass this to target any tree)
+2. `--root` flag / `GTAGS_MCP_ROOT` env var
+3. `root` in a [config file](#config-files) *(note: pinning a root here defeats multi-repo)*
+4. **The client's workspace roots** (MCP roots protocol) — IDEs that advertise their open folders get the right repo automatically, even on the shared HTTP server; with several folders open, agents are asked to pass `project_root`
+5. Walk up from the server's working directory to the nearest `.git`/`GTAGS` — this is why stdio servers spawned by Claude Code/Cursor inside a repo just work
+
+That's it. No indexing step, no configuration. Ask your agent *"who calls `tcp_v4_rcv`?"* — the first query in any repo builds that repo's index automatically, and every query after that is answered in milliseconds. Run `mcp-gtags-server doctor` any time to see what the server detects, or `mcp-gtags-server config` to re-print the client configuration.
 
 <details>
 <summary><b>Background server details</b> (network access, port, lifecycle)</summary>
@@ -132,16 +141,18 @@ The server finds binaries in this order: `--bin-dir`/`GTAGS_MCP_BIN_DIR`/config 
 </details>
 
 <details>
-<summary><b>Claude Desktop</b> config</summary>
+<summary><b>Claude Desktop</b> — extension bundle or manual config</summary>
 
-Add to `claude_desktop_config.json` (pin the project since Desktop doesn't launch in your repo):
+Easiest: download `mcp-gtags-server.mcpb` from the [latest release](https://github.com/harshithsunku/mcp-gtags-server/releases/latest), drag it into Claude Desktop's Settings → Extensions, and pick your project folder in the setup screen. The gtags toolchain installs itself on first use.
+
+Or add to `claude_desktop_config.json` manually (pin the project since Desktop doesn't launch in your repo):
 
 ```json
 {
   "mcpServers": {
     "gtags": {
-      "command": "mcp-gtags-server",
-      "args": ["--root", "/absolute/path/to/your/project"]
+      "command": "uvx",
+      "args": ["mcp-gtags-server", "--root", "/absolute/path/to/your/project"]
     }
   }
 }
@@ -152,7 +163,7 @@ Add to `claude_desktop_config.json` (pin the project since Desktop doesn't launc
 <details>
 <summary><b>Pin a project root</b> explicitly</summary>
 
-By default the server auto-detects the project root by walking up from its working directory to the nearest `.git` or existing `GTAGS` — so queries from anywhere inside a monorepo resolve to the repo root. Override with `--root /path`, the `GTAGS_MCP_ROOT` env var, or `root` in a config file — or pass `project_root` on any individual tool call to query a different tree.
+By default the server uses the client's advertised workspace root (MCP roots protocol) or auto-detects the project root by walking up from its working directory to the nearest `.git` or existing `GTAGS` — so queries from anywhere inside a monorepo resolve to the repo root. Override with `--root /path`, the `GTAGS_MCP_ROOT` env var, or `root` in a config file — or pass `project_root` on any individual tool call to query a different tree. (See ["One config, many repos"](#one-config-many-repos) for the full resolution order.)
 
 </details>
 

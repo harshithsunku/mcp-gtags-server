@@ -142,15 +142,19 @@ publishes the score in the job summary. The writeup lives at
 Publishing (discovery) and reach (users) are two separate jobs.
 
 ### Publish
-- [ ] **Official MCP Registry** (`registry.modelcontextprotocol.io`) — publish a
-      `server.json` under an owned name via the `mcp-publisher` CLI. This is the upstream
-      feed; do it first.
+- [x] **Official MCP Registry** (`registry.modelcontextprotocol.io`) — `server.json` is in
+      the repo and publish.yml publishes every `v*` tag via `mcp-publisher` (GitHub OIDC).
+      Requires the `mcp-name:` marker in the README (PyPI long description) — in place.
+- [x] **Claude Desktop extension** — publish.yml builds `mcp-gtags-server.mcpb`
+      (scripts/build-mcpb.sh) and attaches it to every GitHub release.
+- [x] **Cursor one-click install** — deeplink badge in the README.
+- [ ] **Cursor tools directory** — manual submission form (needs the registry entry live).
 - [ ] **Claim crawled directories** — Glama (`glama.ai/mcp`) and PulseMCP auto-index
       open-source servers; claim and verify ownership to control the listing.
-- [ ] **Smithery** — `smithery mcp publish <url> -n harshithsunku/mcp-gtags-server`.
+- [ ] **Smithery** — `smithery mcp publish <url> -n harshithsunku/mcp-gtags-server`
+      (listing-only: its hosted model doesn't fit a local indexer).
 - [ ] **mcp.so** — community submission.
 - [ ] **awesome-mcp-servers** — open a PR (durable GitHub backlink, real browse traffic).
-- [ ] **Agent connector directories** — Cursor / Cline / Claude Code, for one-click install.
 
 ### Reach
 - [ ] 30-second asciinema/GIF in the README: an agent answering a hard question on a

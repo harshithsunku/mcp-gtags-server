@@ -1,6 +1,6 @@
 [project]
 name = "mcp-gtags-server"
-version = "1.0.0"
+version = "1.1.0"
 description = "Indexed code navigation for AI coding agents — replace grep scans with GNU Global (gtags) lookups over MCP. ~100x faster and radically less noise on million-line C/C++ codebases."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -31,7 +31,11 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
-    "mcp>=1.8.0",
+    # >=1.14: earlier FastMCP releases crash at import on this package's
+    # union-typed tool signatures (Tool.from_function issubclass TypeError);
+    # 1.14 is the oldest release the server imports and the suite passes on.
+    "mcp>=1.14.0",
+    "anyio>=4.0",
     "tomli>=2.0; python_version < '3.11'",
 ]
 

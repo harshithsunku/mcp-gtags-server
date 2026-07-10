@@ -1,0 +1,37 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-09-29/server.schema.json",
+  "name": "io.github.harshithsunku/mcp-gtags-server",
+  "description": "Indexed C/C++ code navigation over MCP — GNU Global (gtags) lookups instead of grep scans, with automatic indexing and a self-installing user-space toolchain.",
+  "repository": {
+    "url": "https://github.com/harshithsunku/mcp-gtags-server",
+    "source": "github"
+  },
+  "version": "1.1.0",
+  "websiteUrl": "https://github.com/harshithsunku/mcp-gtags-server",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "registryBaseUrl": "https://pypi.org",
+      "identifier": "mcp-gtags-server",
+      "version": "1.1.0",
+      "runtimeHint": "uvx",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "GTAGS_MCP_ROOT",
+          "description": "Optional pinned project root. Usually unnecessary: the server uses the client's workspace roots or auto-detects the repo from its working directory.",
+          "isRequired": false,
+          "format": "string"
+        },
+        {
+          "name": "GTAGS_MCP_AUTO_SETUP",
+          "description": "Set to 0 to disable the automatic user-space install of the gtags/ctags toolchain on first use.",
+          "isRequired": false,
+          "format": "string"
+        }
+      ]
+    }
+  ]
+}

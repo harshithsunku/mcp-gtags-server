@@ -1,0 +1,49 @@
+{
+  "$schema": "https://raw.githubusercontent.com/anthropics/mcpb/main/dist/mcpb-manifest.schema.json",
+  "manifest_version": "0.2",
+  "name": "mcp-gtags-server",
+  "display_name": "gtags Code Navigator",
+  "version": "0.0.0",
+  "description": "Indexed C/C++ code navigation — GNU Global (gtags) lookups instead of grep scans, with automatic indexing.",
+  "long_description": "Replaces grep-based code search with indexed lookups powered by GNU Global (gtags). Ask where a symbol is defined, who calls it, what a diff impacts — answered in milliseconds from an index that builds and refreshes itself. The gtags toolchain installs itself into ~/.gtags-mcp (user space, no sudo) on first use.",
+  "author": {
+    "name": "Harshith Sunku",
+    "url": "https://github.com/harshithsunku"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/harshithsunku/mcp-gtags-server"
+  },
+  "homepage": "https://github.com/harshithsunku/mcp-gtags-server",
+  "license": "MIT",
+  "keywords": ["gtags", "gnu-global", "code-navigation", "c", "c++", "kernel"],
+  "server": {
+    "type": "python",
+    "entry_point": "server/main.py",
+    "mcp_config": {
+      "command": "python3",
+      "args": [
+        "${__dirname}/server/main.py",
+        "--root",
+        "${user_config.project_root}"
+      ],
+      "env": {
+        "PYTHONPATH": "${__dirname}/server/lib"
+      }
+    }
+  },
+  "user_config": {
+    "project_root": {
+      "type": "directory",
+      "title": "Project to index",
+      "description": "The code repository the navigation tools operate on.",
+      "required": true
+    }
+  },
+  "compatibility": {
+    "platforms": ["darwin", "linux"],
+    "runtimes": {
+      "python": ">=3.10"
+    }
+  }
+}

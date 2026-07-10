@@ -50,7 +50,8 @@ GLOBAL_SOURCE_URL = f"https://ftp.gnu.org/gnu/global/global-{GLOBAL_VERSION}.tar
 GLOBAL_SOURCE_SHA256 = "cf0937cb3ed521b2ab1acfa7aff45103040b860bb642c4c2f094ac3a3fe86024"
 
 # Prebuilt Global binaries published on this project's GitHub releases under
-# the tag ``global-v<version>``; dormant (auto-skipped) until they exist.
+# the tag ``global-v<version>`` (built by release-binaries.yml); setup falls
+# back to a source build when no asset matches the platform.
 PREBUILT_REPO = "harshithsunku/mcp-gtags-server"
 PREBUILT_TAG = f"global-v{GLOBAL_VERSION}"
 
