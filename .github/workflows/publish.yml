@@ -62,48 +62,15 @@ jobs:
             --title "mcp-gtags-server $GITHUB_REF_NAME" \
             --generate-notes dist/*
 
-  # Publish the release to the official MCP Registry
-  # (registry.modelcontextprotocol.io) so Cursor's directory, Claude clients,
-  # and aggregators discover it. Ownership is proven two ways: GitHub OIDC for
-  # the io.github.* namespace, and the `mcp-name:` marker in the README (the
-  # PyPI long description), which the registry validates against the live
-  # PyPI page — hence the wait step.
+  # Publish the release to the official MCP Registry (see
+  # publish-registry.yml, which is also manually dispatchable for recovery).
   publish-registry:
     needs: publish
-    runs-on: ubuntu-latest
+    uses: ./.github/workflows/publish-registry.yml
     permissions:
       id-token: write   # GitHub OIDC login to the MCP registry
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Sync server.json version with the tag
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          jq --arg v "$VERSION" '.version=$v | .packages[0].version=$v' \
-            server.json > server.json.tmp && mv server.json.tmp server.json
-          cat server.json
-
-      - name: Wait for the release to be live on PyPI
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          for i in $(seq 1 30); do
-            if curl -fsSL "https://pypi.org/pypi/mcp-gtags-server/$VERSION/json" >/dev/null 2>&1; then
-              echo "PyPI has $VERSION"; exit 0
-            fi
-            echo "waiting for PyPI ($i/30) ..."; sleep 10
-          done
-          echo "PyPI never served $VERSION" >&2; exit 1
-
-      - name: Install mcp-publisher
-        run: |
-          curl -fsSL \
-            "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" \
-            | tar xz mcp-publisher
-
-      - name: Publish to the MCP Registry
-        run: |
-          ./mcp-publisher login github-oidc
-          ./mcp-publisher publish
+    with:
+      version: ${{ github.ref_name }}
 
   # Build the Claude Desktop extension bundle (.mcpb) and attach it to the
   # GitHub release. Users drag it into Claude Desktop and pick a project

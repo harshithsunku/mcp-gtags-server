@@ -1,7 +1,7 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-09-29/server.schema.json",
   "name": "io.github.harshithsunku/mcp-gtags-server",
-  "description": "Indexed C/C++ code navigation over MCP — GNU Global (gtags) lookups instead of grep scans, with automatic indexing and a self-installing user-space toolchain.",
+  "description": "Indexed C/C++ code navigation for AI agents — GNU Global (gtags) lookups over MCP, not grep scans.",
   "repository": {
     "url": "https://github.com/harshithsunku/mcp-gtags-server",
     "source": "github"
