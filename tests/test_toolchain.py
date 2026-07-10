@@ -225,3 +225,21 @@ def test_install_ctags_replaces_exuberant(monkeypatch):
     assert toolchain.install_ctags(logs.append) is False
     assert attempted, "expected a download attempt for universal-ctags"
     assert any("cannot emit JSON output" in line for line in logs)
+
+
+def test_write_relocated_conf_fixes_pygments_shebang(tmp_path):
+    """The shipped parser script's `env python` shebang must become python3."""
+    share = toolchain.managed_home() / "share" / "gtags"
+    script_dir = share / "script"
+    script_dir.mkdir(parents=True)
+    (share / "gtags.conf").write_text("default:\\\n\t:tc=native:\n")
+    script = script_dir / "pygments_parser.py"
+    script.write_text("#!/usr/bin/env python\nimport sys\n")
+
+    toolchain.write_relocated_conf(lambda *_: None)
+
+    assert script.read_text().startswith("#!/usr/bin/env python3\n")
+    assert "import sys" in script.read_text()
+    # Idempotent: a second run leaves the fixed script alone.
+    toolchain.write_relocated_conf(lambda *_: None)
+    assert script.read_text().count("python3") == 1

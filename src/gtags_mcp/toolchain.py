@@ -409,6 +409,24 @@ def write_relocated_conf(log) -> None:
         text = re.sub(r"(:ctagscom=)[^:\\\n]*", rf"\g<1>{ctags}", text)
     managed_conf().write_text(text)
     log(f"  wrote {managed_conf()}")
+    _fix_pygments_shebang(log)
+
+
+def _fix_pygments_shebang(log) -> None:
+    """Point the shipped pygments parser script at ``python3``.
+
+    Its shebang says ``#!/usr/bin/env python``, but modern distros ship only
+    ``python3`` — with the original shebang the plugin parser dies at startup
+    and every gtags run under a pygments label fails with "unexpected EOF".
+    """
+    script = managed_home() / "share" / "gtags" / "script" / "pygments_parser.py"
+    try:
+        lines = script.read_text().splitlines(keepends=True)
+    except OSError:
+        return
+    if lines and lines[0].strip() == "#!/usr/bin/env python":
+        script.write_text("#!/usr/bin/env python3\n" + "".join(lines[1:]))
+        log(f"  fixed python3 shebang in {script}")
 
 
 # --------------------------------------------------------------------------
