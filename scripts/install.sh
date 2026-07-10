@@ -104,7 +104,9 @@ fi
 # --- 2. mcp-gtags-server (install or update) ----------------------------------
 BEFORE="$(installed_version)"
 say "Checking mcp-gtags-server ..."
-uv tool install --upgrade --quiet mcp-gtags-server
+# --refresh-package: always re-check PyPI so an installer re-run picks up a
+# release published minutes ago instead of uv's cached index metadata.
+uv tool install --upgrade --refresh-package mcp-gtags-server --quiet mcp-gtags-server
 command -v mcp-gtags-server >/dev/null 2>&1 || die "mcp-gtags-server not on PATH after install"
 AFTER="$(installed_version)"
 
