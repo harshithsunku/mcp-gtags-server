@@ -17,23 +17,18 @@ publishes the score on every push to main — see
 callers, counts, guard variants, and reachability outcomes; expectations are
 path-level so they hold across kernel versions.
 
-Current score on a mid-2026 kernel snapshot:
+Current scores:
 
 ```
-callers       6/6  passed
-definition   12/13 passed
-guards        4/4  passed
-macro        14/14 passed
-references    8/8  passed
-workflow      5/5  passed
-
-recall (expected content found): 49/50 = 98.0%
-precision@1 (top result right):  14/14 = 100.0%
-overall: 49/50 = 98.0%  in 3.1s
+CI, kernel v6.16 (pinned):      50/50 = 100.0% recall, 14/14 = 100.0% precision@1, 41s
+local, mid-2026 master snapshot: 49/50 =  98.0% recall, 14/14 = 100.0% precision@1, 3.1s
 ```
 
-The one failure is deliberate — a known upstream parser gap kept in the set
-so the score stays honest (see "Known limitations").
+The one failure on newer kernels is kept in the set deliberately: recent
+kernels added sparse `__acquires()` annotations to mutex forward
+declarations, and GNU Global's C parser derails on them — the eval caught a
+real upstream parser regression triggered by a new kernel annotation style
+(see "Known limitations").
 
 ## What resolves
 
@@ -88,11 +83,13 @@ Resolution costs 20–75 ms per query on the kernel; a miss costs ~9 ms.
   `reachability` says so explicitly rather than returning a wrong path; the
   golden set asserts this honest "no" (`reach-fnptr-honesty`).
 - **One upstream parser gap, kept as a failing eval case:** GNU Global's C
-  parser derails on a sparse annotation in a forward declaration
+  parser derails on the sparse annotation kernels newer than ~v6.16 put on
+  forward declarations
   (`static void __sched __mutex_lock_slowpath(...) __acquires(lock);`) and
   misses the real `mutex_lock` definition at `kernel/locking/mutex.c:314`.
   The `CONFIG_DEBUG_LOCK_ALLOC` macro variant and the `PREEMPT_RT` variant
-  are still found.
+  are still found, and older kernels are unaffected (hence 100% in CI on
+  v6.16 vs 98% on a 2026 master snapshot).
 - **Prototypes rank alongside definitions.** `find_definition` can return a
   header prototype before the `.c` definition (both are index "definitions");
   the ctags `kind` field distinguishes them.

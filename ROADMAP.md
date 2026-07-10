@@ -116,10 +116,11 @@ Trust through measurable quality — reported on its own terms.
 
 **Done when:** an eval command prints a score in CI, and the capability writeup is live.
 ✅ `mcp-gtags-server eval --golden evals/golden.jsonl --root <kernel>` runs 50
-path-level cases in ~3s — 98% recall, 100% precision@1 on a 2026 kernel snapshot,
-including one deliberate known-fail (an upstream parser gap on `mutex_lock`) so the
-number stays honest. CI (`eval.yml`) clones a pinned kernel tag weekly and on main
-pushes and publishes the score in the job summary. The writeup lives at
+path-level cases in ~3s — 100% recall and 100% precision@1 in CI on pinned v6.16;
+98% recall on a 2026 master snapshot, where the one deliberate known-fail (a GNU
+Global parser gap triggered by the new `__acquires()` annotations) keeps the number
+honest. CI (`eval.yml`) clones the pinned kernel tag weekly and on main pushes and
+publishes the score in the job summary. The writeup lives at
 [docs/capability.md](docs/capability.md); posting it to the blog/HN is the Reach item below.
 
 ---
