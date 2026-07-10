@@ -83,14 +83,19 @@ resolves to its definition site. ✅ `find_definition("sys_read")` returns
 ranked ahead of same-named test helpers; `symbol_info` also reports `EXPORT_SYMBOL*`
 status in an `exported` field.
 
-### 5. Agent workflow tools
+### 5. Agent workflow tools ✅
 Fewer round-trips, higher-value calls — built on the existing call-graph data.
 
-- [ ] `reachability(from, to)` — does A transitively call B, and by what path?
-- [ ] `blast_radius(git_ref)` — take a `git diff`, find changed functions, and return
+- [x] `reachability(from, to)` — does A transitively call B, and by what path?
+- [x] `blast_radius(git_ref)` — take a `git diff`, find changed functions, and return
       everything that references/calls them, ranked by distance. (Refactoring-impact use case.)
 
-**Done when:** both return bounded, ranked results tied to real git state.
+**Done when:** both return bounded, ranked results tied to real git state. ✅
+`reachability("do_sys_openat2", "security_file_open")` returns the 4-hop chain with
+call-site locations in ~1s on the kernel (and says "no static path — function
+pointers" honestly when only an ops-struct route exists); `blast_radius` maps a
+kernel diff to its enclosing functions and ranks callers by distance in ~0.1s,
+listing macro-invocation callers (SYSCALL_DEFINE3) without exploding through them.
 
 ### ~~6. Optional LSP escalation~~ — dropped
 Rejected 2026-07: it contradicts the project's identity. The design principles say

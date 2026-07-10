@@ -185,6 +185,8 @@ Precedence: tool-call argument > CLI flag > environment variable > project confi
 | `find_callers` | **The call graph, deduplicated.** Every reference mapped to its enclosing function with call counts: 245 raw lines for `ext4_mark_inode_dirty` collapse to 62 callers. |
 | `call_hierarchy` | **Multi-level impact analysis.** Who calls X, who calls *those*, up to 5 levels — a cycle-safe, capped tree instead of N rounds of grep. |
 | `find_callees` | **The outgoing call graph.** What does this function call? Body-extracted call sites, each verified against the index, split into in-tree (with locations) and external. |
+| `reachability` | **"Can this function end up in that one?"** — BFS over the caller graph returns the *shortest* call chain from A to B with the file:line of every call site (`ksys_read → vfs_read → rw_verify_area`), or an honest "no static path" that names the function-pointer caveat. One call instead of a dozen find_callers rounds. |
+| `blast_radius` | **What does my diff impact?** Takes `git diff <ref>`, maps changed lines to their enclosing functions via the index, then walks callers outward — results ranked by distance (changed functions first, direct callers next). The pre-merge "what else must I re-check" answer, tied to real git state. |
 | `summarize_references` | **A ranked per-file count.** The cheap first move for hot symbols — `kmalloc`'s 2,744 references become one screen of "where usage concentrates". |
 | `project_overview` | **Orientation in an unfamiliar repo** — file counts by top-level directory and language, straight from the index. |
 | `find_dead_symbols` | **Dead-code candidates** — every symbol a file defines that nothing references. |
@@ -400,9 +402,9 @@ Release flow: bump `version` in `pyproject.toml`, tag `vX.Y.Z`, push — CI publ
 See [ROADMAP.md](ROADMAP.md) — structured JSON output landed in v0.8.0, ctags
 metadata enrichment (kind/signature/scope) in v0.8.1, `#ifdef`/config-guard
 awareness (the headline capability for kernel and firmware trees) in v0.9.0,
-and macro-family symbol resolution (`sys_read` → its `SYSCALL_DEFINE3` site)
-after that; next up are agent workflow tools (`reachability`,
-`blast_radius`) and a correctness eval harness.
+then macro-family symbol resolution (`sys_read` → its `SYSCALL_DEFINE3` site)
+and the agent workflow tools (`reachability`, `blast_radius`); next up is a
+correctness eval harness.
 
 Contributions welcome — open an issue or PR.
 

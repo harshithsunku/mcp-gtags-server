@@ -68,6 +68,11 @@ _NEXT_TOOLS: dict[str, tuple[list[str], list[str]]] = {
     ),
     "call_hierarchy": (["get_symbol_body", "find_callees"], ["find_references"]),
     "find_callees": (["get_symbol_body", "call_hierarchy"], []),
+    "reachability": (
+        ["get_symbol_body", "find_callers"],
+        ["find_callers", "find_callees"],
+    ),
+    "blast_radius": (["find_callers", "get_symbol_body"], ["summarize_references"]),
     "symbol_info": ([], []),  # computed dynamically by the tool
     "project_overview": (["find_files", "symbol_info"], []),
     "find_dead_symbols": (["find_references", "get_symbol_body"], []),

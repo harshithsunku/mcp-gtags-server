@@ -1168,6 +1168,336 @@ def find_callees(
     return "\n".join(sections) + note
 
 
+# Caller-graph walks (reachability / blast_radius) expand at most this many
+# functions per call — beyond that the answer is "too widely connected".
+MAX_GRAPH_EXPANSIONS = 200
+
+# An all-caps "caller" is a macro-invocation name (SYSCALL_DEFINE3,
+# TRACE_EVENT, ...) shared by hundreds of unrelated sites — expanding it by
+# name would pull every other invocation into the walk. List it, never
+# expand through it.
+_MACROISH_RE = re.compile(r"[A-Z][A-Z0-9_]*")
+
+
+@mcp.tool()
+def reachability(
+    from_symbol: str,
+    to_symbol: str,
+    project_root: str | None = None,
+    max_depth: int = 8,
+    format: Format = "json",
+) -> str:
+    """Does FROM transitively call TO — and through which call chain?
+
+    Use this instead of chaining find_callers/find_callees rounds when the
+    question is "can this function end up in that one?" (does a syscall
+    reach this driver? can this cleanup path hit this allocator?). It
+    breadth-first-searches the caller graph upward from `to_symbol` and
+    returns the SHORTEST call chain, each hop with the file:line of the
+    call site — one call answers what would otherwise take many.
+
+    Args:
+        from_symbol: The caller end of the question ("can this reach ...").
+        to_symbol: The callee end ("... this function?").
+        project_root: Project directory. Omit to use the server's default.
+        max_depth: Longest chain to consider, in calls (1-12, default 8).
+        format: "json" (default) for {path_found, hops, depth,
+            nodes_explored}; "text" for the chain rendering. Hops run from
+            from_symbol to to_symbol; each hop's path/line is the call site
+            of the NEXT hop (the last hop is to_symbol at its definition).
+    """
+    max_depth = max(1, min(max_depth, 12))
+    stdout, root, err = _raw_global(["-x", "--", to_symbol], project_root)
+    if err:
+        return output.error("reachability", err, root) if format == "json" else err
+    defs = [r for line in stdout.splitlines() if (r := _parse_cxref(line))]
+    to_location = {"path": defs[0][2], "line": defs[0][1]} if defs else {}
+
+    # BFS upward from to_symbol. link[caller] = (callee, path, sites) is the
+    # tree edge that discovered `caller`, i.e. where caller calls callee.
+    link: dict[str, tuple[str, str, list[int]]] = {}
+    seen = {to_symbol}
+    frontier = [to_symbol]
+    explored = 0
+    skipped_broad = 0
+    found = from_symbol == to_symbol
+    depth_walked = 0
+    while frontier and not found and depth_walked < max_depth:
+        depth_walked += 1
+        next_frontier: list[str] = []
+        for node in frontier:
+            if explored >= MAX_GRAPH_EXPANSIONS:
+                break
+            explored += 1
+            callers, cerr = _callers_of(node, project_root)
+            if cerr:
+                skipped_broad += 1  # too widely referenced to expand
+                continue
+            for (caller, path), sites in sorted(callers.items()):
+                if caller in seen or caller == "(file scope)":
+                    continue
+                seen.add(caller)
+                link[caller] = (node, path, sites)
+                if caller == from_symbol:
+                    found = True
+                    break
+                if not _MACROISH_RE.fullmatch(caller):
+                    next_frontier.append(caller)
+            if found:
+                break
+        if explored >= MAX_GRAPH_EXPANSIONS:
+            break
+        frontier = next_frontier
+
+    hops: list[dict] = []
+    if found:
+        current = from_symbol
+        while current != to_symbol:
+            callee, path, sites = link[current]
+            hops.append(
+                {
+                    "symbol": current,
+                    "path": path,
+                    "line": sorted(sites)[0],
+                    "calls": callee,
+                    "call_sites": len(sites),
+                }
+            )
+            current = callee
+        hops.append(
+            {"symbol": to_symbol, "path": None, "line": None, "calls": None}
+            | to_location
+        )
+
+    message = None
+    if not found:
+        reason = (
+            f"stopped at the {MAX_GRAPH_EXPANSIONS}-function exploration budget"
+            if explored >= MAX_GRAPH_EXPANSIONS
+            else f"within {max_depth} call levels"
+        )
+        message = (
+            f"No call path from '{from_symbol}' to '{to_symbol}' found "
+            f"({reason}; {explored} function(s) explored"
+            + (f", {skipped_broad} too widely referenced to expand" if skipped_broad else "")
+            + "). Static analysis cannot follow function pointers, so an "
+            "indirect path (ops structs, callbacks) may still exist."
+        )
+
+    if format == "json":
+        result = {
+            "from": from_symbol,
+            "to": to_symbol,
+            "path_found": found,
+            "hops": hops,
+            "depth": len(hops) - 1 if found else None,
+            "nodes_explored": explored,
+        }
+        extra = {"message": message} if message else {}
+        return output.envelope(
+            "reachability",
+            root,
+            result,
+            total=len(hops),
+            hints=output.next_tools("reachability", found),
+            **extra,
+        )
+
+    if not found:
+        return message
+    chain = " -> ".join(hop["symbol"] for hop in hops)
+    lines = [f"reachable in {len(hops) - 1} call(s): {chain}"]
+    for hop in hops[:-1]:
+        plural = "s" if hop["call_sites"] != 1 else ""
+        lines.append(
+            f"  {hop['symbol']} calls {hop['calls']} at {hop['path']}:{hop['line']}"
+            f" ({hop['call_sites']} site{plural})"
+        )
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def blast_radius(
+    git_ref: str = "HEAD",
+    project_root: str | None = None,
+    depth: int = 1,
+    limit: int = DEFAULT_LIMIT,
+    offset: int = 0,
+    format: Format = "json",
+) -> str:
+    """Which functions are impacted by a change? (refactoring blast radius)
+
+    Use this after editing code, or before merging, to see how far a change
+    reaches: it takes the `git diff` against `git_ref`, maps every changed
+    line to its enclosing function via the index, then walks the caller
+    graph outward. Results are ranked by distance — the changed functions
+    themselves first (distance 0), their direct callers next (distance 1),
+    and so on — so the top of the list is always what to re-check first.
+
+    Args:
+        git_ref: Diff base understood by `git diff` — a commit, branch, or
+            range (default HEAD = uncommitted changes; use "HEAD~1" for the
+            last commit, "main..." for a whole branch).
+        project_root: Project directory (must be a git work tree). Omit to
+            use the server's default.
+        depth: Caller levels to expand beyond the changed functions (0-3,
+            default 1; 0 = just list the changed functions).
+        limit: Maximum results to return (default 100).
+        offset: Skip this many results (for pagination).
+        format: "json" (default) for records {symbol, path, line, distance,
+            via, call_sites} — `via` is the already-impacted function this
+            caller reaches the change through; "text" for a ranked listing.
+    """
+    depth = max(0, min(depth, 3))
+    if git_ref.startswith("-"):
+        msg = f"Error: invalid git_ref: {git_ref!r}"
+        return output.error("blast_radius", msg) if format == "json" else msg
+    if err := _check_global_installed():
+        return output.error("blast_radius", err) if format == "json" else err
+    root, err = _effective_root(project_root)
+    if err:
+        return output.error("blast_radius", err) if format == "json" else err
+    if err := _ensure_index(root):
+        return output.error("blast_radius", err, root) if format == "json" else err
+    diff_out, diff_err, code = _run(
+        ["git", "diff", "--no-color", "--unified=0", git_ref, "--"], root
+    )
+    if code != 0:
+        msg = f"Error: git diff {git_ref} failed: {diff_err.strip() or 'unknown error'}"
+        return output.error("blast_radius", msg, root) if format == "json" else msg
+
+    # Changed line ranges per (new-side) file, from the unified-diff hunks.
+    changed_ranges: dict[str, list[tuple[int, int]]] = {}
+    current_file: str | None = None
+    for line in diff_out.splitlines():
+        if line.startswith("+++ "):
+            target = line[4:].strip()
+            current_file = None if target == "/dev/null" else target.removeprefix("b/")
+        elif line.startswith("@@") and current_file:
+            hunk = re.match(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", line)
+            if hunk:
+                start = int(hunk.group(1))
+                count = int(hunk.group(2)) if hunk.group(2) is not None else 1
+                # A pure deletion (count 0) still touches the code around
+                # `start`; treat it as a one-line change there.
+                changed_ranges.setdefault(current_file, []).append(
+                    (start, start + max(count, 1) - 1)
+                )
+
+    # Map each changed range to the definitions whose span intersects it.
+    impacted: dict[str, dict] = {}
+    for path, ranges in sorted(changed_ranges.items()):
+        defs_out, _, derr = _raw_global(["-fx", "--", path], project_root)
+        if derr or not defs_out or not defs_out.strip():
+            continue  # deleted, unindexed, or non-source file
+        defs = sorted(
+            (d[1], d[0])
+            for line in defs_out.splitlines()
+            if (d := _parse_cxref(line))
+        )
+        for start, end in ranges:
+            for i, (def_line, def_sym) in enumerate(defs):
+                next_line = defs[i + 1][0] if i + 1 < len(defs) else float("inf")
+                if def_line <= end and start < next_line:
+                    impacted.setdefault(
+                        def_sym,
+                        {
+                            "symbol": def_sym,
+                            "path": path,
+                            "line": def_line,
+                            "distance": 0,
+                            "via": None,
+                            "call_sites": None,
+                        },
+                    )
+
+    results = sorted(impacted.values(), key=lambda r: (r["path"], r["line"]))
+    seen = set(impacted)
+    frontier = [r["symbol"] for r in results]
+    explored = 0
+    skipped_broad = 0
+    capped = False
+    for distance in range(1, depth + 1):
+        next_frontier: list[str] = []
+        for sym in frontier:
+            if explored >= MAX_GRAPH_EXPANSIONS:
+                capped = True
+                break
+            explored += 1
+            callers, cerr = _callers_of(sym, project_root)
+            if cerr:
+                skipped_broad += 1
+                continue
+            for (caller, path), sites in sorted(callers.items()):
+                if caller in seen or caller == "(file scope)":
+                    continue
+                seen.add(caller)
+                results.append(
+                    {
+                        "symbol": caller,
+                        "path": path,
+                        "line": sorted(sites)[0],
+                        "distance": distance,
+                        "via": sym,
+                        "call_sites": len(sites),
+                    }
+                )
+                if not _MACROISH_RE.fullmatch(caller):
+                    next_frontier.append(caller)
+        if capped:
+            break
+        frontier = next_frontier
+
+    message = None
+    if not changed_ranges:
+        message = f"git diff {git_ref} reports no changes."
+    elif not impacted:
+        message = (
+            f"No indexed definitions overlap the changes against {git_ref} "
+            "(non-source files, or files not in the index)."
+        )
+
+    if format == "json":
+        page, total, truncated = output.paginate(results, limit, offset)
+        extra = {"message": message} if message else {}
+        return output.envelope(
+            "blast_radius",
+            root,
+            page,
+            total=total,
+            offset=offset,
+            truncated=truncated or capped,
+            git_ref=git_ref,
+            changed_files=len(changed_ranges),
+            changed_functions=len(impacted),
+            skipped_broad=skipped_broad,
+            hints=output.next_tools("blast_radius", bool(results)),
+            **extra,
+        )
+
+    if message:
+        return message
+    lines = [
+        f"Blast radius of `git diff {git_ref}`: {len(impacted)} changed "
+        f"function(s), {len(results)} impacted within {depth} caller level(s):"
+    ]
+    for rec in results[offset : offset + max(1, limit)]:
+        if rec["distance"] == 0:
+            lines.append(f"  [changed] {rec['symbol']}  {rec['path']}:{rec['line']}")
+        else:
+            plural = "s" if rec["call_sites"] != 1 else ""
+            lines.append(
+                f"  [d={rec['distance']}] {rec['symbol']}  {rec['path']}:{rec['line']}"
+                f"  via {rec['via']} ({rec['call_sites']} site{plural})"
+            )
+    if skipped_broad:
+        lines.append(
+            f"  ({skipped_broad} function(s) too widely referenced to expand — "
+            "use summarize_references on them)"
+        )
+    return "\n".join(lines)
+
+
 def _describe_definition(rec: dict, source: str) -> str:
     """Render one enriched definition record for the symbol_info text card.
 
