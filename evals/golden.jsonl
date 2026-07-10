@@ -1,0 +1,70 @@
+# Golden query set for `mcp-gtags-server eval`, curated against the Linux kernel.
+# Expectations are path-level (not line-level) so they hold across kernel versions;
+# CI pins one tag for a stable headline number. One JSON case per line.
+#
+# --- definition: plain indexed lookups -------------------------------------
+{"id": "def-vfs_read", "category": "definition", "tool": "find_definition", "args": {"symbol": "vfs_read"}, "expect": {"paths": ["fs/read_write.c"], "top_path": ["fs/read_write.c"]}}
+{"id": "def-schedule", "category": "definition", "tool": "find_definition", "args": {"symbol": "schedule"}, "expect": {"paths": ["kernel/sched/core.c"]}}
+{"id": "def-kmalloc", "category": "definition", "tool": "find_definition", "args": {"symbol": "kmalloc"}, "expect": {"paths": ["include/linux/slab.h"], "top_path": ["include/linux/slab.h"]}}
+{"id": "def-task_struct", "category": "definition", "tool": "find_definition", "args": {"symbol": "task_struct"}, "expect": {"paths": ["include/linux/sched.h"]}}
+{"id": "def-list_head", "category": "definition", "tool": "find_definition", "args": {"symbol": "list_head"}, "expect": {"paths": ["include/linux/types.h"]}}
+{"id": "def-file_operations", "category": "definition", "tool": "find_definition", "args": {"symbol": "file_operations"}, "expect": {"paths": ["include/linux/fs.h"]}}
+{"id": "def-tcp_v4_rcv", "category": "definition", "tool": "find_definition", "args": {"symbol": "tcp_v4_rcv"}, "expect": {"paths": ["net/ipv4/tcp_ipv4.c"], "top_path": ["net/ipv4/tcp_ipv4.c"]}}
+{"id": "def-ext4_map_blocks", "category": "definition", "tool": "find_definition", "args": {"symbol": "ext4_map_blocks"}, "expect": {"paths": ["fs/ext4/inode.c"]}}
+{"id": "def-kernel_clone", "category": "definition", "tool": "find_definition", "args": {"symbol": "kernel_clone"}, "expect": {"paths": ["kernel/fork.c"], "top_path": ["kernel/fork.c"]}}
+# def-mutex_lock is a deliberate KNOWN-FAIL: GNU Global's C parser derails on the
+# sparse annotation in "static void __sched __mutex_lock_slowpath(...) __acquires(lock);"
+# and misses the real mutex_lock definition at kernel/locking/mutex.c:314 entirely
+# (the CONFIG_DEBUG_LOCK_ALLOC macro and PREEMPT_RT variants are still found).
+# Tracked honestly instead of hidden — see docs/capability.md.
+{"id": "def-mutex_lock", "category": "definition", "tool": "find_definition", "args": {"symbol": "mutex_lock"}, "expect": {"paths": ["kernel/locking/mutex.c"]}}
+{"id": "def-skb_clone", "category": "definition", "tool": "find_definition", "args": {"symbol": "skb_clone"}, "expect": {"paths": ["net/core/skbuff.c"], "top_path": ["net/core/skbuff.c"]}}
+{"id": "def-do_dentry_open", "category": "definition", "tool": "find_definition", "args": {"symbol": "do_dentry_open"}, "expect": {"paths": ["fs/open.c"], "top_path": ["fs/open.c"]}}
+{"id": "def-wait_event", "category": "definition", "tool": "find_definition", "args": {"symbol": "wait_event"}, "expect": {"paths": ["include/linux/wait.h"]}}
+#
+# --- macro: token-pasted symbols with no literal definition ----------------
+{"id": "macro-sys_read", "category": "macro", "tool": "find_definition", "args": {"symbol": "sys_read"}, "expect": {"paths": ["fs/read_write.c"], "top_path": ["fs/read_write.c"], "resolved_via": "macro:SYSCALL_DEFINE"}}
+{"id": "macro-sys_write", "category": "macro", "tool": "find_definition", "args": {"symbol": "sys_write"}, "expect": {"paths": ["fs/read_write.c"], "top_path": ["fs/read_write.c"], "resolved_via": "macro:SYSCALL_DEFINE"}}
+{"id": "macro-sys_openat", "category": "macro", "tool": "find_definition", "args": {"symbol": "sys_openat"}, "expect": {"paths": ["fs/open.c"], "top_path": ["fs/open.c"], "resolved_via": "macro:SYSCALL_DEFINE"}}
+{"id": "macro-sys_getpid", "category": "macro", "tool": "find_definition", "args": {"symbol": "sys_getpid"}, "expect": {"paths": ["kernel/sys.c"], "resolved_via": "macro:SYSCALL_DEFINE"}}
+{"id": "macro-sys_clone3", "category": "macro", "tool": "find_definition", "args": {"symbol": "sys_clone3"}, "expect": {"paths": ["kernel/fork.c"], "resolved_via": "macro:SYSCALL_DEFINE"}}
+{"id": "macro-sys_mmap", "category": "macro", "tool": "find_definition", "args": {"symbol": "sys_mmap"}, "expect": {"min_results": 1, "resolved_via": "macro:SYSCALL_DEFINE"}}
+{"id": "macro-x64-wrapper", "category": "macro", "tool": "find_definition", "args": {"symbol": "__x64_sys_openat"}, "expect": {"paths": ["fs/open.c"], "top_path": ["fs/open.c"], "resolved_via": "macro:SYSCALL_DEFINE"}}
+{"id": "macro-compat_sys_ioctl", "category": "macro", "tool": "find_definition", "args": {"symbol": "compat_sys_ioctl"}, "expect": {"paths": ["fs/ioctl.c"], "resolved_via": "macro:COMPAT_SYSCALL_DEFINE"}}
+{"id": "macro-trace_sched_switch", "category": "macro", "tool": "find_definition", "args": {"symbol": "trace_sched_switch"}, "expect": {"paths": ["include/trace/events/sched.h"], "top_path": ["include/trace/events/sched.h"], "resolved_via": "macro:TRACE_EVENT"}}
+{"id": "macro-trace_kmalloc", "category": "macro", "tool": "find_definition", "args": {"symbol": "trace_kmalloc"}, "expect": {"paths": ["include/trace/events/kmem.h"], "resolved_via": "macro:TRACE_EVENT"}}
+{"id": "macro-trace_kfree", "category": "macro", "tool": "find_definition", "args": {"symbol": "trace_kfree"}, "expect": {"paths": ["include/trace/events/kmem.h"], "resolved_via": "macro:TRACE_EVENT"}}
+{"id": "macro-css_set_lock", "category": "macro", "tool": "find_definition", "args": {"symbol": "css_set_lock"}, "expect": {"paths": ["kernel/cgroup/cgroup.c"], "top_path": ["kernel/cgroup/cgroup.c"], "resolved_via": "macro:DEFINE_SPINLOCK"}}
+{"id": "macro-runqueues", "category": "macro", "tool": "find_definition", "args": {"symbol": "runqueues"}, "expect": {"paths": ["kernel/sched/core.c"], "top_path": ["kernel/sched/core.c"]}}
+{"id": "macro-wq_pool_mutex", "category": "macro", "tool": "find_definition", "args": {"symbol": "wq_pool_mutex"}, "expect": {"paths": ["kernel/workqueue.c"], "top_path": ["kernel/workqueue.c"], "resolved_via": "macro:DEFINE_MUTEX"}}
+#
+# --- references: exhaustive usage lookups ----------------------------------
+{"id": "refs-kmalloc", "category": "references", "tool": "find_references", "args": {"symbol": "kmalloc", "limit": 1}, "expect": {"min_results": 2000}}
+{"id": "refs-kfree", "category": "references", "tool": "find_references", "args": {"symbol": "kfree", "limit": 1}, "expect": {"min_results": 2000}}
+{"id": "refs-mutex_lock", "category": "references", "tool": "find_references", "args": {"symbol": "mutex_lock", "limit": 1}, "expect": {"min_results": 2000}}
+{"id": "refs-schedule", "category": "references", "tool": "find_references", "args": {"symbol": "schedule", "limit": 1}, "expect": {"min_results": 300}}
+{"id": "refs-task_struct", "category": "references", "tool": "find_references", "args": {"symbol": "task_struct", "limit": 1}, "expect": {"min_results": 2000}}
+{"id": "refs-ext4_mark_inode_dirty", "category": "references", "tool": "find_references", "args": {"symbol": "ext4_mark_inode_dirty", "limit": 1}, "expect": {"min_results": 50}}
+{"id": "refs-vfs_read", "category": "references", "tool": "find_references", "args": {"symbol": "vfs_read"}, "expect": {"min_results": 3, "paths": ["fs/read_write.c"]}}
+{"id": "refs-rw_verify_area", "category": "references", "tool": "find_references", "args": {"symbol": "rw_verify_area"}, "expect": {"min_results": 5, "paths": ["fs/read_write.c"]}}
+#
+# --- callers: reference sites mapped to their enclosing function -----------
+{"id": "callers-rw_verify_area", "category": "callers", "tool": "find_callers", "args": {"symbol": "rw_verify_area"}, "expect": {"callers": ["vfs_read", "vfs_write"]}}
+{"id": "callers-vfs_read", "category": "callers", "tool": "find_callers", "args": {"symbol": "vfs_read"}, "expect": {"callers": ["ksys_read"]}}
+{"id": "callers-ext4_mark_inode_dirty", "category": "callers", "tool": "find_callers", "args": {"symbol": "ext4_mark_inode_dirty", "limit": 200}, "expect": {"callers": ["ext4_dirty_inode"], "min_results": 30}}
+{"id": "callers-kernel_clone", "category": "callers", "tool": "find_callers", "args": {"symbol": "kernel_clone"}, "expect": {"callers": ["kernel_thread", "user_mode_thread"]}}
+{"id": "callers-do_dentry_open", "category": "callers", "tool": "find_callers", "args": {"symbol": "do_dentry_open"}, "expect": {"callers": ["vfs_open"]}}
+{"id": "callers-generic_file_open", "category": "callers", "tool": "find_callers", "args": {"symbol": "generic_file_open", "limit": 1}, "expect": {"min_results": 10}}
+#
+# --- guards: #ifdef awareness (the v0.9.0 headline) ------------------------
+{"id": "guards-kmap-variants", "category": "guards", "tool": "symbol_info", "args": {"symbol": "kmap"}, "expect": {"guard_variants_min": 2, "definition_count_min": 2}}
+{"id": "guards-kmap_atomic-variants", "category": "guards", "tool": "symbol_info", "args": {"symbol": "kmap_atomic"}, "expect": {"guard_variants_min": 2}}
+{"id": "guards-kmap-defs", "category": "guards", "tool": "find_definition", "args": {"symbol": "kmap"}, "expect": {"paths": ["include/linux/highmem-internal.h"], "min_results": 2}}
+{"id": "guards-kmap-config-filter", "category": "guards", "tool": "find_definition", "args": {"symbol": "kmap", "active_config": "CONFIG_HIGHMEM,CONFIG_SMP"}, "expect": {"paths": ["include/linux/highmem-internal.h"], "config_filtered_min": 1}}
+#
+# --- workflow: reachability and export facts --------------------------------
+{"id": "reach-ksys_read", "category": "workflow", "tool": "reachability", "args": {"from_symbol": "ksys_read", "to_symbol": "rw_verify_area"}, "expect": {"path_found": true}}
+{"id": "reach-openat-security", "category": "workflow", "tool": "reachability", "args": {"from_symbol": "do_sys_openat2", "to_symbol": "security_file_open"}, "expect": {"path_found": true}}
+{"id": "reach-fnptr-honesty", "category": "workflow", "tool": "reachability", "args": {"from_symbol": "vfs_read", "to_symbol": "ext4_file_read_iter", "max_depth": 4}, "expect": {"path_found": false}}
+{"id": "exported-kernel_read", "category": "workflow", "tool": "symbol_info", "args": {"symbol": "kernel_read"}, "expect": {"exported": "EXPORT_SYMBOL"}}
+{"id": "exported-mutex_lock", "category": "workflow", "tool": "symbol_info", "args": {"symbol": "mutex_lock"}, "expect": {"exported": "EXPORT_SYMBOL"}}

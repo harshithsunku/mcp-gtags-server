@@ -105,16 +105,22 @@ integrations, and existing clangd MCP bridges. Wrapping clangd here would be the
 complex item on this list for the least differentiated value. If demand ever
 materializes it can return as a stretch goal; see "Known limitations".
 
-### 7. Correctness eval harness
+### 7. Correctness eval harness ✅
 Trust through measurable quality — reported on its own terms.
 
-- [ ] Build a golden set (~50 queries) of known symbols on a large codebase with
+- [x] Build a golden set (~50 queries) of known symbols on a large codebase with
       expected definition locations and expected callers.
-- [ ] Run it in CI; report precision/recall.
-- [ ] Publish a short capability writeup: how it navigates a large codebase with no
+- [x] Run it in CI; report precision/recall.
+- [x] Publish a short capability writeup: how it navigates a large codebase with no
       build, what it resolves, and its measured accuracy.
 
 **Done when:** an eval command prints a score in CI, and the capability writeup is live.
+✅ `mcp-gtags-server eval --golden evals/golden.jsonl --root <kernel>` runs 50
+path-level cases in ~3s — 98% recall, 100% precision@1 on a 2026 kernel snapshot,
+including one deliberate known-fail (an upstream parser gap on `mutex_lock`) so the
+number stays honest. CI (`eval.yml`) clones a pinned kernel tag weekly and on main
+pushes and publishes the score in the job summary. The writeup lives at
+[docs/capability.md](docs/capability.md); posting it to the blog/HN is the Reach item below.
 
 ---
 

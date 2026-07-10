@@ -2189,12 +2189,13 @@ def main() -> None:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=["serve", "setup", "doctor", "config", "help"],
+        choices=["serve", "setup", "doctor", "config", "eval", "help"],
         default="serve",
         help="serve (default): run the MCP server; setup: install the "
         "gtags/ctags/Pygments toolchain into ~/.gtags-mcp without root; "
         "doctor: print what the server detects on this machine; "
-        "config: print MCP client configuration for this server.",
+        "config: print MCP client configuration for this server; "
+        "eval: run the golden-set correctness eval against --root.",
     )
     parser.add_argument(
         "--version",
@@ -2274,6 +2275,19 @@ def main() -> None:
         action="store_true",
         help="setup only: reinstall even when a toolchain is already present.",
     )
+    parser.add_argument(
+        "--golden",
+        default="evals/golden.jsonl",
+        help="eval only: path to the golden-set JSONL file "
+        "(default evals/golden.jsonl).",
+    )
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=0.9,
+        help="eval only: minimum overall pass rate for exit code 0 "
+        "(default 0.9).",
+    )
     args = parser.parse_args()
     _default_root = args.root
     _forced_label = args.label
@@ -2289,6 +2303,10 @@ def main() -> None:
         return
     if args.command == "setup":
         sys.exit(toolchain.run_setup(with_ctags=not args.no_ctags, force=args.force))
+    if args.command == "eval":
+        from . import evalharness
+
+        sys.exit(evalharness.run(args.golden, args.root, args.threshold))
     if args.command == "doctor":
         root, _ = _effective_root(args.root)
         print(f"mcp-gtags-server doctor (v{_package_version()})")

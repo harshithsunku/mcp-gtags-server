@@ -1,0 +1,60 @@
+name: Eval
+
+# Correctness eval against a pinned Linux kernel tag (see ROADMAP milestone 7).
+# Runs on main pushes, weekly, and on demand — not per-PR (it clones a kernel).
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+env:
+  # Pinned so the headline number is stable; the golden set itself is
+  # path-level and holds across nearby versions. Bump deliberately.
+  KERNEL_REF: v6.16
+
+jobs:
+  kernel-eval:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install GNU Global
+        run: sudo apt-get update && sudo apt-get install -y global exuberant-ctags python3-pygments
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+
+      - name: Cache kernel checkout and index
+        uses: actions/cache@v4
+        with:
+          path: linux
+          # v1: bump to invalidate when the index format or GNU Global changes.
+          key: kernel-eval-${{ env.KERNEL_REF }}-v1
+
+      - name: Clone kernel ${{ env.KERNEL_REF }} (cache miss only)
+        run: |
+          if [ ! -d linux ]; then
+            git clone --depth 1 --branch "$KERNEL_REF" \
+              https://github.com/torvalds/linux.git linux
+          fi
+
+      - name: Run golden-set eval
+        run: |
+          set -o pipefail
+          uv run mcp-gtags-server eval \
+            --golden evals/golden.jsonl --root "$PWD/linux" | tee eval.txt
+
+      - name: Publish score to job summary
+        if: always()
+        run: |
+          {
+            echo "### Kernel eval (${KERNEL_REF})"
+            echo '```'
+            cat eval.txt 2>/dev/null || echo "eval did not produce output"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

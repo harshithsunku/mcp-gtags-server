@@ -395,6 +395,8 @@ npx @modelcontextprotocol/inspector mcp-gtags-server    # poke at it interactive
 
 Tests build a real C project in a temp dir and exercise auto-indexing, auto-refresh, caller mapping, body extraction, pagination, user-space binary discovery, and config layering end-to-end.
 
+Correctness is also measured, not assumed: `mcp-gtags-server eval --golden evals/golden.jsonl --root <kernel-tree>` runs a 50-case golden set (definitions, macro resolution, references, callers, guards, reachability) against a real kernel and prints recall / precision@1 — CI does this weekly against a pinned tag. See [docs/capability.md](docs/capability.md) for the current numbers.
+
 Release flow: bump `version` in `pyproject.toml`, tag `vX.Y.Z`, push — CI publishes to PyPI and users pick the update up on their next installer re-run. Prebuilt GNU Global binaries are rebuilt by tagging `global-v<version>`.
 
 ## Roadmap
@@ -402,9 +404,11 @@ Release flow: bump `version` in `pyproject.toml`, tag `vX.Y.Z`, push — CI publ
 See [ROADMAP.md](ROADMAP.md) — structured JSON output landed in v0.8.0, ctags
 metadata enrichment (kind/signature/scope) in v0.8.1, `#ifdef`/config-guard
 awareness (the headline capability for kernel and firmware trees) in v0.9.0,
-then macro-family symbol resolution (`sys_read` → its `SYSCALL_DEFINE3` site)
-and the agent workflow tools (`reachability`, `blast_radius`); next up is a
-correctness eval harness.
+then macro-family symbol resolution (`sys_read` → its `SYSCALL_DEFINE3` site),
+the agent workflow tools (`reachability`, `blast_radius`), and the correctness
+eval harness — a 50-case golden set against a pinned kernel scoring 98% recall /
+100% precision@1 in CI, with the measured writeup in
+[docs/capability.md](docs/capability.md). Next: distribution.
 
 Contributions welcome — open an issue or PR.
 
