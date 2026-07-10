@@ -415,10 +415,11 @@ Release flow: bump `version` in `pyproject.toml`, tag `vX.Y.Z`, push — CI publ
 See [ROADMAP.md](ROADMAP.md) — structured JSON output landed in v0.8.0, ctags
 metadata enrichment (kind/signature/scope) in v0.8.1, `#ifdef`/config-guard
 awareness (the headline capability for kernel and firmware trees) in v0.9.0,
-then macro-family symbol resolution (`sys_read` → its `SYSCALL_DEFINE3` site),
-the agent workflow tools (`reachability`, `blast_radius`), and the correctness
-eval harness — a 50-case golden set against pinned kernel v6.16 scoring 100%
-recall / 100% precision@1 in CI, with the measured writeup in
+then, all shipped in v1.0.0: macro-family symbol resolution (`sys_read` → its
+`SYSCALL_DEFINE3` site), the agent workflow tools (`reachability`,
+`blast_radius`), automatic recovery from corrupted index databases, and the
+correctness eval harness — a 50-case golden set against pinned kernel v6.16
+scoring 100% recall / 100% precision@1 in CI, with the measured writeup in
 [docs/capability.md](docs/capability.md). Every technical milestone is done;
 what remains is distribution (MCP registry, directories, the writeup post).
 

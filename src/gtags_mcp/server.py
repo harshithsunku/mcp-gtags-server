@@ -138,6 +138,19 @@ def _db_dir(root: Path) -> Path:
     return root / INDEX_DIR_NAME
 
 
+# `global`'s stderr signature for a damaged database ("GTAGS seems corrupted.",
+# same wording for GRTAGS/GPATH). A partial index from an interrupted or failed
+# `gtags` run triggers it on every subsequent query, so it must never survive.
+_CORRUPT_SIGNATURE = "seems corrupted"
+_INDEX_FILES = ("GTAGS", "GRTAGS", "GSYMS", "GPATH")
+
+
+def _delete_index_files(db_dir: Path) -> None:
+    """Remove the index database files so the next query rebuilds from scratch."""
+    for name in _INDEX_FILES:
+        (db_dir / name).unlink(missing_ok=True)
+
+
 def _detect_root(start: Path) -> Path:
     """Walk up from start to the nearest directory holding an index or .git.
 
@@ -230,12 +243,18 @@ def _run_index(root: Path, incremental: bool) -> tuple[str, str, int]:
         if not gitignore.exists():
             gitignore.write_text("*\n")
         args.append(str(db_dir))
-    return _run(
+    stdout, stderr, code = _run(
         args,
         root,
         timeout=INDEX_TIMEOUT_SECONDS,
         input_text="".join(f"{f}\n" for f in files),
     )
+    # A failed full build must not leave a partial database behind: its GTAGS
+    # would pass the "index exists" check while every query fails with
+    # "seems corrupted". (A failed incremental keeps the old, still-valid index.)
+    if code != 0 and not incremental:
+        _delete_index_files(db_dir)
+    return stdout, stderr, code
 
 
 def _refresh_in_background(root: Path) -> None:
@@ -333,7 +352,7 @@ def _paginate(text: str, limit: int, offset: int) -> str:
 
 
 def _raw_global(
-    flags: list[str], project_root: str | None
+    flags: list[str], project_root: str | None, _retry: bool = True
 ) -> tuple[str | None, Path | None, str | None]:
     """Resolve root, ensure the index, run `global`. Returns (stdout, root, error)."""
     if err := _check_global_installed():
@@ -347,6 +366,23 @@ def _raw_global(
     # `global` exits non-zero both for real errors and for "no match found";
     # only the former writes to stderr.
     if code != 0 and stderr.strip():
+        # A corrupted database (interrupted build, older version's partial
+        # index) is recoverable: wipe it, rebuild from scratch, retry once.
+        if _retry and _CORRUPT_SIGNATURE in stderr:
+            _delete_index_files(_db_dir(root))
+            _, rebuild_err, rebuild_code = _run_index(root, incremental=False)
+            if rebuild_code != 0:
+                return None, root, (
+                    f"Error: index was corrupted and the automatic rebuild failed "
+                    f"(gtags exited {rebuild_code}): {rebuild_err.strip()}"
+                )
+            _last_update[root] = time.monotonic()
+            with _refresh_lock:  # surfaced via the envelope's warning field
+                _refresh_errors[root] = (
+                    "Warning: the index database was corrupted and has been "
+                    "rebuilt automatically."
+                )
+            return _raw_global(flags, project_root, _retry=False)
         return None, root, f"Error: global exited with code {code}: {stderr.strip()}"
     return stdout, root, None
 
@@ -2039,6 +2075,11 @@ def index_project(project_root: str | None = None, format: Format = "json") -> s
     root, err = _effective_root(project_root)
     if err:
         return _respond(err, error=True)
+    # From-scratch means from scratch: drop any existing (possibly corrupt)
+    # database first. Legacy root-level indexes are left for gtags to
+    # overwrite in place so their location doesn't silently move.
+    if (db_dir := _db_dir(root)) != root:
+        _delete_index_files(db_dir)
     stdout, stderr, code = _run_index(root, incremental=False)
     if code != 0:
         return _respond(
@@ -2325,7 +2366,17 @@ def main() -> None:
             db_dir = _db_dir(root)
             built = "" if (db_dir / "GTAGS").is_file() else "  (not built yet)"
             legacy = "  (legacy root-level index)" if db_dir == root else ""
-            print(f"  index location: {db_dir}{legacy}{built}")
+            corrupt = ""
+            if not built and not _check_global_installed():
+                # Cheap validity probe: querying a nonexistent symbol is a
+                # silent no-match on a healthy DB, but a corrupt one writes
+                # the "seems corrupted" signature to stderr.
+                _, probe_err, _ = _run(
+                    ["global", "-x", "__gtags_mcp_doctor_probe__"], cwd=root
+                )
+                if _CORRUPT_SIGNATURE in probe_err:
+                    corrupt = "  (CORRUPTED — will be rebuilt automatically on the next query)"
+            print(f"  index location: {db_dir}{legacy}{built}{corrupt}")
         return
     if args.command == "config":
         print(_client_config_text(args.transport, args.host, args.port))

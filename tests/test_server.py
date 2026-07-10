@@ -217,6 +217,45 @@ def test_background_refresh_error_surfaces(c_project, monkeypatch):
 
 
 @requires_global
+def test_failed_full_build_leaves_no_partial_index(c_project, monkeypatch):
+    """A failed first build must not strand a partial GTAGS that every later
+    query trips over ('seems corrupted') — the DB files are cleaned up and the
+    next query rebuilds from scratch."""
+    root = str(c_project)
+    real_run = server._run
+
+    def failing_full_build(args, cwd, timeout=server.QUERY_TIMEOUT_SECONDS, **kwargs):
+        if args[0] == "gtags" and "-i" not in args:
+            db_dir = c_project / server.INDEX_DIR_NAME
+            db_dir.mkdir(exist_ok=True)
+            (db_dir / "GTAGS").write_bytes(b"partial garbage")
+            return "", "simulated parser crash", 1
+        return real_run(args, cwd, timeout, **kwargs)
+
+    monkeypatch.setattr(server, "_run", failing_full_build)
+    result = server.find_definition("add_numbers", root)
+    assert "automatic indexing failed" in result
+    assert not (c_project / server.INDEX_DIR_NAME / "GTAGS").exists()
+
+    monkeypatch.setattr(server, "_run", real_run)
+    recovered = server.find_definition("add_numbers", root)
+    assert "util.c" in recovered
+
+
+@requires_global
+def test_corrupted_index_auto_recovers(c_project):
+    """A corrupt database (interrupted build, crashed process) is wiped,
+    rebuilt, and the query retried — with a warning in the envelope."""
+    root = str(c_project)
+    assert "util.c" in server.find_definition("add_numbers", root)  # healthy build
+    (c_project / server.INDEX_DIR_NAME / "GTAGS").write_bytes(b"\x00garbage" * 64)
+
+    result = server.find_definition("add_numbers", root)
+    assert "util.c" in result
+    assert "rebuilt automatically" in result
+
+
+@requires_global
 def test_explicit_index_and_update_tools(c_project):
     root = str(c_project)
     assert "Indexed" in server.index_project(root)
