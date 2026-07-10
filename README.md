@@ -330,6 +330,7 @@ agent question ──► MCP tool ──► GTAGS index (built once, ~66s for th
 ```
 
 - **First query on a tree?** The index is built automatically (the only operation that ever blocks — and only once).
+- **Where do the index files go?** Into a single `.gtags-mcp/` folder at the project root — never loose files next to your code. The folder ships its own `.gitignore`, so `git status` stays clean without touching yours. A pre-existing root-level `GTAGS` (from older versions, or your own gtags runs) keeps being used as-is. `mcp-gtags-server doctor` shows the location.
 - **Files changed?** A debounced incremental refresh runs **in the background**: queries always answer instantly from the current index while `gtags -i` catches up behind the scenes. Measured on the kernel: queries return in 0.02s while the 25s freshness check runs invisibly. Staleness is bounded by the debounce window; call `update_index` for a synchronous, guaranteed-fresh barrier right after edits.
 - **Huge result?** Pagination footers tell the agent exactly how to fetch the next page — or the tool itself suggests a narrower one (`find_callers` on a symbol used in 500+ files points to `summarize_references`).
 
@@ -343,6 +344,9 @@ C, C++, Yacc, Java, PHP, and assembly natively — plus Python, Go, Rust, JS/TS,
 
 **Does the agent have to manage the index?**
 No. That's the point. Build-on-first-query, background refresh with adaptive debounce, zero blocking — queries never wait for index maintenance. The explicit `index_project`/`update_index` tools exist only as escape hatches (`update_index` doubles as a synchronous freshness barrier after edits).
+
+**Where does the index live? Can I delete it?**
+In `.gtags-mcp/` at the project root (self-gitignored). Delete it freely any time — the next query rebuilds it from scratch.
 
 **Will it fight my agent's built-in tools?**
 The tool descriptions are written to steer the model: they say *when* to use indexed lookups instead of grep. In practice agents pick the faster, narrower tool naturally.

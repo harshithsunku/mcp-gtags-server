@@ -122,15 +122,32 @@ def _check_global_installed() -> str | None:
     return None
 
 
+# Index files (GTAGS/GRTAGS/GPATH) live in this folder inside the project
+# root, so they never clutter the user's tree. A pre-existing root-level
+# GTAGS (older versions, or the user's own gtags run) is respected as-is.
+INDEX_DIR_NAME = ".gtags-mcp"
+
+
+def _db_dir(root: Path) -> Path:
+    """Where root's index database lives: legacy root-level wins, else .gtags-mcp/."""
+    if (root / "GTAGS").is_file():
+        return root
+    return root / INDEX_DIR_NAME
+
+
 def _detect_root(start: Path) -> Path:
-    """Walk up from start to the nearest directory holding GTAGS or .git.
+    """Walk up from start to the nearest directory holding an index or .git.
 
     Monorepo/subdirectory support: a server launched (or queried) from deep
     inside a tree still indexes and reports paths from the project root.
     Falls back to start itself when no marker is found.
     """
     for candidate in (start, *start.parents):
-        if (candidate / "GTAGS").is_file() or (candidate / ".git").exists():
+        if (
+            (candidate / "GTAGS").is_file()
+            or (candidate / INDEX_DIR_NAME / "GTAGS").is_file()
+            or (candidate / ".git").exists()
+        ):
             return candidate
     return start
 
@@ -167,6 +184,11 @@ def _run(
     label = _gtags_label(cwd)
     if label:
         env["GTAGSLABEL"] = label
+    if args[0] == "global" and (db_dir := _db_dir(cwd)) != cwd:
+        # The index lives in .gtags-mcp/, not the root global searches by
+        # default; the env pair points queries at it (paths stay root-relative).
+        env["GTAGSROOT"] = str(cwd)
+        env["GTAGSDBPATH"] = str(db_dir)
     proc = subprocess.run(
         [exe, *args[1:]],
         cwd=cwd,
@@ -195,7 +217,16 @@ def _run_index(root: Path, incremental: bool) -> tuple[str, str, int]:
             "respect_gitignore", root, default=True
         ),
     )
+    db_dir = _db_dir(root)
     args = ["gtags"] + (["-i"] if incremental else []) + ["--skip-unreadable", "-f", "-"]
+    if db_dir != root:
+        db_dir.mkdir(exist_ok=True)
+        # Self-ignoring dir (cargo-style): git never sees the index files and
+        # the user's .gitignore stays untouched.
+        gitignore = db_dir / ".gitignore"
+        if not gitignore.exists():
+            gitignore.write_text("*\n")
+        args.append(str(db_dir))
     return _run(
         args,
         root,
@@ -243,7 +274,7 @@ def _ensure_index(root: Path) -> str | None:
     Returns an error string only for fatal conditions (failed full build);
     a failed *background* refresh is surfaced as a warning on the next query.
     """
-    if not (root / "GTAGS").is_file():
+    if not (_db_dir(root) / "GTAGS").is_file():
         stdout, stderr, code = _run_index(root, incremental=False)
         if code != 0:
             return (
@@ -1611,13 +1642,15 @@ def index_project(project_root: str | None = None, format: Format = "json") -> s
             error=True,
         )
     _last_update[root] = time.monotonic()
+    db_dir = _db_dir(root)
+    where = str(db_dir) if db_dir != root else f"{root} (legacy root-level index)"
     label = _gtags_label(root)
     if label:
         return _respond(
-            f"Indexed {root} (GTAGS, GRTAGS, GPATH created) "
+            f"Indexed {root} (database in {where}) "
             f"using parser label '{label}' (multi-language)."
         )
-    message = f"Indexed {root} (GTAGS, GRTAGS, GPATH created) using the native parser."
+    message = f"Indexed {root} (database in {where}) using the native parser."
     non_native = set()
     try:
         from itertools import islice
@@ -1665,9 +1698,9 @@ def update_index(project_root: str | None = None, format: Format = "json") -> st
     root, err = _effective_root(project_root)
     if err:
         return _respond(err, error=True)
-    if not (root / "GTAGS").is_file():
+    if not (_db_dir(root) / "GTAGS").is_file():
         return _respond(
-            f"Error: no GTAGS index found in {root}. Run index_project first.",
+            f"Error: no GTAGS index found for {root}. Run index_project first.",
             error=True,
         )
     _wait_for_refresh(root)  # don't race an in-flight background refresh
@@ -1856,6 +1889,11 @@ def main() -> None:
             )
         guard_state = "active (built-in)" if _guards_enabled(root) else "disabled"
         print(f"  guard scanning: {guard_state}")
+        if root:
+            db_dir = _db_dir(root)
+            built = "" if (db_dir / "GTAGS").is_file() else "  (not built yet)"
+            legacy = "  (legacy root-level index)" if db_dir == root else ""
+            print(f"  index location: {db_dir}{legacy}{built}")
         return
     if args.command == "config":
         print(_client_config_text(args.transport, args.host, args.port))

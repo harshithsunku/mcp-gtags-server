@@ -89,13 +89,18 @@ def c_project(tmp_path):
 
 @requires_global
 def test_auto_index_on_first_query(c_project):
-    """Queries build the index themselves — no index_project call needed."""
+    """Queries build the index themselves — into .gtags-mcp/, not the root."""
     root = str(c_project)
-    assert not (c_project / "GTAGS").exists()
+    assert not (c_project / server.INDEX_DIR_NAME).exists()
 
     definition = server.find_definition("add_numbers", root)
     assert "util.c" in definition
-    assert (c_project / "GTAGS").is_file()
+    db_dir = c_project / server.INDEX_DIR_NAME
+    assert (db_dir / "GTAGS").is_file()
+    # The project root itself stays clean, and the index dir self-gitignores.
+    for name in ("GTAGS", "GRTAGS", "GPATH"):
+        assert not (c_project / name).exists()
+    assert (db_dir / ".gitignore").read_text() == "*\n"
 
 
 @requires_global
@@ -981,3 +986,72 @@ def test_guards_track_file_edits(guarded_c_project):
         (r["path"], r["line"]): r["guard"] for r in _defs("foo_mode", root)["results"]
     }
     assert after[("feature.c", 9)] == ["CONFIG_NEW_NAME"]
+
+
+# ---------------------------------------------------------------------------
+# Index database location: .gtags-mcp/ inside the root (legacy GTAGS honored)
+# ---------------------------------------------------------------------------
+
+
+@requires_global
+def test_legacy_root_index_respected(c_project):
+    """A pre-existing root-level GTAGS keeps being used — no .gtags-mcp dir."""
+    root = str(c_project)
+    # Build an old-style root-level index the way pre-0.9.1 versions did.
+    files = "util.h\nutil.c\nmain.c\n"
+    _, stderr, code = server._run(
+        ["gtags", "--skip-unreadable", "-f", "-"], c_project, input_text=files
+    )
+    assert code == 0, stderr
+    assert (c_project / "GTAGS").is_file()
+
+    result = json.loads(server.find_definition("add_numbers", root))
+    assert result["results"][0]["path"] == "util.c"
+    assert not (c_project / server.INDEX_DIR_NAME).exists()
+
+    # Incremental refresh also stays root-level for legacy indexes.
+    (c_project / "extra.c").write_text("int extra_fn(void) { return 1; }\n")
+    server.update_index(root)
+    assert "extra.c" in server.find_definition("extra_fn", root)
+    assert not (c_project / server.INDEX_DIR_NAME).exists()
+
+
+@requires_global
+def test_index_dir_never_indexed(c_project):
+    """The .gtags-mcp database itself must not appear in any results."""
+    root = str(c_project)
+    server.find_definition("add_numbers", root)  # builds .gtags-mcp/
+    server.index_project(root)  # full rebuild with the dir already present
+
+    files = json.loads(server.find_files(".", root, limit=500))["results"]
+    assert files and not any(server.INDEX_DIR_NAME in f["path"] for f in files)
+
+
+@requires_global
+def test_index_dir_never_indexed_in_git_repo(git_project):
+    root = str(git_project)
+    server.find_definition("add_numbers", root)
+    server.index_project(root)
+    files = json.loads(server.find_files(".", root, limit=500))["results"]
+    assert files and not any(server.INDEX_DIR_NAME in f["path"] for f in files)
+    # git must not see the index either (self-gitignoring directory).
+    status = subprocess.run(
+        ["git", "-C", root, "status", "--porcelain"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert server.INDEX_DIR_NAME not in status
+
+
+@requires_global
+def test_root_autodetected_via_index_dir(c_project, monkeypatch):
+    """A previously indexed non-git root is found from a subdirectory."""
+    root = str(c_project)
+    server.find_definition("add_numbers", root)  # creates .gtags-mcp/GTAGS
+    assert not (c_project / ".git").exists()
+    subdir = c_project / "sub" / "deeper"
+    subdir.mkdir(parents=True)
+    monkeypatch.chdir(subdir)
+    result = json.loads(server.find_definition("add_numbers"))
+    assert result["root"] == str(c_project.resolve())

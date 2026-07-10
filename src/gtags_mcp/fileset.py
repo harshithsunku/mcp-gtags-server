@@ -25,10 +25,11 @@ from pathlib import Path
 GIT_TIMEOUT_SECONDS = 60
 
 # Directory names never worth indexing when walking a non-git tree.
+# .gtags-mcp is our own index directory (server.INDEX_DIR_NAME).
 DEFAULT_SKIP_DIRS = frozenset(
     ".git .hg .svn CVS node_modules dist out target "
     ".venv venv __pycache__ .tox .mypy_cache .pytest_cache .cache "
-    ".idea .vscode".split()
+    ".idea .vscode .gtags-mcp".split()
 )
 
 
