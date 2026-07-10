@@ -29,6 +29,7 @@ from . import config as config_module
 from . import enrich
 from . import fileset
 from . import guards
+from . import macros
 from . import output
 from . import toolchain
 
@@ -85,6 +86,8 @@ _bin_dir: str | None = None
 _no_enrich = False
 # #ifdef guard scanning disabled by --no-guards.
 _no_guards = False
+# Macro-family symbol resolution disabled by --no-macro-resolve.
+_no_macro_resolve = False
 
 # File extensions GNU Global's built-in parser understands.
 _NATIVE_EXTENSIONS = frozenset(
@@ -361,6 +364,7 @@ def _query_global(
     enrich_records: bool = False,  # ctags metadata on definition-shaped results
     guard_records: bool = False,  # #ifdef guard stacks on cxref results
     active_config: str | None = None,  # .config / macro list to filter guards by
+    macro_symbol: str | None = None,  # macro-family fallback for this symbol
 ) -> str:
     """Shared plumbing for all read-only `global` queries."""
     stdout, root, err = _raw_global(flags, project_root)
@@ -370,6 +374,13 @@ def _query_global(
     if format == "text":
         suffix = f"\n\n{warning}" if warning else ""
         if not stdout.strip():
+            if macro_symbol:
+                hits, via = _macro_resolve(macro_symbol, project_root, root, True)
+                if hits:
+                    text = "\n".join(
+                        f"{s:<16} {lineno:>4} {path} {src}" for s, lineno, path, src in hits
+                    )
+                    return _paginate(text, limit, offset) + f"\n(resolved via {via})" + suffix
             return empty_message + suffix
         return _paginate(stdout.rstrip(), limit, offset) + suffix
     if parse == "cxref":
@@ -387,6 +398,18 @@ def _query_global(
             if (p := line.strip())
         ]
     extra: dict = {}
+    if macro_symbol and parse == "cxref":
+        hits, via = _macro_resolve(macro_symbol, project_root, root, not items)
+        if hits:
+            known = {(rec["path"], rec["line"]) for rec in items}
+            resolved = [output.record(s, path, lineno, src) for s, lineno, path, src in hits]
+            # Generator sites come FIRST: for a macro-generated name they are
+            # the real answer; same-named textual matches (test helpers,
+            # tools/) are shadows.
+            items = [
+                rec for rec in resolved if (rec["path"], rec["line"]) not in known
+            ] + items
+            extra["resolved_via"] = via
     if active_config and parse == "cxref":
         # Explicit intent must not fail silently: bad specs and disabled
         # guard scanning are errors, not quietly-unfiltered results.
@@ -449,6 +472,35 @@ def _guards_enabled(root: Path | None) -> bool:
     if env := os.environ.get("GTAGS_MCP_GUARDS"):
         return env.strip().lower() not in ("0", "false", "no", "off")
     return config_module.get_bool_setting("guards", root, default=True)
+
+
+def _macro_resolve_enabled(root: Path | None) -> bool:
+    """Macro-family resolution: --no-macro-resolve > GTAGS_MCP_MACRO_RESOLVE
+    > config > on."""
+    if _no_macro_resolve:
+        return False
+    if env := os.environ.get("GTAGS_MCP_MACRO_RESOLVE"):
+        return env.strip().lower() not in ("0", "false", "no", "off")
+    return config_module.get_bool_setting("macro_resolve", root, default=True)
+
+
+def _cxrefs(flags: list[str], project_root: str | None) -> list[macros.Cxref]:
+    """Run one `global` query and return parsed cxref tuples ([] on error)."""
+    stdout, _, err = _raw_global(flags, project_root)
+    if err or not stdout:
+        return []
+    return [r for line in stdout.splitlines() if (r := _parse_cxref(line))]
+
+
+def _macro_resolve(
+    symbol: str, project_root: str | None, root: Path | None, direct_empty: bool
+) -> tuple[list[macros.Cxref], str | None]:
+    """Macro-family fallback for a definition lookup (see gtags_mcp.macros)."""
+    if not _macro_resolve_enabled(root):
+        return [], None
+    return macros.resolve(
+        symbol, lambda flags: _cxrefs(flags, project_root), direct_empty=direct_empty
+    )
 
 
 def _maybe_guard(
@@ -648,6 +700,11 @@ def find_definition(
     millions of lines. The index is built and refreshed automatically.
     Multiply-defined symbols (kernel/firmware `#ifdef` alternates) come back
     with each definition's guard stack, so you can tell which one applies.
+    Macro-generated symbols resolve too: querying "sys_read",
+    "trace_sched_switch", or a DEFINE_SPINLOCK/DEFINE_PER_CPU/module_param
+    name returns the generator invocation site (SYSCALL_DEFINE3(read, ...)),
+    flagged by a "resolved_via" field in the envelope — no preprocessor or
+    build needed.
 
     Args:
         symbol: Exact symbol name, e.g. "tcp_v4_rcv" or "list_head".
@@ -681,6 +738,7 @@ def find_definition(
         enrich_records=True,
         guard_records=True,
         active_config=active_config,
+        macro_symbol=symbol,
     )
 
 
@@ -1158,13 +1216,17 @@ def symbol_info(
     guard_variants > 1 tells you the flat list is really a config choice),
     how widely it's used, which files use it most, and which tool to reach
     for next. Cheaper than any combination of grep and file reads.
+    Macro-generated symbols (sys_*, trace_*, DEFINE_SPINLOCK/DEFINE_PER_CPU
+    names) resolve to their generator invocation site, flagged by
+    resolved_via; kernel symbols report their EXPORT_SYMBOL* variant in
+    "exported".
 
     Args:
         symbol: Exact symbol name.
         project_root: Project directory. Omit to use the server's default.
         format: "json" (default) for {definitions, definition_count,
-            guard_variants, reference_count, file_count, top_files};
-            "text" for the overview card.
+            guard_variants, resolved_via, exported, reference_count,
+            file_count, top_files}; "text" for the overview card.
         active_config: Kernel .config path or comma-separated macro list
             (e.g. "CONFIG_SMP,!CONFIG_DEBUG"); definitions whose guard stack
             is definitely false under it are dropped and reported as
@@ -1175,12 +1237,18 @@ def symbol_info(
         return output.error("symbol_info", err, root) if format == "json" else err
     defs = [r for line in defs_out.splitlines() if (r := _parse_cxref(line))]
 
+    resolved, resolved_via = _macro_resolve(symbol, project_root, root, not defs)
+    if resolved:
+        known = {(path, lineno) for _, lineno, path, _ in defs}
+        defs = [h for h in resolved if (h[2], h[1]) not in known] + defs
+
     refs_out, _, rerr = _raw_global(["-rx", "--", symbol], project_root)
     refs = (
         [r for line in refs_out.splitlines() if (r := _parse_cxref(line))]
         if refs_out and not rerr
         else []
     )
+    exported = macros.exported_via(symbol, (src for _, _, _, src in refs))
     counts: dict[str, int] = {}
     for _, _, path, _ in refs:
         counts[path] = counts.get(path, 0) + 1
@@ -1236,6 +1304,8 @@ def symbol_info(
             "definitions": def_records,
             "definition_count": live_defs,
             "guard_variants": guard_variants,
+            "resolved_via": resolved_via,
+            "exported": exported,
             "reference_count": len(refs),
             "file_count": len(counts),
             "top_files": [{"path": path, "count": count} for path, count in top],
@@ -1251,6 +1321,10 @@ def symbol_info(
         )
 
     lines = [f"Symbol: {symbol}"]
+    if resolved_via:
+        lines.append(f"  macro-generated symbol (resolved via {resolved_via})")
+    if exported:
+        lines.append(f"  exported via {exported}")
     if def_records:
         if guard_variants is not None and guard_variants > 1:
             lines.append(
@@ -1772,6 +1846,7 @@ def _client_config_text(transport: str, host: str, port: int) -> str:
 def main() -> None:
     """Entry point: serve MCP over stdio/HTTP, or run a maintenance subcommand."""
     global _default_root, _forced_label, _bin_dir, _no_enrich, _no_guards
+    global _no_macro_resolve
     parser = argparse.ArgumentParser(
         prog="mcp-gtags-server",
         description=(
@@ -1851,6 +1926,14 @@ def main() -> None:
         "GTAGS_MCP_GUARDS=0, or `guards = false` in .gtags-mcp.toml).",
     )
     parser.add_argument(
+        "--no-macro-resolve",
+        action="store_true",
+        help="Disable macro-family symbol resolution — macro-generated "
+        "symbols (sys_*, trace_*, DEFINE_* names) no longer fall back to "
+        "their generator invocation site (also: GTAGS_MCP_MACRO_RESOLVE=0, "
+        "or `macro_resolve = false` in .gtags-mcp.toml).",
+    )
+    parser.add_argument(
         "--no-ctags",
         action="store_true",
         help="setup only: skip installing universal-ctags and Pygments "
@@ -1867,6 +1950,7 @@ def main() -> None:
     _bin_dir = args.bin_dir
     _no_enrich = args.no_enrich
     _no_guards = args.no_guards
+    _no_macro_resolve = args.no_macro_resolve
     if args.bin_dir:
         os.environ["GTAGS_MCP_BIN_DIR"] = args.bin_dir
 

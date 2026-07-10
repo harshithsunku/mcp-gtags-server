@@ -69,16 +69,19 @@ nothing else surfaces it. Worth spending real time here.
 **Done when:** a multiply-defined symbol returns each definition tagged with its guard
 stack, and passing a config narrows the result to the live definition.
 
-### 4. Macro-family symbol resolution
+### 4. Macro-family symbol resolution ✅
 Closes the best-known gtags gap on the kernel without a preprocessor.
 
-- [ ] Hardcode name-transform rules for the dominant macro families
+- [x] Hardcode name-transform rules for the dominant macro families
       (`SYSCALL_DEFINE*`, `EXPORT_SYMBOL*`, `DEFINE_PER_CPU`, `module_param`,
       `DECLARE_*` / `DEFINE_*`, tracepoints).
-- [ ] Add a "fuzzy resolve" fallback that tries derived spellings before returning empty.
+- [x] Add a "fuzzy resolve" fallback that tries derived spellings before returning empty.
 
 **Done when:** querying a macro-generated symbol (e.g. a `SYSCALL_DEFINE` entry point)
-resolves to its definition site.
+resolves to its definition site. ✅ `find_definition("sys_read")` returns
+`fs/read_write.c SYSCALL_DEFINE3(read, ...)` with `resolved_via: "macro:SYSCALL_DEFINE"`,
+ranked ahead of same-named test helpers; `symbol_info` also reports `EXPORT_SYMBOL*`
+status in an `exported` field.
 
 ### 5. Agent workflow tools
 Fewer round-trips, higher-value calls — built on the existing call-graph data.
@@ -89,15 +92,13 @@ Fewer round-trips, higher-value calls — built on the existing call-graph data.
 
 **Done when:** both return bounded, ranked results tied to real git state.
 
-### 6. Optional LSP escalation
-Spans no-build and full-build without losing the no-build appeal.
-
-- [ ] Detect `compile_commands.json`; when present, offer a semantically-exact tier
-      (precise references, types, callback/ops-struct resolution).
-- [ ] Fall back to gtags automatically when no compile database exists. Keep it opt-in.
-
-**Done when:** the same query returns precise results where a compile DB exists and
-gtags results where it doesn't.
+### ~~6. Optional LSP escalation~~ — dropped
+Rejected 2026-07: it contradicts the project's identity. The design principles say
+"no build required" and the non-goals say "not a replacement for a full language
+server" — a user who has a working `compile_commands.json` already has clangd, IDE
+integrations, and existing clangd MCP bridges. Wrapping clangd here would be the most
+complex item on this list for the least differentiated value. If demand ever
+materializes it can return as a stretch goal; see "Known limitations".
 
 ### 7. Correctness eval harness
 Trust through measurable quality — reported on its own terms.
@@ -117,7 +118,10 @@ Trust through measurable quality — reported on its own terms.
 - Static tagging can't resolve function pointers / ops-struct indirection
   (e.g. `->read()` through a `file_operations`). Documented; a candidate-target
   heuristic is a future stretch goal.
-- C++ templates/overloads are weaker than C. Enrichment in step 2 helps; step 6 closes it.
+- C++ templates/overloads are weaker than C. Enrichment in step 2 helps.
+- Semantically-exact resolution (types, overloads, callback targets) needs a real
+  compiler frontend. Deliberately out of scope (see dropped step 6): when a compile
+  database exists, clangd and its ecosystem already serve that user.
 
 ---
 

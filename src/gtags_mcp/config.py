@@ -22,6 +22,7 @@ Recognised keys (all optional)::
     respect_gitignore = true        # use `git ls-files` to honour .gitignore
     enrich = true                   # ctags kind/signature/scope on results
     guards = true                   # #ifdef guard stacks on results
+    macro_resolve = true            # resolve macro-generated symbols (sys_*, ...)
 """
 
 from __future__ import annotations
@@ -38,7 +39,16 @@ else:  # pragma: no cover - exercised only on Python 3.10
 PROJECT_CONFIG_NAME = ".gtags-mcp.toml"
 
 _VALID_KEYS = frozenset(
-    {"root", "label", "bin_dir", "skip_globs", "respect_gitignore", "enrich", "guards"}
+    {
+        "root",
+        "label",
+        "bin_dir",
+        "skip_globs",
+        "respect_gitignore",
+        "enrich",
+        "guards",
+        "macro_resolve",
+    }
 )
 
 # Caches: project configs keyed by directory, user config loaded once.

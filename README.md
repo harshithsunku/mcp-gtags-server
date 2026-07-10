@@ -164,6 +164,7 @@ skip_globs = ["*.gen.c"]      # never index paths/basenames matching these globs
 respect_gitignore = true      # default: index only what `git ls-files` reports
 enrich = true                 # default: ctags kind/signature/scope on results
 guards = true                 # default: #ifdef guard stacks on results
+macro_resolve = true          # default: resolve macro-generated symbols (sys_*, ...)
 # root = "/abs/path"          # default project root (user config)
 ```
 
@@ -272,6 +273,36 @@ explicit conditions (`!CONFIG_X86_64 && CONFIG_X86_32`), comments on
 directives are ignored (they lie), and broken/partial files never fail a
 query. Disable with `--no-guards`, `GTAGS_MCP_GUARDS=0`, or `guards = false`
 in `.gtags-mcp.toml`.
+
+### Macro-generated symbols resolve too (`sys_read` → `SYSCALL_DEFINE3`)
+
+The best-known gap of every tagging tool on the kernel: `sys_read`,
+`trace_sched_switch`, and `css_set_lock` have **no literal definition
+anywhere** — they are minted by token-pasting macros, and a plain lookup
+comes back empty (or worse, returns a same-named test helper). This server
+resolves them from the index alone, no preprocessor and no build:
+
+```text
+find_definition("sys_read")        → fs/read_write.c:723  SYSCALL_DEFINE3(read, ...)   resolved_via: "macro:SYSCALL_DEFINE"
+find_definition("__x64_sys_openat")→ fs/open.c:1385       SYSCALL_DEFINE4(openat, ...) (arch entry-point wrappers map back)
+find_definition("trace_sched_switch") → include/trace/events/sched.h:220  TRACE_EVENT(sched_switch, ...)
+find_definition("css_set_lock")    → kernel/cgroup/cgroup.c:82  DEFINE_SPINLOCK(css_set_lock);
+```
+
+Covered families: `SYSCALL_DEFINE0..6` / `COMPAT_SYSCALL_DEFINE*` (incl.
+`__x64_`/`__ia32_`/`__arm64_`/`__se_`/`__do_` wrapper spellings), tracepoints
+(`TRACE_EVENT`, `DEFINE_EVENT`, `DECLARE_TRACE`, ...), and the bare-name
+definers (`DEFINE_SPINLOCK`, `DEFINE_MUTEX`, `DEFINE_PER_CPU*`,
+`DECLARE_BITMAP`, `module_param*`, any `DEFINE_`/`DECLARE_`-shaped macro) —
+plus a last-resort fuzzy tier that tries underscore-variant spellings.
+Resolved results are flagged with `resolved_via` in the envelope and ranked
+ahead of same-named textual shadows; `DEFINE_*` sites rank above their
+`DECLARE_*` counterparts. `symbol_info` additionally reports the
+`EXPORT_SYMBOL` / `EXPORT_SYMBOL_GPL` variant a kernel symbol is exported
+with, in an `exported` field. Costs nothing when a symbol resolves normally
+(only family-shaped names like `sys_*`/`trace_*` get the extra indexed
+lookups); disable with `--no-macro-resolve`, `GTAGS_MCP_MACRO_RESOLVE=0`, or
+`macro_resolve = false`.
 - `next_tools` tells the agent the highest-value follow-up call for what was (or wasn't) found.
 - `total`/`offset`/`truncated` replace the text continuation footer; errors keep the envelope with an `error` field.
 - Composite tools return tool-shaped `results` (e.g. `call_hierarchy` a nested caller tree, `find_callees` `{in_tree, external}`, `symbol_info` an overview object) inside the same envelope.
@@ -367,10 +398,11 @@ Release flow: bump `version` in `pyproject.toml`, tag `vX.Y.Z`, push — CI publ
 ## Roadmap
 
 See [ROADMAP.md](ROADMAP.md) — structured JSON output landed in v0.8.0, ctags
-metadata enrichment (kind/signature/scope) in v0.8.1, and `#ifdef`/config-guard
-awareness (the headline capability for kernel and firmware trees) in v0.9.0;
-next up are macro-family symbol resolution, agent workflow tools
-(`reachability`, `blast_radius`), and a correctness eval harness.
+metadata enrichment (kind/signature/scope) in v0.8.1, `#ifdef`/config-guard
+awareness (the headline capability for kernel and firmware trees) in v0.9.0,
+and macro-family symbol resolution (`sys_read` → its `SYSCALL_DEFINE3` site)
+after that; next up are agent workflow tools (`reachability`,
+`blast_radius`) and a correctness eval harness.
 
 Contributions welcome — open an issue or PR.
 

@@ -26,6 +26,11 @@ means guard scanning was disabled or the file could not be read. Keys are
 only ever *added*, never renamed or removed, so agent-side parsers keep
 working. Paths are repo-relative. Errors replace ``results`` with an
 ``error`` string but keep the envelope and ``next_tools``.
+
+Definition-shaped envelopes gain a ``resolved_via`` field (e.g.
+``"macro:SYSCALL_DEFINE"``, ``"fuzzy:vfs_read"``) when some results were
+found through macro-family resolution rather than a literal index match —
+see :mod:`gtags_mcp.macros`.
 """
 
 from __future__ import annotations
