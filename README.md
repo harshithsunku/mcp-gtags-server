@@ -376,12 +376,50 @@ Force a specific parser label with `--label`, `GTAGS_MCP_LABEL`, or `label` in `
 
 ## How it works
 
-```text
-agent question ──► MCP tool ──► GTAGS index (built once, ~66s for the kernel;
-                                    │        .gitignore-aware file list)
-                 background auto-refresh (gtags -i, adaptive debounce)
-                                    │
-                       narrow JSON answer ──► agent context
+### Architecture
+
+One long-lived server process per IDE window (stdio) — or one shared HTTP server for the whole machine. Everything heavy lives on disk and is shared: the toolchain installs itself once per machine, the index builds itself once per repo.
+
+```mermaid
+flowchart LR
+    subgraph clients["MCP clients"]
+        CC["Claude Code / Cursor / VS Code"]
+        CD["Claude Desktop (.mcpb)"]
+    end
+
+    subgraph proc["mcp-gtags-server — spawned once per window, lives for the session"]
+        T["20 navigation tools"]
+        RR["root resolution<br/>project_root → env → config → client roots → cwd"]
+    end
+
+    subgraph disk["your machine, user space (no sudo)"]
+        TC["~/.gtags-mcp<br/>global · gtags · ctags · Pygments<br/>self-installs on first use"]
+        IX["&lt;repo&gt;/.gtags-mcp/GTAGS<br/>one index per repo, auto-built"]
+    end
+
+    CC -- "stdio (uvx)" --> T
+    CD -- "stdio" --> T
+    T --> RR
+    RR -- "runs global (ms, indexed)" --> TC
+    TC -- "B-tree lookup" --> IX
+```
+
+### A tool call, end to end
+
+The binary is **not** re-executed per call — the server process stays alive; each call is one JSON-RPC message plus one millisecond-scale `global` subprocess:
+
+```mermaid
+sequenceDiagram
+    participant A as Agent
+    participant S as server (long-lived process)
+    participant G as global (GTAGS index)
+
+    A->>S: find_definition("tcp_v4_rcv")
+    Note over S: first call on this machine?<br/>toolchain installs itself in the background,<br/>calls answer "installing — retry shortly"
+    Note over S: first query in this repo?<br/>index auto-builds once (~66 s for the kernel)
+    S->>G: global -dx tcp_v4_rcv
+    G-->>S: net/ipv4/tcp_ipv4.c:2067 (milliseconds)
+    S-->>A: narrow JSON answer — no grep firehose
 ```
 
 - **First query on a tree?** The index is built automatically (the only operation that ever blocks — and only once).
