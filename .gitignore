@@ -18,3 +18,8 @@ GSYMS
 .idea/
 .vscode/
 *.swp
+
+# agent A/B eval: results stay local (unpublished); the harness itself is committed
+evals/agent/results/
+# local bring-up notes
+docs/bringup-hurdles.md

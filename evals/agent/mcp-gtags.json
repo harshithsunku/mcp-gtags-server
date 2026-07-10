@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "gtags": {
+      "command": "uv",
+      "args": ["--directory", "/home/ai/mcp-gtags-server", "run", "mcp-gtags-server", "--root", "/home/ai/linux"]
+    }
+  }
+}
