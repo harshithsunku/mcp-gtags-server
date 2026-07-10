@@ -7,7 +7,7 @@ import textwrap
 
 import pytest
 
-from gtags_mcp import config, enrich, server, toolchain
+from gtags_mcp import config, enrich, guards, server, toolchain
 
 requires_global = pytest.mark.skipif(
     toolchain.find_global() is None or toolchain.find_gtags() is None,
@@ -37,10 +37,12 @@ def fresh_update_cache():
     _drain_refresh_state()
     config.reset_cache()
     enrich.reset_cache()
+    guards.reset_cache()
     yield
     _drain_refresh_state()
     config.reset_cache()
     enrich.reset_cache()
+    guards.reset_cache()
 
 
 @pytest.fixture
@@ -515,7 +517,7 @@ def test_json_record_schema(c_project):
     # kind is populated only when Universal Ctags (+json) is available;
     # strict enrichment assertions live in the milestone-2 test section.
     assert record["kind"] in (None, "function")
-    assert record["guard"] is None  # milestone 3
+    assert record["guard"] == []  # scanned, unconditional (milestone 3)
     assert "add_numbers" in record["snippet"]
 
 
@@ -668,7 +670,7 @@ def test_enriched_function_definition(rich_c_project):
     assert rec["kind"] == "function"
     assert rec["typeref"] == "int"
     assert "struct item" in rec["signature"]
-    assert rec["guard"] is None  # milestone 3 still reserved
+    assert rec["guard"] == []  # scanned, unconditional (milestone 3)
 
 
 @requires_global
@@ -776,3 +778,206 @@ def test_enrichment_tracks_file_edits(rich_c_project):
     assert after["line"] > before["line"]
     assert after["kind"] == "function"
     assert after["typeref"] == "long"
+
+
+# ---------------------------------------------------------------------------
+# Milestone 3: #ifdef guard awareness + active_config filtering
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def guarded_c_project(tmp_path):
+    """A C project with #ifdef alternates, an include guard, and plain code."""
+    (tmp_path / "feature.h").write_text(
+        textwrap.dedent(
+            """\
+            #ifndef FEATURE_H
+            #define FEATURE_H
+
+            int always_here(void);
+
+            #ifdef CONFIG_FOO
+            int foo_mode(int x);
+            #else
+            static inline int foo_mode(int x) { return 0; }
+            #endif
+
+            #endif /* FEATURE_H */
+            """
+        )
+    )
+    (tmp_path / "feature.c").write_text(
+        textwrap.dedent(
+            """\
+            #include "feature.h"
+
+            int always_here(void)
+            {
+                return foo_mode(1);
+            }
+
+            #ifdef CONFIG_FOO
+            int foo_mode(int x)
+            {
+                return x * 2;
+            }
+            #endif
+
+            #if defined(CONFIG_BAR) && !defined(CONFIG_FOO)
+            int bar_only(void)
+            {
+                return foo_mode(9);
+            }
+            #endif
+            """
+        )
+    )
+    return tmp_path
+
+
+def _defs(symbol, root, **kwargs):
+    return json.loads(server.find_definition(symbol, root, **kwargs))
+
+
+@requires_global
+def test_guard_tagging_on_definitions(guarded_c_project):
+    root = str(guarded_c_project)
+    records = _defs("foo_mode", root)["results"]
+    # gtags reports two definitions: the real one (CONFIG_FOO) and the
+    # inline stub (!CONFIG_FOO); the header prototype is a reference.
+    by_path = {(r["path"], r["line"]): r["guard"] for r in records}
+    assert by_path == {
+        ("feature.c", 9): ["CONFIG_FOO"],
+        ("feature.h", 9): ["!CONFIG_FOO"],
+    }
+
+    # Unguarded symbol: scanned file, empty stack — include guard invisible.
+    (unguarded,) = [
+        r for r in _defs("always_here", root)["results"] if r["path"] == "feature.c"
+    ]
+    assert unguarded["guard"] == []
+
+
+@requires_global
+def test_guard_tagging_on_references(guarded_c_project):
+    root = str(guarded_c_project)
+    refs = json.loads(server.find_references("foo_mode", root))["results"]
+    guards_by_line = {(r["path"], r["line"]): r["guard"] for r in refs}
+    assert guards_by_line[("feature.c", 5)] == []  # call in always_here
+    assert guards_by_line[("feature.c", 18)] == [
+        "defined(CONFIG_BAR) && !defined(CONFIG_FOO)"
+    ]
+    assert guards_by_line[("feature.h", 7)] == ["CONFIG_FOO"]  # the prototype
+
+
+@requires_global
+def test_active_config_filters_definitions(guarded_c_project):
+    root = str(guarded_c_project)
+    on = _defs("foo_mode", root, active_config="CONFIG_FOO")
+    assert [(r["path"], r["line"]) for r in on["results"]] == [("feature.c", 9)]
+    assert on["config_filtered"] == 1  # the !CONFIG_FOO stub
+    assert on["total"] == 1
+
+    off = _defs("foo_mode", root, active_config="!CONFIG_FOO")
+    assert [(r["path"], r["line"]) for r in off["results"]] == [("feature.h", 9)]
+    assert off["config_filtered"] == 1  # the CONFIG_FOO definition
+
+
+@requires_global
+def test_active_config_dot_config_file(guarded_c_project):
+    root = str(guarded_c_project)
+    (guarded_c_project / "test.config").write_text("CONFIG_FOO=y\n")
+    result = _defs("foo_mode", root, active_config="test.config")
+    lines = {(r["path"], r["line"]) for r in result["results"]}
+    assert lines == {("feature.c", 9)}  # the !CONFIG_FOO stub is dead
+
+    # Closed world: CONFIG_BAR absent from the .config -> bar_only is dead.
+    bar = _defs("bar_only", root, active_config="test.config")
+    assert bar["results"] == [] and bar["config_filtered"] == 1
+
+
+@requires_global
+def test_active_config_bad_path_is_error(guarded_c_project):
+    result = _defs("foo_mode", str(guarded_c_project), active_config="missing/.config")
+    assert "error" in result and "not found" in result["error"]
+
+
+@requires_global
+def test_symbol_info_guard_card(guarded_c_project):
+    root = str(guarded_c_project)
+    card = json.loads(server.symbol_info("foo_mode", root))["results"]
+    assert card["definition_count"] == 2
+    assert card["guard_variants"] == 2  # CONFIG_FOO vs !CONFIG_FOO
+
+    text = server.symbol_info("foo_mode", root, format="text")
+    assert "2 definitions under 2 distinct guards:" in text
+    assert "[CONFIG_FOO] defined at" in text
+    assert "[!CONFIG_FOO] defined at" in text
+
+    filtered = json.loads(
+        server.symbol_info("foo_mode", root, active_config="CONFIG_FOO")
+    )["results"]
+    assert filtered["definition_count"] == 1
+    assert filtered["config_filtered"] == 1
+    assert filtered["guard_variants"] == 1
+
+    none_live = server.symbol_info(
+        "bar_only", root, format="text", active_config="CONFIG_FOO,CONFIG_BAR"
+    )
+    assert "no definition is live under active_config" in none_live
+
+
+@requires_global
+def test_symbol_info_single_guard_keeps_plain_card(c_project):
+    text = server.symbol_info("add_numbers", str(c_project), format="text")
+    assert "distinct guards" not in text
+    assert "defined at util.c:3" in text
+
+
+@requires_global
+@pytest.mark.parametrize("how", ["config", "env", "flag"])
+def test_guards_opt_out(guarded_c_project, monkeypatch, how):
+    root = str(guarded_c_project)
+    if how == "config":
+        (guarded_c_project / config.PROJECT_CONFIG_NAME).write_text("guards = false\n")
+    elif how == "env":
+        monkeypatch.setenv("GTAGS_MCP_GUARDS", "0")
+    else:
+        monkeypatch.setattr(server, "_no_guards", True)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("guards_for_file called despite opt-out")
+
+    monkeypatch.setattr(guards, "guards_for_file", forbidden)
+    records = _defs("foo_mode", root)["results"]
+    assert all(r["guard"] is None for r in records)
+
+    # Explicit active_config with guards disabled is an error, not a no-op.
+    result = _defs("foo_mode", root, active_config="CONFIG_FOO")
+    assert "error" in result and "guard scanning" in result["error"]
+
+    info = json.loads(server.symbol_info("foo_mode", root))["results"]
+    assert info["guard_variants"] is None
+
+
+@requires_global
+def test_guards_track_file_edits(guarded_c_project):
+    root = str(guarded_c_project)
+    before = {
+        (r["path"], r["line"]): r["guard"] for r in _defs("foo_mode", root)["results"]
+    }
+    assert before[("feature.c", 9)] == ["CONFIG_FOO"]
+
+    source = (guarded_c_project / "feature.c").read_text()
+    (guarded_c_project / "feature.c").write_text(
+        source.replace("#ifdef CONFIG_FOO", "#ifdef CONFIG_NEW_NAME")
+    )
+    stat = (guarded_c_project / "feature.c").stat()
+    os.utime(
+        guarded_c_project / "feature.c", (stat.st_atime + 2, stat.st_mtime + 2)
+    )
+    server.update_index(root)
+    after = {
+        (r["path"], r["line"]): r["guard"] for r in _defs("foo_mode", root)["results"]
+    }
+    assert after[("feature.c", 9)] == ["CONFIG_NEW_NAME"]

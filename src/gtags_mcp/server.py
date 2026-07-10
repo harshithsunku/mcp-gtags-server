@@ -28,6 +28,7 @@ from mcp.server.fastmcp import FastMCP
 from . import config as config_module
 from . import enrich
 from . import fileset
+from . import guards
 from . import output
 from . import toolchain
 
@@ -54,6 +55,8 @@ Format = Literal["json", "text"]
 DEFAULT_LIMIT = 100
 MAX_LINE_CHARS = 200
 MAX_BODY_LINES = 300
+# symbol_info guard-scans at most this many definitions of one symbol.
+MAX_GUARDED_DEFS = 50
 QUERY_TIMEOUT_SECONDS = 120
 INDEX_TIMEOUT_SECONDS = 600
 # Skip the incremental freshness check when the same root was updated this
@@ -80,6 +83,8 @@ _auto_label_resolved = False
 _bin_dir: str | None = None
 # ctags metadata enrichment disabled by --no-enrich.
 _no_enrich = False
+# #ifdef guard scanning disabled by --no-guards.
+_no_guards = False
 
 # File extensions GNU Global's built-in parser understands.
 _NATIVE_EXTENSIONS = frozenset(
@@ -323,6 +328,8 @@ def _query_global(
     parse: str = "cxref",  # cxref | symbol | path — shape of `global` stdout
     record_symbol: str | None = None,
     enrich_records: bool = False,  # ctags metadata on definition-shaped results
+    guard_records: bool = False,  # #ifdef guard stacks on cxref results
+    active_config: str | None = None,  # .config / macro list to filter guards by
 ) -> str:
     """Shared plumbing for all read-only `global` queries."""
     stdout, root, err = _raw_global(flags, project_root)
@@ -348,10 +355,31 @@ def _query_global(
             for line in stdout.splitlines()
             if (p := line.strip())
         ]
+    extra: dict = {}
+    if active_config and parse == "cxref":
+        # Explicit intent must not fail silently: bad specs and disabled
+        # guard scanning are errors, not quietly-unfiltered results.
+        if not _guards_enabled(root):
+            return output.error(
+                tool,
+                "Error: active_config needs guard scanning, which is disabled "
+                "(--no-guards / GTAGS_MCP_GUARDS / `guards = false`).",
+                root,
+            )
+        cfg, cfg_err = guards.load_active_config(active_config, root)
+        if cfg_err:
+            return output.error(tool, cfg_err, root)
+        # Filtering changes totals, so it must run BEFORE pagination. This
+        # scans every result file (not just one page) — opt-in cost, cached.
+        items, dropped = _maybe_guard(items, root, cfg)
+        extra["config_filtered"] = dropped
     page, total, truncated = output.paginate(items, limit, offset)
     if enrich_records and parse == "cxref":
         _maybe_enrich(page, root)  # after pagination: only one page pays ctags
-    extra = {} if items else {"message": empty_message}
+    if guard_records and parse == "cxref" and not active_config:
+        _maybe_guard(page, root)  # guards already filled when config-filtered
+    if not items:
+        extra["message"] = empty_message
     return output.envelope(
         tool,
         root,
@@ -381,6 +409,45 @@ def _enrichment_enabled(root: Path | None) -> bool:
     if env := os.environ.get("GTAGS_MCP_ENRICH"):
         return env.strip().lower() not in ("0", "false", "no", "off")
     return config_module.get_bool_setting("enrich", root, default=True)
+
+
+def _guards_enabled(root: Path | None) -> bool:
+    """#ifdef guard scanning: --no-guards > GTAGS_MCP_GUARDS > config > on."""
+    if _no_guards:
+        return False
+    if env := os.environ.get("GTAGS_MCP_GUARDS"):
+        return env.strip().lower() not in ("0", "false", "no", "off")
+    return config_module.get_bool_setting("guards", root, default=True)
+
+
+def _maybe_guard(
+    records: list[dict],
+    root: Path | None,
+    cfg: guards.ActiveConfig | None = None,
+) -> tuple[list[dict], int]:
+    """Fill the ``guard`` field on records in place; optionally config-filter.
+
+    With *cfg*, records whose guard stack is DEFINITELY false under it are
+    dropped (unknown macros never drop anything). Returns (kept records,
+    dropped count). Best-effort: unreadable files leave ``guard`` null.
+    """
+    if not records or root is None or not _guards_enabled(root):
+        return records, 0
+    kept: list[dict] = []
+    dropped = 0
+    for rec in records:
+        table = guards.guards_for_file(root / rec["path"])
+        satisfiable: bool | None = None
+        if table is not None:
+            stack = table.stack_at(rec["line"])
+            rec["guard"] = guards.guard_list(stack)
+            if cfg is not None:
+                satisfiable = guards.stack_satisfiable(stack, cfg)
+        if satisfiable is False:
+            dropped += 1
+            continue
+        kept.append(rec)
+    return kept, dropped
 
 
 def _maybe_enrich(records: list[dict], root: Path | None) -> None:
@@ -540,6 +607,7 @@ def find_definition(
     limit: int = DEFAULT_LIMIT,
     offset: int = 0,
     format: Format = "json",
+    active_config: str | None = None,
 ) -> str:
     """Find where a C/C++ symbol (function, struct, macro, typedef, enum) is defined.
 
@@ -547,6 +615,8 @@ def find_definition(
     definition — it is an indexed lookup that returns only the definition
     site(s), not every textual occurrence, and stays fast on codebases with
     millions of lines. The index is built and refreshed automatically.
+    Multiply-defined symbols (kernel/firmware `#ifdef` alternates) come back
+    with each definition's guard stack, so you can tell which one applies.
 
     Args:
         symbol: Exact symbol name, e.g. "tcp_v4_rcv" or "list_head".
@@ -559,8 +629,14 @@ def find_definition(
             {symbol, path, line, col, kind, typeref, scope, signature,
             guard, snippet} records — kind/typeref/scope/signature carry
             ctags metadata (what the symbol is, its type/return type, its
-            enclosing scope, its parameter list) when available;
+            enclosing scope, its parameter list) when available; guard is
+            the enclosing #if/#ifdef stack (outermost first, [] = none);
             "text" for lines of: symbol line-number file source-line.
+        active_config: Path to a kernel .config (absolute or root-relative),
+            or a comma-separated macro list like "CONFIG_SMP,BITS_PER_LONG=64"
+            (prefix ! for known-undefined). Definitions whose guard stack is
+            DEFINITELY false under it are dropped; unknown macros never drop
+            anything. The envelope reports the drop count as config_filtered.
     """
     flags = ["-x"] + (["-i"] if case_insensitive else []) + ["--", symbol]
     return _query_global(
@@ -572,6 +648,8 @@ def find_definition(
         offset,
         format,
         enrich_records=True,
+        guard_records=True,
+        active_config=active_config,
     )
 
 
@@ -583,13 +661,15 @@ def find_references(
     limit: int = DEFAULT_LIMIT,
     offset: int = 0,
     format: Format = "json",
+    active_config: str | None = None,
 ) -> str:
     """Find all call/usage sites of a defined C/C++ symbol.
 
     Use this INSTEAD of grep when you need who calls a function or uses a
     type — grep returns every textual match including comments and strings,
     while this returns only real reference sites from the index, instantly
-    even on huge trees.
+    even on huge trees. Each reference carries its #if/#ifdef guard stack,
+    so you can see which call sites are conditional.
 
     Args:
         symbol: Exact symbol name whose call/usage sites you want.
@@ -597,8 +677,12 @@ def find_references(
         case_insensitive: Match the symbol ignoring case.
         limit: Maximum result lines to return (default 100).
         offset: Skip this many result lines (for pagination).
-        format: "json" (default) for structured records; "text" for
-            lines of: symbol line-number file source-line.
+        format: "json" (default) for structured records (guard = enclosing
+            #if/#ifdef stack); "text" for lines of:
+            symbol line-number file source-line.
+        active_config: Kernel .config path or comma-separated macro list;
+            drops references whose guard stack is definitely false under it
+            (reported as config_filtered). Unknown macros never drop anything.
     """
     flags = ["-rx"] + (["-i"] if case_insensitive else []) + ["--", symbol]
     return _query_global(
@@ -609,6 +693,8 @@ def find_references(
         limit,
         offset,
         format,
+        guard_records=True,
+        active_config=active_config,
     )
 
 
@@ -1029,21 +1115,29 @@ def symbol_info(
     symbol: str,
     project_root: str | None = None,
     format: Format = "json",
+    active_config: str | None = None,
 ) -> str:
     """One-shot overview card for a symbol — the best FIRST query.
 
     Use this before anything else when you encounter an unfamiliar symbol:
     one call returns where it's defined, WHAT it is (function/macro/struct/
     typedef/enum-constant, with signature and enclosing scope when
-    available), how widely it's used, which files use it most, and which
-    tool to reach for next. Cheaper than any combination of grep and file
-    reads.
+    available), under WHICH #ifdef guards each definition lives (kernel and
+    firmware code defines symbols multiple times under different configs —
+    guard_variants > 1 tells you the flat list is really a config choice),
+    how widely it's used, which files use it most, and which tool to reach
+    for next. Cheaper than any combination of grep and file reads.
 
     Args:
         symbol: Exact symbol name.
         project_root: Project directory. Omit to use the server's default.
-        format: "json" (default) for {definitions, reference_count,
-            file_count, top_files}; "text" for the overview card.
+        format: "json" (default) for {definitions, definition_count,
+            guard_variants, reference_count, file_count, top_files};
+            "text" for the overview card.
+        active_config: Kernel .config path or comma-separated macro list
+            (e.g. "CONFIG_SMP,!CONFIG_DEBUG"); definitions whose guard stack
+            is definitely false under it are dropped and reported as
+            config_filtered. Unknown macros never drop anything.
     """
     defs_out, root, err = _raw_global(["-x", "--", symbol], project_root)
     if err:
@@ -1075,37 +1169,79 @@ def symbol_info(
         hint = "find_symbol_usages to see usage sites"
         hint_tools = ["find_symbol_usages"]
 
-    def_records = [
+    # Guard-scan EVERY definition (bounded), not just the first three: "N
+    # definitions under M distinct guards" must describe the whole set, and
+    # active_config must be able to drop any of them.
+    all_records = [
         output.record(sym, path, lineno, source)
-        for sym, lineno, path, source in defs[:3]
+        for sym, lineno, path, source in defs[:MAX_GUARDED_DEFS]
     ]
+    cfg = None
+    if active_config:
+        if not _guards_enabled(root):
+            msg = (
+                "Error: active_config needs guard scanning, which is disabled "
+                "(--no-guards / GTAGS_MCP_GUARDS / `guards = false`)."
+            )
+            return output.error("symbol_info", msg, root) if format == "json" else msg
+        cfg, cfg_err = guards.load_active_config(active_config, root)
+        if cfg_err:
+            return (
+                output.error("symbol_info", cfg_err, root)
+                if format == "json"
+                else cfg_err
+            )
+    kept, config_filtered = _maybe_guard(all_records, root, cfg)
+    live_defs = len(kept) + max(0, len(defs) - MAX_GUARDED_DEFS)
+    distinct = {tuple(rec["guard"]) for rec in kept if rec["guard"] is not None}
+    guard_variants = len(distinct) if distinct else None
+
+    def_records = kept[:3]
     _maybe_enrich(def_records, root)
 
     if format == "json":
         info = {
             "symbol": symbol,
             "definitions": def_records,
-            "definition_count": len(defs),
+            "definition_count": live_defs,
+            "guard_variants": guard_variants,
             "reference_count": len(refs),
             "file_count": len(counts),
             "top_files": [{"path": path, "count": count} for path, count in top],
         }
+        if active_config:
+            info["config_filtered"] = config_filtered
         return output.envelope(
             "symbol_info",
             root,
             info,
-            total=len(defs) + len(refs),
+            total=live_defs + len(refs),
             hints=hint_tools,
         )
 
     lines = [f"Symbol: {symbol}"]
-    if defs:
-        for rec, (_, lineno, path, source) in zip(def_records, defs[:3]):
+    if def_records:
+        if guard_variants is not None and guard_variants > 1:
             lines.append(
-                f"  defined at {path}:{lineno} — {_describe_definition(rec, source)}"
+                f"  {live_defs} definitions under {guard_variants} distinct guards:"
             )
-        if len(defs) > 3:
-            lines.append(f"  ... {len(defs) - 3} more definition(s)")
+        for rec in def_records:
+            prefix = f"[{' && '.join(rec['guard'])}] " if rec["guard"] else ""
+            lines.append(
+                f"  {prefix}defined at {rec['path']}:{rec['line']} — "
+                f"{_describe_definition(rec, rec['snippet'])}"
+            )
+        if live_defs > 3:
+            lines.append(f"  ... {live_defs - 3} more definition(s)")
+        if config_filtered:
+            lines.append(
+                f"  ({config_filtered} definition(s) filtered out by active_config)"
+            )
+    elif defs:
+        lines.append(
+            f"  no definition is live under active_config "
+            f"({config_filtered} filtered out)"
+        )
     else:
         lines.append("  no in-tree definition (external symbol? try find_symbol_usages)")
     if refs:
@@ -1361,7 +1497,8 @@ def list_file_symbols(
         limit: Maximum result lines to return (default 100).
         offset: Skip this many result lines (for pagination).
         format: "json" (default) for structured records with ctags metadata
-            (kind/typeref/scope/signature) when available; "text" for raw lines.
+            (kind/typeref/scope/signature) and #ifdef guard stacks when
+            available; "text" for raw lines.
     """
     return _query_global(
         "list_file_symbols",
@@ -1372,6 +1509,7 @@ def list_file_symbols(
         offset,
         format,
         enrich_records=True,
+        guard_records=True,
     )
 
 
@@ -1600,7 +1738,7 @@ def _client_config_text(transport: str, host: str, port: int) -> str:
 
 def main() -> None:
     """Entry point: serve MCP over stdio/HTTP, or run a maintenance subcommand."""
-    global _default_root, _forced_label, _bin_dir, _no_enrich
+    global _default_root, _forced_label, _bin_dir, _no_enrich, _no_guards
     parser = argparse.ArgumentParser(
         prog="mcp-gtags-server",
         description=(
@@ -1673,6 +1811,13 @@ def main() -> None:
         "or `enrich = false` in .gtags-mcp.toml).",
     )
     parser.add_argument(
+        "--no-guards",
+        action="store_true",
+        help="Disable #ifdef guard scanning — results keep a null guard "
+        "field and active_config filtering is rejected (also: "
+        "GTAGS_MCP_GUARDS=0, or `guards = false` in .gtags-mcp.toml).",
+    )
+    parser.add_argument(
         "--no-ctags",
         action="store_true",
         help="setup only: skip installing universal-ctags and Pygments "
@@ -1688,6 +1833,7 @@ def main() -> None:
     _forced_label = args.label
     _bin_dir = args.bin_dir
     _no_enrich = args.no_enrich
+    _no_guards = args.no_guards
     if args.bin_dir:
         os.environ["GTAGS_MCP_BIN_DIR"] = args.bin_dir
 
@@ -1708,6 +1854,8 @@ def main() -> None:
                 "    re-run `mcp-gtags-server setup` to install universal-ctags "
                 "into user space (no sudo needed)."
             )
+        guard_state = "active (built-in)" if _guards_enabled(root) else "disabled"
+        print(f"  guard scanning: {guard_state}")
         return
     if args.command == "config":
         print(_client_config_text(args.transport, args.host, args.port))

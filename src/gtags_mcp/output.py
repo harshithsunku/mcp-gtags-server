@@ -19,11 +19,13 @@ Symbol-location items use one stable record schema everywhere::
 ``kind`` / ``typeref`` / ``scope`` / ``signature`` are ctags metadata
 (populated on definition-shaped results when Universal Ctags with JSON
 output can parse the file — see :mod:`gtags_mcp.enrich` — and ``null``
-otherwise). ``guard`` (#ifdef stack) is reserved for a later milestone and
-always ``null``. Keys are only ever *added*, never renamed or removed, so
-agent-side parsers keep working. Paths are repo-relative. Errors replace
-``results`` with an ``error`` string but keep the envelope and
-``next_tools``.
+otherwise). ``guard`` is the enclosing ``#if``/``#ifdef`` conditional stack
+as a list of strings, outermost first (see :mod:`gtags_mcp.guards`):
+``[]`` means the file was scanned and the symbol is unconditional; ``null``
+means guard scanning was disabled or the file could not be read. Keys are
+only ever *added*, never renamed or removed, so agent-side parsers keep
+working. Paths are repo-relative. Errors replace ``results`` with an
+``error`` string but keep the envelope and ``next_tools``.
 """
 
 from __future__ import annotations
@@ -85,6 +87,7 @@ def record(
     typeref: str | None = None,
     scope: str | None = None,
     signature: str | None = None,
+    guard: list[str] | None = None,
 ) -> dict:
     """One symbol-location result in the stable record schema."""
     snippet = snippet.rstrip()
@@ -100,7 +103,7 @@ def record(
         "typeref": typeref,
         "scope": scope,
         "signature": signature,
-        "guard": None,  # #ifdef stack (roadmap milestone 3)
+        "guard": guard,
         "snippet": snippet,
     }
 

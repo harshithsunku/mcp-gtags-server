@@ -163,6 +163,7 @@ bin_dir = "/opt/tools/bin"    # extra directory searched for gtags/global/ctags
 skip_globs = ["*.gen.c"]      # never index paths/basenames matching these globs
 respect_gitignore = true      # default: index only what `git ls-files` reports
 enrich = true                 # default: ctags kind/signature/scope on results
+guards = true                 # default: #ifdef guard stacks on results
 # root = "/abs/path"          # default project root (user config)
 ```
 
@@ -178,7 +179,7 @@ Precedence: tool-call argument > CLI flag > environment variable > project confi
 
 | Tool | What the agent gets |
 |---|---|
-| `symbol_info` | **A one-shot overview card** — definitions (with kind, signature, and scope), reference count, hottest files, and which tool to use next. The best first query for any unfamiliar symbol. |
+| `symbol_info` | **A one-shot overview card** — definitions (with kind, signature, scope, and `#ifdef` guard), reference count, hottest files, and which tool to use next. Multiply-defined symbols are explained as "N definitions under M distinct guards". The best first query for any unfamiliar symbol. |
 | `get_symbol_body` | **Just the source of a definition.** The 271-line `tcp_v4_rcv` function — not the 3,500-line file it lives in. Handles functions, structs, and multi-line macros. |
 | `find_callers` | **The call graph, deduplicated.** Every reference mapped to its enclosing function with call counts: 245 raw lines for `ext4_mark_inode_dirty` collapse to 62 callers. |
 | `call_hierarchy` | **Multi-level impact analysis.** Who calls X, who calls *those*, up to 5 levels — a cycle-safe, capped tree instead of N rounds of grep. |
@@ -225,19 +226,52 @@ Since v0.8.0 every tool returns a **machine-readable JSON envelope by default** 
   "tool": "find_definition",
   "root": "/abs/project/root",
   "results": [
-    {"symbol": "tcp_v4_rcv", "path": "net/ipv4/tcp_ipv4.c", "line": 2001,
-     "col": 5, "kind": "function", "typeref": "int", "scope": null,
-     "signature": "(struct sk_buff * skb)", "guard": null,
-     "snippet": "int tcp_v4_rcv(struct sk_buff *skb)"}
+    {"symbol": "kmap", "path": "include/linux/highmem-internal.h", "line": 40,
+     "col": 22, "kind": "function", "typeref": "void *", "scope": null,
+     "signature": "(struct page * page)", "guard": ["CONFIG_HIGHMEM"],
+     "snippet": "static inline void *kmap(struct page *page)"}
   ],
-  "total": 1, "offset": 0, "truncated": false,
+  "total": 2, "offset": 0, "truncated": false,
   "next_tools": ["get_symbol_body", "find_callers", "symbol_info"],
   "warning": null
 }
 ```
 
-- Symbol locations always use the stable record schema `{symbol, path, line, col, kind, typeref, scope, signature, guard, snippet}` with repo-relative paths. Keys are only ever added, never renamed or removed — parsers never need to change shape. `guard` (`#ifdef` stack) is reserved for an upcoming milestone and currently `null`.
+- Symbol locations always use the stable record schema `{symbol, path, line, col, kind, typeref, scope, signature, guard, snippet}` with repo-relative paths. Keys are only ever added, never renamed or removed — parsers never need to change shape.
 - **`kind` / `typeref` / `scope` / `signature` say *what* a symbol is** (since v0.8.1): function vs. macro vs. struct vs. typedef vs. enum constant, its return/target type, its enclosing scope (`enum:color`, `struct:item`), and its parameter list — extracted per file by universal-ctags with **no build and no compile database**, cached, and filled on definition-shaped results (`find_definition`, `symbol_info`, `list_file_symbols`). When universal-ctags isn't available the fields are simply `null`; disable explicitly with `--no-enrich`, `GTAGS_MCP_ENRICH=0`, or `enrich = false` in `.gtags-mcp.toml`.
+- **`guard` says *when* a symbol exists** (since v0.9.0): the enclosing `#if`/`#ifdef` stack, outermost first (`[]` = unconditional, `null` = scanning disabled or file unreadable). See the next section — this is the headline feature.
+
+### `#ifdef`-aware: know which definition your config actually compiles
+
+Kernel and firmware code defines the same symbol multiple times and lets the
+build configuration pick one. Every other no-build tool returns a flat,
+unexplained list — an agent happily reads the no-op stub of `kmap` and
+reasons its way to a wrong answer. This server reads the preprocessor
+conditionals (pure scanning — still no build, no `compile_commands.json`):
+
+```text
+Symbol: kmap
+  2 definitions under 2 distinct guards:
+  [CONFIG_HIGHMEM] defined at include/linux/highmem-internal.h:40 — function kmap(struct page * page) -> void *
+  [!CONFIG_HIGHMEM] defined at include/linux/highmem-internal.h:170 — function kmap(struct page * page) -> void *
+```
+
+Pass `active_config` — a kernel `.config` path or a macro list like
+`"CONFIG_SMP,BITS_PER_LONG=64,!CONFIG_DEBUG"` — to `find_definition`,
+`find_references`, or `symbol_info`, and definitions whose guard stack is
+**definitely false** under it are dropped (the envelope reports the count as
+`config_filtered`). Filtering is deliberately conservative: a `.config` is a
+closed world for `CONFIG_*` macros (kbuild semantics, including
+`=m` → `CONFIG_X_MODULE` and `IS_ENABLED`/`IS_BUILTIN`/`IS_MODULE`), but
+anything unknown (`__ASSEMBLY__`, `ARCH_HAS_*`, arithmetic it can't decide)
+never drops a result.
+
+The details are handled so the output stays clean: classic include guards
+(`#ifndef FOO_H`) are detected and suppressed, `#elif` chains compose into
+explicit conditions (`!CONFIG_X86_64 && CONFIG_X86_32`), comments on
+directives are ignored (they lie), and broken/partial files never fail a
+query. Disable with `--no-guards`, `GTAGS_MCP_GUARDS=0`, or `guards = false`
+in `.gtags-mcp.toml`.
 - `next_tools` tells the agent the highest-value follow-up call for what was (or wasn't) found.
 - `total`/`offset`/`truncated` replace the text continuation footer; errors keep the envelope with an `error` field.
 - Composite tools return tool-shaped `results` (e.g. `call_hierarchy` a nested caller tree, `find_callees` `{in_tree, external}`, `symbol_info` an overview object) inside the same envelope.
@@ -328,10 +362,11 @@ Release flow: bump `version` in `pyproject.toml`, tag `vX.Y.Z`, push — CI publ
 
 ## Roadmap
 
-See [ROADMAP.md](ROADMAP.md) — structured JSON output landed in v0.8.0 and ctags
-metadata enrichment (kind/signature/scope on every definition) in v0.8.1; next up are
-`#ifdef`/config-guard awareness (the headline capability for kernel and firmware
-trees), macro-family symbol resolution, and a correctness eval harness.
+See [ROADMAP.md](ROADMAP.md) — structured JSON output landed in v0.8.0, ctags
+metadata enrichment (kind/signature/scope) in v0.8.1, and `#ifdef`/config-guard
+awareness (the headline capability for kernel and firmware trees) in v0.9.0;
+next up are macro-family symbol resolution, agent workflow tools
+(`reachability`, `blast_radius`), and a correctness eval harness.
 
 Contributions welcome — open an issue or PR.
 

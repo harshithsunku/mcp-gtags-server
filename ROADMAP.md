@@ -55,15 +55,15 @@ Cheap, high-value — uses the parser already in the stack.
 
 **Done when:** `symbol_info` shows kind + signature + scope for C symbols with no build.
 
-### 3. `#ifdef` / config-guard awareness — headline capability
+### 3. `#ifdef` / config-guard awareness — headline capability ✅ (v0.9.0)
 The differentiator. Firmware and kernel code is conditional-compilation soup, and
 nothing else surfaces it. Worth spending real time here.
 
-- [ ] For each definition/reference, collect the enclosing
+- [x] For each definition/reference, collect the enclosing
       `#if` / `#ifdef` / `#ifndef` / `#elif` stack and attach it as a `guard` field.
-- [ ] When a symbol has multiple definitions, report them explicitly as
+- [x] When a symbol has multiple definitions, report them explicitly as
       "N definitions under different guards" rather than a flat list.
-- [ ] Add an optional `active_config` filter (a `.config` or a list of defined macros)
+- [x] Add an optional `active_config` filter (a `.config` or a list of defined macros)
       that keeps only definitions whose guard stack is satisfiable.
 
 **Done when:** a multiply-defined symbol returns each definition tagged with its guard
