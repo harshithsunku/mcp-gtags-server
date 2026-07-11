@@ -29,15 +29,21 @@ jobs:
     strategy:
       matrix:
         include:
+          # Linux builds run inside manylinux_2_28 (AlmaLinux 8, glibc 2.28)
+          # containers so the binaries work on RHEL 8-era hosts, not just the
+          # runner's own glibc.
           - runner: ubuntu-22.04
             platform: linux-x86_64
+            container: quay.io/pypa/manylinux_2_28_x86_64
           - runner: ubuntu-22.04-arm
             platform: linux-aarch64
+            container: quay.io/pypa/manylinux_2_28_aarch64
           - runner: macos-15-intel
             platform: macos-x86_64
           - runner: macos-latest
             platform: macos-aarch64
     runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container }}
     steps:
       - name: Resolve version
         id: ver
@@ -51,7 +57,11 @@ jobs:
       - name: Download and verify source
         run: |
           curl -fsSLO "https://ftp.gnu.org/gnu/global/global-${{ steps.ver.outputs.version }}.tar.gz"
-          echo "${GLOBAL_SHA256}  global-${{ steps.ver.outputs.version }}.tar.gz" | shasum -a 256 -c -
+          if command -v sha256sum >/dev/null; then
+            echo "${GLOBAL_SHA256}  global-${{ steps.ver.outputs.version }}.tar.gz" | sha256sum -c -
+          else
+            echo "${GLOBAL_SHA256}  global-${{ steps.ver.outputs.version }}.tar.gz" | shasum -a 256 -c -
+          fi
           tar xzf "global-${{ steps.ver.outputs.version }}.tar.gz"
 
       - name: Build with placeholder prefix
@@ -59,8 +69,12 @@ jobs:
           # Must match PLACEHOLDER_PREFIX in src/gtags_mcp/toolchain.py:
           # "/opt/gtags-mcp-placeholder-prefix" + 167 underscores (200 chars).
           PREFIX="/opt/gtags-mcp-placeholder-prefix$(printf '_%.0s' $(seq 1 167))"
-          sudo mkdir -p "$PREFIX"
-          sudo chown "$(id -u)" "$PREFIX"
+          if [ "$(id -u)" = "0" ]; then
+            mkdir -p "$PREFIX"  # manylinux containers run as root, no sudo
+          else
+            sudo mkdir -p "$PREFIX"
+            sudo chown "$(id -u)" "$PREFIX"
+          fi
           cd "global-${{ steps.ver.outputs.version }}"
           ./configure --prefix="$PREFIX" --disable-gtagscscope --with-included-ltdl
           make -j"$(getconf _NPROCESSORS_ONLN)"
@@ -74,13 +88,37 @@ jobs:
           "$PREFIX/bin/gtags"
           "$PREFIX/bin/global" -x foo | grep -q a.c
 
+      - name: Assert glibc symbol ceiling
+        if: startsWith(matrix.platform, 'linux')
+        run: |
+          # Nothing we ship may need glibc newer than the manylinux_2_28
+          # baseline, or the binaries break on RHEL 8-era hosts again.
+          CEILING="2.28"
+          fail=0
+          for bin in "$PREFIX"/bin/* "$PREFIX"/lib/gtags/*.so*; do
+            [ -f "$bin" ] || continue
+            head -c4 "$bin" | grep -q $'\x7fELF' || continue
+            max=$(objdump -T "$bin" | grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' \
+                  | sed 's/GLIBC_//' | sort -uV | tail -1)
+            [ -n "$max" ] || continue
+            if [ "$(printf '%s\n%s\n' "$max" "$CEILING" | sort -V | tail -1)" != "$CEILING" ]; then
+              echo "::error::$bin requires GLIBC_$max > $CEILING"
+              fail=1
+            fi
+          done
+          exit $fail
+
       - name: Package
         run: |
           STAGE="global-${{ steps.ver.outputs.version }}-${{ matrix.platform }}"
           mkdir "$STAGE"
           cp -R "$PREFIX/bin" "$PREFIX/lib" "$PREFIX/share" "$STAGE/"
           tar czf "$STAGE.tar.gz" "$STAGE"
-          shasum -a 256 "$STAGE.tar.gz"
+          if command -v sha256sum >/dev/null; then
+            sha256sum "$STAGE.tar.gz"
+          else
+            shasum -a 256 "$STAGE.tar.gz"
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
