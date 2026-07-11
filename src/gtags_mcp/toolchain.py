@@ -63,7 +63,12 @@ CTAGS_NIGHTLY_API = (
 DOWNLOAD_TIMEOUT_SECONDS = 120
 BUILD_TIMEOUT_SECONDS = 1800
 
-_CTAGS_NAMES = ("ctags-exuberant", "universal-ctags", "ctags")
+# Universal flavours first: enrichment and export recovery require Universal
+# Ctags (+json), which Exuberant ctags can never provide. Distros name the
+# universal binary "ctags-universal" (Debian/Ubuntu) or "universal-ctags";
+# the generic "ctags" may be either flavour, and exuberant is the last
+# resort (still fine as the gtags pygments-plugin backend).
+_CTAGS_NAMES = ("universal-ctags", "ctags-universal", "ctags", "ctags-exuberant")
 
 
 class SetupError(RuntimeError):
