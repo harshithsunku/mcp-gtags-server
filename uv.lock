@@ -370,9 +370,10 @@ wheels = [
 
 [[package]]
 name = "mcp-gtags-server"
-version = "1.0.0"
+version = "1.4.2"
 source = { editable = "." }
 dependencies = [
+    { name = "anyio" },
     { name = "mcp" },
     { name = "tomli", marker = "python_full_version < '3.11'" },
 ]
@@ -384,7 +385,8 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "mcp", specifier = ">=1.8.0" },
+    { name = "anyio", specifier = ">=4.0" },
+    { name = "mcp", specifier = ">=1.14.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "tomli", marker = "python_full_version < '3.11'", specifier = ">=2.0" },
 ]

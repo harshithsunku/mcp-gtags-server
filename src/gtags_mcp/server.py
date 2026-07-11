@@ -246,6 +246,17 @@ _CORRUPT_SIGNATURE = "seems corrupted"
 _INDEX_FILES = ("GTAGS", "GRTAGS", "GSYMS", "GPATH")
 
 
+def _loader_hint(stderr: str) -> str:
+    """Remediation suffix when a binary fails with a glibc loader error."""
+    if "GLIBC_" in stderr or "GLIBCXX_" in stderr:
+        return (
+            " The installed toolchain binaries are incompatible with this "
+            "system's glibc; run `mcp-gtags-server setup --force` to rebuild "
+            "from source."
+        )
+    return ""
+
+
 def _delete_index_files(db_dir: Path) -> None:
     """Remove the index database files so the next query rebuilds from scratch."""
     for name in _INDEX_FILES:
@@ -511,7 +522,7 @@ def _ensure_index(root: Path) -> str | None:
         if code != 0:
             return (
                 f"Error: automatic indexing failed (gtags exited {code}): "
-                f"{stderr.strip() or stdout.strip()}"
+                f"{stderr.strip() or stdout.strip()}{_loader_hint(stderr)}"
             )
         _last_update[root] = time.monotonic()
         _bump_generation(root)
@@ -607,7 +618,10 @@ def _raw_global(
                     "rebuilt automatically."
                 )
             return _raw_global(flags, project_root, _retry=False)
-        return None, root, f"Error: global exited with code {code}: {stderr.strip()}"
+        return None, root, (
+            f"Error: global exited with code {code}: "
+            f"{stderr.strip()}{_loader_hint(stderr)}"
+        )
     return stdout, root, None
 
 
@@ -2018,7 +2032,7 @@ def update_index(
         if code != 0:
             return _respond(
                 f"Error: gtags exited with code {code}: "
-                f"{stderr.strip() or stdout.strip()}",
+                f"{stderr.strip() or stdout.strip()}{_loader_hint(stderr)}",
                 error=True,
             )
         _last_update[root] = time.monotonic()

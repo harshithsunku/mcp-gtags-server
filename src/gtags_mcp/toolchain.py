@@ -55,6 +55,10 @@ GLOBAL_SOURCE_SHA256 = "cf0937cb3ed521b2ab1acfa7aff45103040b860bb642c4c2f094ac3a
 PREBUILT_REPO = "harshithsunku/mcp-gtags-server"
 PREBUILT_TAG = f"global-v{GLOBAL_VERSION}"
 
+# Prebuilt Linux binaries are built in manylinux_2_28 containers and need at
+# least this glibc; older hosts skip the download and build from source.
+PREBUILT_MIN_GLIBC = (2, 28)
+
 # Official universal-ctags binary releases (built by the ctags project).
 CTAGS_NIGHTLY_API = (
     "https://api.github.com/repos/universal-ctags/ctags-nightly-build/releases/latest"
@@ -251,6 +255,25 @@ def _platform_tag() -> str | None:
     return None
 
 
+def _host_glibc() -> tuple[int, int] | None:
+    """(major, minor) of the host glibc; None on non-Linux/musl/unknown."""
+    if not sys.platform.startswith("linux"):
+        return None
+    version = ""
+    try:
+        version = os.confstr("CS_GNU_LIBC_VERSION") or ""
+    except (ValueError, OSError):
+        pass
+    if not version:
+        lib, ver = platform.libc_ver()
+        if lib == "glibc":
+            version = f"glibc {ver}"
+    match = re.match(r"glibc[ -](\d+)\.(\d+)", version)
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
 # --------------------------------------------------------------------------
 # GNU Global installation
 # --------------------------------------------------------------------------
@@ -303,10 +326,28 @@ def _patch_embedded_prefix(binary: Path, old_prefix: str, new_prefix: str) -> No
     binary.write_bytes(bytes(out))
 
 
+def _verify_managed_global(log) -> bool:
+    """Execute the just-installed managed global/gtags; False on any failure."""
+    for name in ("global", "gtags"):
+        ok, tail = _try_run([str(managed_bin() / name), "--version"], timeout=15)
+        if not ok:
+            log(f"  installed {name} does not run on this host: {tail.strip()}")
+            return False
+    return True
+
+
 def install_global_prebuilt(log) -> bool:
     """Install Global from this repo's release binaries. False if unavailable."""
     tag_platform = _platform_tag()
     if tag_platform is None:
+        return False
+    glibc = _host_glibc()
+    if glibc is not None and glibc < PREBUILT_MIN_GLIBC:
+        log(
+            f"  host glibc {glibc[0]}.{glibc[1]} is older than "
+            f"{PREBUILT_MIN_GLIBC[0]}.{PREBUILT_MIN_GLIBC[1]} required by the "
+            "prebuilt binaries; building from source instead"
+        )
         return False
     base = f"https://github.com/{PREBUILT_REPO}/releases/download/{PREBUILT_TAG}"
     asset = f"global-{GLOBAL_VERSION}-{tag_platform}.tar.gz"
@@ -341,6 +382,13 @@ def install_global_prebuilt(log) -> bool:
     if libdir.is_dir():
         for path in libdir.glob("*.so"):
             _patch_embedded_prefix(path, PLACEHOLDER_PREFIX, str(home))
+    # Raising (not returning False) matters: files are already extracted into
+    # the managed home, and only run_setup's exception path wipes it before
+    # falling back to a source build.
+    if not _verify_managed_global(log):
+        raise SetupError(
+            "prebuilt binaries are not runnable on this host (incompatible glibc?)"
+        )
     return True
 
 
@@ -448,9 +496,9 @@ def install_ctags(log) -> bool:
     enrichment requirement). An old Exuberant ctags on PATH is not enough —
     we install our own into the managed bin dir, which wins discovery order.
     """
-    if existing := find_ctags():
-        from . import enrich  # function-local: enrich imports this module
+    from . import enrich  # function-local: enrich imports this module
 
+    if existing := find_ctags():
         usable, detail = enrich.probe_binary(existing)
         if usable:
             log(f"  ctags already available (Universal +json): {existing}")
@@ -502,6 +550,15 @@ def install_ctags(log) -> bool:
         target = managed_bin() / "ctags"
         shutil.copy2(binaries[0], target)
         target.chmod(0o755)
+    enrich.reset_cache()  # the managed path may carry a stale probe result
+    usable, detail = enrich.probe_binary(str(target))
+    if not usable:
+        target.unlink(missing_ok=True)
+        log(
+            f"  downloaded ctags does not work on this host ({detail}); "
+            "removed it — metadata enrichment will be unavailable"
+        )
+        return False
     log(f"  installed {target}")
     return True
 
@@ -625,6 +682,13 @@ def run_setup(with_ctags: bool = True, force: bool = False, log=print) -> int:
             "and reinstalling ..."
         )
         shutil.rmtree(managed_home(), ignore_errors=True)
+    elif (managed_bin() / "global").is_file() and managed_version is None:
+        log(
+            f"* Managed GNU Global in {managed_bin()} exists but cannot run "
+            f"(incompatible binaries?) — removing {managed_home()} "
+            "and reinstalling ..."
+        )
+        shutil.rmtree(managed_home(), ignore_errors=True)
 
     existing = find_global()
     if existing and not force and not Path(existing).is_relative_to(managed_home()):
@@ -678,6 +742,8 @@ def doctor_report(project_root: Path | None = None) -> str:
                 [exe, "--version"], capture_output=True, text=True, timeout=15
             )
             first = (proc.stdout or proc.stderr).splitlines()[0].strip()
+            if "GLIBC_" in first:
+                first += " — run 'mcp-gtags-server setup --force' to rebuild from source"
             return f"{exe}  ({first})"
         except (OSError, subprocess.TimeoutExpired, IndexError):
             return f"{exe}  (version check failed)"

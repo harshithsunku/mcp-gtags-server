@@ -227,6 +227,236 @@ def test_install_ctags_replaces_exuberant(monkeypatch):
     assert any("cannot emit JSON output" in line for line in logs)
 
 
+# ---------------------------------------------------------------------------
+# v1.4.2: prebuilt binaries must actually run on the host (glibc compat)
+# ---------------------------------------------------------------------------
+
+
+def _failing_exe(directory: Path, name: str, stderr: str) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    exe = directory / name
+    exe.write_text(f'#!/bin/sh\necho "{stderr}" >&2\nexit 1\n')
+    exe.chmod(exe.stat().st_mode | stat.S_IXUSR)
+    return exe
+
+
+def test_host_glibc_detection(monkeypatch):
+    monkeypatch.setattr(toolchain.sys, "platform", "linux")
+    monkeypatch.setattr(toolchain.os, "confstr", lambda name: "glibc 2.28")
+    assert toolchain._host_glibc() == (2, 28)
+
+    # confstr unavailable: fall back to platform.libc_ver().
+    def confstr_raises(name):
+        raise ValueError(name)
+
+    monkeypatch.setattr(toolchain.os, "confstr", confstr_raises)
+    monkeypatch.setattr(toolchain.platform, "libc_ver", lambda: ("glibc", "2.17"))
+    assert toolchain._host_glibc() == (2, 17)
+
+    # musl / unknown libc: no version to compare, caller relies on the probe.
+    monkeypatch.setattr(toolchain.platform, "libc_ver", lambda: ("", ""))
+    assert toolchain._host_glibc() is None
+
+    monkeypatch.setattr(toolchain.sys, "platform", "darwin")
+    assert toolchain._host_glibc() is None
+
+
+def test_prebuilt_skipped_on_old_glibc(monkeypatch):
+    monkeypatch.setattr(toolchain, "_platform_tag", lambda: "linux-x86_64")
+    monkeypatch.setattr(toolchain, "_host_glibc", lambda: (2, 17))
+
+    def no_network(*args, **kwargs):
+        raise AssertionError("must not download prebuilts on an old-glibc host")
+
+    monkeypatch.setattr(toolchain.urllib.request, "urlopen", no_network)
+    logs = []
+    assert toolchain.install_global_prebuilt(logs.append) is False
+    assert any("glibc 2.17" in line for line in logs)
+
+
+def test_verify_managed_global(tmp_path):
+    _fake_exe(toolchain.managed_bin(), "global")
+    _fake_exe(toolchain.managed_bin(), "gtags")
+    logs = []
+    assert toolchain._verify_managed_global(logs.append) is True
+
+    _failing_exe(
+        toolchain.managed_bin(), "global", "global: version GLIBC_2.34 not found"
+    )
+    assert toolchain._verify_managed_global(logs.append) is False
+    assert any("GLIBC_2.34" in line for line in logs)
+
+
+def _prebuilt_release_tarball(tmp_path: Path) -> tuple[Path, str]:
+    """A real release-shaped tarball whose binaries fail to execute."""
+    import tarfile
+
+    stage = tmp_path / f"global-{toolchain.GLOBAL_VERSION}-linux-x86_64"
+    _failing_exe(stage / "bin", "global", "version GLIBC_2.34 not found")
+    _failing_exe(stage / "bin", "gtags", "version GLIBC_2.34 not found")
+    tarball = tmp_path / f"{stage.name}.tar.gz"
+    with tarfile.open(tarball, "w:gz") as tar:
+        tar.add(stage, arcname=stage.name)
+    return tarball, hashlib.sha256(tarball.read_bytes()).hexdigest()
+
+
+def test_prebuilt_probe_failure_raises(tmp_path, monkeypatch):
+    tarball, sha = _prebuilt_release_tarball(tmp_path)
+    monkeypatch.setattr(toolchain, "_platform_tag", lambda: "linux-x86_64")
+    monkeypatch.setattr(toolchain, "_host_glibc", lambda: None)
+
+    def fake_download(url, dest, expected_sha256=None):
+        if url.endswith("checksums.txt"):
+            dest.write_text(f"{sha}  {tarball.name}\n")
+        else:
+            assert expected_sha256 == sha
+            shutil.copy2(tarball, dest)
+
+    monkeypatch.setattr(toolchain, "_download", fake_download)
+    logs = []
+    with pytest.raises(toolchain.SetupError, match="not runnable"):
+        toolchain.install_global_prebuilt(logs.append)
+    assert any("does not run on this host" in line for line in logs)
+
+
+def test_run_setup_falls_back_to_source_on_probe_failure(monkeypatch):
+    sentinel = toolchain.managed_home() / "half-installed"
+
+    def broken_prebuilt(log):
+        sentinel.parent.mkdir(parents=True, exist_ok=True)
+        sentinel.write_text("partial")
+        raise toolchain.SetupError("prebuilt binaries are not runnable on this host")
+
+    source_calls = []
+
+    def fake_source_build(log):
+        source_calls.append(True)
+        _fake_exe(toolchain.managed_bin(), "global")
+        _fake_exe(toolchain.managed_bin(), "gtags")
+
+    monkeypatch.setattr(toolchain.shutil, "which", lambda name: None)
+    monkeypatch.setattr(toolchain, "install_global_prebuilt", broken_prebuilt)
+    monkeypatch.setattr(toolchain, "install_global_from_source", fake_source_build)
+    monkeypatch.setattr(toolchain, "install_ctags", lambda log: True)
+    monkeypatch.setattr(toolchain, "install_pygments", lambda log: True)
+    monkeypatch.setattr(toolchain, "write_relocated_conf", lambda log: None)
+    monkeypatch.setattr(toolchain, "doctor_report", lambda: "ok")
+
+    logs = []
+    assert toolchain.run_setup(log=logs.append) == 0
+    assert source_calls, "expected fallback to the source build"
+    assert not sentinel.exists(), "managed home must be wiped before the fallback"
+    assert any("falling back to source build" in line for line in logs)
+
+
+def test_run_setup_self_heals_broken_managed_install(monkeypatch):
+    """A managed `global` that cannot run (old glibc) must be wiped, not trusted."""
+    _failing_exe(
+        toolchain.managed_bin(), "global", "global: version GLIBC_2.34 not found"
+    )
+
+    def fake_prebuilt(log):
+        _fake_exe(toolchain.managed_bin(), "global")
+        _fake_exe(toolchain.managed_bin(), "gtags")
+        return True
+
+    monkeypatch.setattr(toolchain.shutil, "which", lambda name: None)
+    monkeypatch.setattr(toolchain, "install_global_prebuilt", fake_prebuilt)
+    monkeypatch.setattr(toolchain, "install_ctags", lambda log: True)
+    monkeypatch.setattr(toolchain, "install_pygments", lambda log: True)
+    monkeypatch.setattr(toolchain, "write_relocated_conf", lambda log: None)
+    monkeypatch.setattr(toolchain, "doctor_report", lambda: "ok")
+
+    logs = []
+    assert toolchain.run_setup(log=logs.append) == 0
+    assert any("cannot run" in line for line in logs)
+    # The reinstalled binary works again.
+    ok, _ = toolchain._try_run([str(toolchain.managed_bin() / "global"), "--version"])
+    assert ok
+
+
+def _ctags_release_tarball(tmp_path: Path) -> Path:
+    import tarfile
+
+    stage = tmp_path / "uctags-2026.01.01-linux-x86_64"
+    _fake_exe(stage / "bin", "ctags")
+    tarball = tmp_path / f"{stage.name}.release.tar.gz"
+    with tarfile.open(tarball, "w:gz") as tar:
+        tar.add(stage, arcname=stage.name)
+    return tarball
+
+
+def _ctags_nightly_env(monkeypatch, tmp_path):
+    """Fake the nightly-release API + download for install_ctags."""
+    import io
+    import json as jsonlib
+
+    tarball = _ctags_release_tarball(tmp_path)
+    release = {
+        "assets": [
+            {
+                "name": tarball.name,
+                "browser_download_url": "https://example.invalid/ctags.tar.gz",
+            }
+        ]
+    }
+
+    class FakeResponse(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(toolchain.sys, "platform", "linux")
+    monkeypatch.setattr(toolchain.platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(toolchain, "find_ctags", lambda *a, **k: None)
+    monkeypatch.setattr(
+        toolchain.urllib.request,
+        "urlopen",
+        lambda *a, **k: FakeResponse(jsonlib.dumps(release).encode()),
+    )
+    monkeypatch.setattr(
+        toolchain,
+        "_download",
+        lambda url, dest, expected_sha256=None: shutil.copy2(tarball, dest),
+    )
+
+
+def test_install_ctags_removes_broken_download(tmp_path, monkeypatch):
+    from gtags_mcp import enrich
+
+    _ctags_nightly_env(monkeypatch, tmp_path)
+    enrich.reset_cache()
+    monkeypatch.setattr(enrich, "probe_binary", lambda exe: (False, "did not run"))
+    logs = []
+    assert toolchain.install_ctags(logs.append) is False
+    assert not (toolchain.managed_bin() / "ctags").exists()
+    assert any("does not work on this host" in line for line in logs)
+
+
+def test_install_ctags_keeps_working_download(tmp_path, monkeypatch):
+    from gtags_mcp import enrich
+
+    _ctags_nightly_env(monkeypatch, tmp_path)
+    enrich.reset_cache()
+    monkeypatch.setattr(
+        enrich, "probe_binary", lambda exe: (True, "Universal Ctags 6.x")
+    )
+    logs = []
+    assert toolchain.install_ctags(logs.append) is True
+    assert (toolchain.managed_bin() / "ctags").is_file()
+
+
+def test_doctor_report_hints_on_glibc_error(tmp_path, monkeypatch):
+    _failing_exe(
+        toolchain.managed_bin(), "global", "global: version GLIBC_2.34 not found"
+    )
+    monkeypatch.setattr(toolchain.shutil, "which", lambda name: None)
+    report = toolchain.doctor_report()
+    assert "setup --force" in report
+
+
 def test_write_relocated_conf_fixes_pygments_shebang(tmp_path):
     """The shipped parser script's `env python` shebang must become python3."""
     share = toolchain.managed_home() / "share" / "gtags"

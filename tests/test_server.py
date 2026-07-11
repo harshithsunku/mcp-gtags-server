@@ -248,6 +248,26 @@ def test_failed_full_build_leaves_no_partial_index(c_project, monkeypatch):
     assert "util.c" in recovered
 
 
+def test_loader_hint():
+    hint = server._loader_hint("global: /lib64/libc.so.6: version `GLIBC_2.34' not found")
+    assert "setup --force" in hint
+    assert server._loader_hint("GTAGS not found") == ""
+
+
+def test_glibc_failure_gets_remediation_hint(c_project, monkeypatch):
+    """A toolchain binary rejected by an old glibc must surface a fix hint,
+    not just the raw loader error (the RHEL 8 scenario)."""
+    loader_error = "gtags: /lib64/libc.so.6: version `GLIBC_2.34' not found"
+
+    def glibc_broken_run(args, cwd, timeout=server.QUERY_TIMEOUT_SECONDS, **kwargs):
+        return "", loader_error, 1
+
+    monkeypatch.setattr(server, "_run", glibc_broken_run)
+    result = server.find_definition("add_numbers", str(c_project))
+    assert "GLIBC_2.34" in result
+    assert "setup --force" in result
+
+
 @requires_global
 def test_corrupted_index_auto_recovers(c_project):
     """A corrupt database (interrupted build, crashed process) is wiped,
