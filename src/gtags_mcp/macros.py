@@ -186,6 +186,24 @@ def exported_via(symbol: str, sources: Iterable[str]) -> str | None:
     return None
 
 
+def export_sites(symbol: str, cxrefs: Iterable[Cxref]) -> list[tuple[str, int, str]]:
+    """Every EXPORT_SYMBOL* site of `symbol` among its occurrence cxrefs.
+
+    Returns (path, line, variant) tuples, deduplicated by path, source order
+    kept. EXPORT_SYMBOL* always sits in the .c file that defines the symbol,
+    so these paths are ground truth for where a definition must exist — the
+    signal export recovery uses when the parser missed one.
+    """
+    sites: list[tuple[str, int, str]] = []
+    seen: set[str] = set()
+    for _, lineno, path, source in cxrefs:
+        match = _EXPORT_RE.search(source)
+        if match and match.group("name") == symbol and path not in seen:
+            seen.add(path)
+            sites.append((path, lineno, match.group(0)))
+    return sites
+
+
 def resolve(
     symbol: str, query: Query, direct_empty: bool = True
 ) -> tuple[list[Cxref], str | None]:

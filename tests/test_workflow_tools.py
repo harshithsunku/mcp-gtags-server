@@ -1,6 +1,7 @@
 """reachability and blast_radius: agent workflow tools over the caller graph."""
 
 import json
+import os
 import subprocess
 import textwrap
 
@@ -23,6 +24,8 @@ def _drain_refresh_state():
     server._update_cost.clear()
     server._refresh_errors.clear()
     server._refresh_threads.clear()
+    server._index_generation.clear()
+    server._reset_fx_cache()
 
 
 @pytest.fixture(autouse=True)
@@ -291,3 +294,69 @@ def test_blast_radius_text_format(git_project):
     text = server.blast_radius(project_root=str(git_project), format="text")
     assert "[changed] leaf" in text
     assert "[d=1] middle" in text and "via leaf" in text
+
+
+# ---------------------------------------------------------------------------
+# Per-file `-fx` definition cache (keyed by index generation)
+# ---------------------------------------------------------------------------
+
+
+def _count_fx_runs(monkeypatch):
+    """Wrap server._run to count `global -fx` subprocess invocations."""
+    counts = {"fx": 0}
+    real_run = server._run
+
+    def counting_run(args, cwd, timeout=server.QUERY_TIMEOUT_SECONDS, **kwargs):
+        if args[0] == "global" and "-fx" in args:
+            counts["fx"] += 1
+        return real_run(args, cwd, timeout, **kwargs)
+
+    monkeypatch.setattr(server, "_run", counting_run)
+    return counts
+
+
+def test_fx_cache_one_run_per_file_per_generation(chain_project, monkeypatch):
+    root = str(chain_project)
+    server.find_definition("leaf", root)  # builds the index (generation 1)
+    counts = _count_fx_runs(monkeypatch)
+
+    server.reachability("main", "leaf", project_root=root)
+    # The BFS visits several nodes, all referenced in chain.c — one -fx run.
+    assert counts["fx"] == 1
+    server.reachability("main", "leaf", project_root=root)
+    server.find_callers("leaf", root)
+    server.find_callers("middle", root)
+    assert counts["fx"] == 1  # every later walk is served from the cache
+
+
+def test_fx_cache_invalidated_by_update_index(chain_project, monkeypatch):
+    root = str(chain_project)
+    json.loads(server.find_callers("leaf", root))  # build + populate cache
+    counts = _count_fx_runs(monkeypatch)
+    before = json.loads(server.find_callers("leaf", root))
+    assert counts["fx"] == 0  # cache hit
+    assert all(r["caller"] != "newcomer" for r in before["results"])
+
+    source = (chain_project / "chain.c").read_text()
+    (chain_project / "chain.c").write_text(
+        source + "\nint newcomer(int x)\n{\n    return leaf(x);\n}\n"
+    )
+    # Nudge mtime past the index build's second so `gtags -i` sees the edit.
+    stat = (chain_project / "chain.c").stat()
+    os.utime(chain_project / "chain.c", (stat.st_atime + 2, stat.st_mtime + 2))
+    server.update_index(root)  # synchronous refresh bumps the generation
+
+    after = json.loads(server.find_callers("leaf", root))
+    assert counts["fx"] >= 1  # re-queried under the new generation
+    assert any(r["caller"] == "newcomer" for r in after["results"])
+
+
+def test_index_generation_bumps_on_every_refresh_path(chain_project):
+    root = chain_project.resolve()
+    assert server._current_generation(root) == 0
+    server.find_definition("leaf", str(chain_project))  # initial build
+    assert server._current_generation(root) == 1
+    server.update_index(str(chain_project), full=True)
+    assert server._current_generation(root) == 2
+    server.update_index(str(chain_project))  # synchronous incremental
+    assert server._current_generation(root) == 3

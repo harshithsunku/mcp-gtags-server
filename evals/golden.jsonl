@@ -12,12 +12,12 @@
 {"id": "def-tcp_v4_rcv", "category": "definition", "tool": "find_definition", "args": {"symbol": "tcp_v4_rcv"}, "expect": {"paths": ["net/ipv4/tcp_ipv4.c"], "top_path": ["net/ipv4/tcp_ipv4.c"]}}
 {"id": "def-ext4_map_blocks", "category": "definition", "tool": "find_definition", "args": {"symbol": "ext4_map_blocks"}, "expect": {"paths": ["fs/ext4/inode.c"]}}
 {"id": "def-kernel_clone", "category": "definition", "tool": "find_definition", "args": {"symbol": "kernel_clone"}, "expect": {"paths": ["kernel/fork.c"], "top_path": ["kernel/fork.c"]}}
-# def-mutex_lock is a deliberate KNOWN-FAIL: GNU Global's C parser derails on the
-# sparse annotation in "static void __sched __mutex_lock_slowpath(...) __acquires(lock);"
-# and misses the real mutex_lock definition at kernel/locking/mutex.c:314 entirely
-# (the CONFIG_DEBUG_LOCK_ALLOC macro and PREEMPT_RT variants are still found).
-# Tracked honestly instead of hidden — see docs/capability.md.
-{"id": "def-mutex_lock", "category": "definition", "tool": "find_definition", "args": {"symbol": "mutex_lock"}, "expect": {"paths": ["kernel/locking/mutex.c"]}}
+# def-mutex_lock exercises ctags export recovery (v1.4.0): GNU Global's C parser
+# derails on the sparse annotation in "static void __sched __mutex_lock_slowpath(...)
+# __acquires(lock);" and misses the real definition at kernel/locking/mutex.c:314 —
+# the server recovers it from the EXPORT_SYMBOL(mutex_lock) site via ctags and ranks
+# it first. This case was a deliberate known-fail from v1.0.0 to v1.3.1.
+{"id": "def-mutex_lock", "category": "definition", "tool": "find_definition", "args": {"symbol": "mutex_lock"}, "expect": {"paths": ["kernel/locking/mutex.c"], "top_path": ["kernel/locking/mutex.c"], "resolved_via": "ctags:EXPORT_SYMBOL"}}
 {"id": "def-skb_clone", "category": "definition", "tool": "find_definition", "args": {"symbol": "skb_clone"}, "expect": {"paths": ["net/core/skbuff.c"], "top_path": ["net/core/skbuff.c"]}}
 {"id": "def-do_dentry_open", "category": "definition", "tool": "find_definition", "args": {"symbol": "do_dentry_open"}, "expect": {"paths": ["fs/open.c"], "top_path": ["fs/open.c"]}}
 {"id": "def-wait_event", "category": "definition", "tool": "find_definition", "args": {"symbol": "wait_event"}, "expect": {"paths": ["include/linux/wait.h"]}}

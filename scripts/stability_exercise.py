@@ -92,11 +92,24 @@ def _matrix(root: str) -> list[Case]:
     def has_suggestions(data):
         return None if data.get("suggestions") else "expected suggestions on the miss"
 
+    def recovered_from_export(data):
+        paths = [r["path"] for r in data["results"]]
+        if "kernel/locking/mutex.c" not in paths:
+            return f"expected recovered kernel/locking/mutex.c, got {paths[:3]}"
+        if not str(data.get("resolved_via", "")).startswith("ctags:"):
+            return f"expected ctags resolved_via, got {data.get('resolved_via')!r}"
+        return None
+
     return [
-        # find_definition: plain, multi-def guarded, macro-generated, miss.
+        # find_definition: plain, multi-def guarded, macro-generated,
+        # parser-missed (ctags export recovery), miss.
         Case("def-plain", "find_definition", {"symbol": "vfs_read"}),
         Case("def-guarded-kmap", "find_definition", {"symbol": "kmap"}, min_results=2),
         Case("def-macro-sys_read", "find_definition", {"symbol": "sys_read"}),
+        Case(
+            "def-recovered-mutex_lock", "find_definition", {"symbol": "mutex_lock"},
+            extra_check=recovered_from_export,
+        ),
         Case("def-struct", "find_definition", {"symbol": "task_struct"}),
         Case(
             "def-miss-suggestions", "find_definition", {"symbol": "tcp_v4_r"},

@@ -289,6 +289,37 @@ def test_lru_evicts_oldest_entry(ctags_stub, tmp_path, monkeypatch):
     assert ctags_stub["runs"] == 4
 
 
+def test_definition_tag_rejects_declaration_kinds():
+    tags = {
+        "foo_lock": [
+            {"line": 3, "kind": "prototype", "typeref": None, "scope": None, "signature": "()"},
+            {"line": 50, "kind": "function", "typeref": "void", "scope": None, "signature": "()"},
+            {"line": 8, "kind": "externvar", "typeref": None, "scope": None, "signature": None},
+        ]
+    }
+    assert enrich.definition_tag(tags, "foo_lock")["line"] == 50
+
+    declarations_only = {
+        "foo_lock": [
+            {"line": 3, "kind": "prototype", "typeref": None, "scope": None, "signature": "()"},
+        ]
+    }
+    assert enrich.definition_tag(declarations_only, "foo_lock") is None
+    assert enrich.definition_tag({}, "foo_lock") is None
+
+
+def test_definition_tag_kind_priority_then_line():
+    tags = {
+        "thing": [
+            {"line": 9, "kind": "variable", "typeref": None, "scope": None, "signature": None},
+            {"line": 20, "kind": "function", "typeref": None, "scope": None, "signature": "()"},
+            {"line": 4, "kind": "function", "typeref": None, "scope": None, "signature": "()"},
+        ]
+    }
+    # function outranks variable; earliest function line wins the tie.
+    assert enrich.definition_tag(tags, "thing")["line"] == 4
+
+
 # ---------------------------------------------------------------------------
 # Real ctags end-to-end (skips without Universal Ctags +json)
 # ---------------------------------------------------------------------------

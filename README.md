@@ -25,7 +25,7 @@ Every AI coding agent — Claude Code, Cursor, Codex, you name it — answers *"
 
 - **~100× faster per query** — milliseconds instead of seconds, at any codebase size
 - **Radically less noise** — the definition, not 7,873 lines of matches
-- **Speaks kernel** — `#ifdef` guard stacks with `.config` filtering, and macro-generated symbols (`sys_read` → its `SYSCALL_DEFINE3` site) that no other tagging tool resolves
+- **Speaks kernel** — `#ifdef` guard stacks with `.config` filtering, macro-generated symbols (`sys_read` → its `SYSCALL_DEFINE3` site) that no other tagging tool resolves, and definitions the parser misses recovered from their `EXPORT_SYMBOL` site via ctags
 - **Zero index management** — first query builds the index, every query auto-refreshes it
 - **Correctness measured in CI** — a 65-case golden eval covering all 11 tools against a pinned kernel: 100% recall, 100% precision@1 ([docs/capability.md](docs/capability.md))
 - **Works everywhere MCP does** — Claude Code, Claude Desktop, Cursor, any MCP client
@@ -42,6 +42,7 @@ Measured on a full Linux kernel checkout — **65,163 C/C++ files, 37.1 million 
 | Show me `tcp_v4_rcv`'s implementation | *read a 3,500-line file* | **`get_symbol_body`** | **exactly the 271-line function** |
 | Who calls `ext4_mark_inode_dirty`? | 245 raw match lines | **`find_callers`** | **62 deduped caller functions, with counts** |
 | Where is `sys_read` *really* defined? | *no answer — the name is macro-generated* | **0.03 s** | `fs/read_write.c SYSCALL_DEFINE3(read, ...)`, flagged `resolved_via` |
+| Where is `mutex_lock` defined? | 24,774 noisy match lines | **0.2 s** | `kernel/locking/mutex.c:314` — recovered via `EXPORT_SYMBOL` + ctags after gtags' parser derails on it |
 | Does `ksys_read` ever reach `rw_verify_area`? | *N rounds of grep + reading* | **0.6 s** | the shortest call chain, with every call site's file:line |
 | What does my uncommitted diff impact? | *not answerable* | **0.1 s** | `blast_radius`: changed functions + callers, ranked by distance |
 
@@ -53,7 +54,7 @@ One-time index build: **66 s** for the whole kernel. Incremental refresh after e
 
 The speed is nice. The real win is **precision**: an agent that gets 5 exact lines instead of 7,873 noisy ones keeps its context window for actual reasoning.
 
-And the answers are *measured*, not assumed: CI runs a [65-case golden eval](evals/golden.jsonl) against pinned kernel v6.16 on every push — currently **100% recall, 100% precision@1** across definitions, macro resolution, references, callers, callees, definition bodies, `#ifdef` guards, and reachability, covering all 11 tools. The full methodology, numbers, and honest limitations live in [docs/capability.md](docs/capability.md).
+And the answers are *measured*, not assumed: CI runs a [65-case golden eval](evals/golden.jsonl) against pinned kernel v6.16 on every push — currently **100% recall, 100% precision@1** across definitions, macro resolution, export recovery, references, callers, callees, definition bodies, `#ifdef` guards, and reachability, covering all 11 tools. The full methodology, numbers, and honest limitations live in [docs/capability.md](docs/capability.md).
 
 ## Quick start (60 seconds)
 

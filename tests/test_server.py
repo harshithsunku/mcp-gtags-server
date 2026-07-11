@@ -29,6 +29,8 @@ def _drain_refresh_state():
     server._update_cost.clear()
     server._refresh_errors.clear()
     server._refresh_threads.clear()
+    server._index_generation.clear()
+    server._reset_fx_cache()
 
 
 @pytest.fixture(autouse=True)
@@ -1304,6 +1306,101 @@ def test_update_index_full_failure_keeps_envelope_and_recovers(c_project, monkey
     monkeypatch.undo()
     # The failed rebuild must not strand state: the next query rebuilds.
     assert "util.c" in server.find_definition("add_numbers", root)
+
+
+# ---------------------------------------------------------------------------
+# ctags export recovery: definitions the index parser missed
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def export_gap_project(tmp_path):
+    """Reproduces the GNU Global parser derail: the sparse-annotated forward
+    declaration makes gtags miss foo_lock's real definition entirely; the
+    EXPORT_SYMBOL line is the recovery signal."""
+    (tmp_path / "foo.c").write_text(
+        textwrap.dedent(
+            """\
+            struct foo { int held; };
+
+            static void __sched __foo_lock_slowpath(struct foo *lock) __acquires(lock);
+
+            void __sched foo_lock(struct foo *lock)
+            {
+                lock->held = 1;
+            }
+            EXPORT_SYMBOL(foo_lock);
+            """
+        )
+    )
+    (tmp_path / "user.c").write_text(
+        "struct foo;\nvoid use_it(struct foo *f)\n{\n    foo_lock(f);\n}\n"
+    )
+    return tmp_path
+
+
+def _skip_if_parser_fixed(data):
+    if data["results"] and "resolved_via" not in data:
+        pytest.skip("GNU Global's parser no longer derails on this fixture")
+
+
+@requires_global
+@requires_ctags_json
+def test_export_recovery_finds_parser_missed_definition(export_gap_project):
+    root = str(export_gap_project)
+    data = json.loads(server.find_definition("foo_lock", root))
+    _skip_if_parser_fixed(data)
+    assert data["resolved_via"] == "ctags:EXPORT_SYMBOL"
+    top = data["results"][0]
+    assert top["path"] == "foo.c" and top["line"] == 5
+    assert top["kind"] == "function"  # enriched from the same (cached) ctags run
+    assert "foo_lock(struct foo *lock)" in top["snippet"]
+
+    text = server.find_definition("foo_lock", root, format="text")
+    assert "recovered via ctags:EXPORT_SYMBOL" in text
+
+
+@requires_global
+@requires_ctags_json
+def test_symbol_info_includes_recovered_definition(export_gap_project):
+    root = str(export_gap_project)
+    card = json.loads(server.symbol_info("foo_lock", root))["results"]
+    if card["definitions"] and not card["resolved_via"]:
+        pytest.skip("GNU Global's parser no longer derails on this fixture")
+    assert card["resolved_via"] == "ctags:EXPORT_SYMBOL"
+    assert card["exported"] == "EXPORT_SYMBOL"
+    assert card["definition_count"] >= 1
+    assert card["definitions"][0]["path"] == "foo.c"
+
+
+@requires_global
+@requires_ctags_json
+def test_get_symbol_body_and_callees_read_recovered_definition(export_gap_project):
+    root = str(export_gap_project)
+    data = json.loads(server.get_symbol_body("foo_lock", root))
+    _skip_if_parser_fixed(data)
+    assert data["resolved_via"] == "ctags:EXPORT_SYMBOL"
+    assert "lock->held = 1;" in data["results"][0]["body"]
+    text = server.get_symbol_body("foo_lock", root, format="text")
+    assert "(resolved via ctags:EXPORT_SYMBOL)" in text
+
+    callees = json.loads(server.find_callees("foo_lock", root))
+    assert callees["resolved_via"] == "ctags:EXPORT_SYMBOL"
+    assert callees["definition"] == {"path": "foo.c", "line": 5}
+
+
+@requires_global
+@requires_ctags_json
+def test_export_recovery_respects_enrich_optout(export_gap_project, monkeypatch):
+    monkeypatch.setattr(server, "_no_enrich", True)
+    data = json.loads(server.find_definition("foo_lock", str(export_gap_project)))
+    assert "resolved_via" not in data
+
+
+@requires_global
+def test_export_recovery_inert_on_plain_projects(c_project):
+    data = json.loads(server.find_definition("add_numbers", str(c_project)))
+    assert "resolved_via" not in data
 
 
 # ---------------------------------------------------------------------------

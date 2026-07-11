@@ -117,14 +117,18 @@ Trust through measurable quality — reported on its own terms.
 **Done when:** an eval command prints a score in CI, and the capability writeup is live.
 ✅ `mcp-gtags-server eval --golden evals/golden.jsonl --root <kernel>` runs 65
 path-level cases covering all 11 tools in ~14s — 100% recall and 100% precision@1
-in CI on pinned v6.16; 98.5% recall on a 2026 master snapshot, where the one
-deliberate known-fail (a GNU Global parser gap triggered by the new `__acquires()`
-annotations) keeps the number honest. CI (`eval.yml`) clones the pinned kernel tag
-weekly and on main pushes and publishes the score in the job summary. A second
-operational layer, `scripts/stability_exercise.py`, measures per-tool latency and
-response size against the kernel (27-call matrix, zero anomalies — table in the
-writeup). The writeup lives at [docs/capability.md](docs/capability.md); posting
-it to the blog/HN is the Reach item below.
+on pinned v6.16 AND on a 2026 master snapshot. The one long-standing known-fail
+(a GNU Global parser gap triggered by the new `__acquires()` annotations that
+hid `mutex_lock`'s real definition) was closed in v1.4.0 by ctags export
+recovery: definitions the parser misses are restored from their `EXPORT_SYMBOL*`
+site, flagged `resolved_via: "ctags:..."`. v1.4.0 also added a per-file
+definition cache keyed by index generation, dropping warm reachability from
+~0.55s to ~46ms. CI (`eval.yml`) clones the pinned kernel tag weekly and on main
+pushes and publishes the score in the job summary. A second operational layer,
+`scripts/stability_exercise.py`, measures per-tool latency and response size
+against the kernel (28-call matrix, zero anomalies — table in the writeup). The
+writeup lives at [docs/capability.md](docs/capability.md); posting it to the
+blog/HN is the Reach item below.
 
 ---
 

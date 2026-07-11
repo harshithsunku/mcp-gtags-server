@@ -23,6 +23,7 @@ import sys
 import threading
 import time
 import weakref
+from collections import OrderedDict
 from pathlib import Path
 from typing import Literal
 from urllib.parse import unquote, urlparse
@@ -70,6 +71,8 @@ MAX_BODY_LINES = 300
 MAX_GUARDED_DEFS = 50
 # Empty find_definition results carry at most this many prefix suggestions.
 MAX_SUGGESTIONS = 10
+# Export recovery ctags-scans at most this many EXPORT_SYMBOL* files per query.
+MAX_EXPORT_RECOVERY_FILES = 5
 QUERY_TIMEOUT_SECONDS = 120
 INDEX_TIMEOUT_SECONDS = 600
 # Skip the incremental freshness check when the same root was updated this
@@ -88,6 +91,10 @@ _update_cost: dict[Path, float] = {}
 _refresh_lock = threading.Lock()
 _refresh_threads: dict[Path, threading.Thread] = {}
 _refresh_errors: dict[Path, str] = {}
+# Monotonic per-root index generation, bumped whenever a (re)build or refresh
+# finishes; part of the -fx definition-cache key, so cached per-file
+# definition lists die with the index state they were read from.
+_index_generation: dict[Path, int] = {}
 # Parser label forced by --label / GTAGS_MCP_LABEL; None = auto-detect.
 _forced_label: str | None = None
 _auto_label: str | None = None
@@ -475,6 +482,7 @@ def _refresh_in_background(root: Path) -> None:
     with _refresh_lock:
         _last_update[root] = time.monotonic()
         _update_cost[root] = _last_update[root] - started
+        _index_generation[root] = _index_generation.get(root, 0) + 1
         if error:
             _refresh_errors[root] = error
         _refresh_threads.pop(root, None)
@@ -506,6 +514,7 @@ def _ensure_index(root: Path) -> str | None:
                 f"{stderr.strip() or stdout.strip()}"
             )
         _last_update[root] = time.monotonic()
+        _bump_generation(root)
         return None
 
     with _refresh_lock:
@@ -522,6 +531,18 @@ def _ensure_index(root: Path) -> str | None:
             _refresh_threads[root] = thread
             thread.start()
     return None
+
+
+def _bump_generation(root: Path) -> None:
+    """Mark root's index as changed. Never call with _refresh_lock held —
+    the already-locked refresh paths bump the counter inline instead."""
+    with _refresh_lock:
+        _index_generation[root] = _index_generation.get(root, 0) + 1
+
+
+def _current_generation(root: Path) -> int:
+    with _refresh_lock:
+        return _index_generation.get(root, 0)
 
 
 def _pop_refresh_warning(root: Path | None) -> str | None:
@@ -580,6 +601,7 @@ def _raw_global(
                 )
             _last_update[root] = time.monotonic()
             with _refresh_lock:  # surfaced via the envelope's warning field
+                _index_generation[root] = _index_generation.get(root, 0) + 1
                 _refresh_errors[root] = (
                     "Warning: the index database was corrupted and has been "
                     "rebuilt automatically."
@@ -610,6 +632,7 @@ def _query_global(
     guard_records: bool = False,  # #ifdef guard stacks on results
     active_config: str | None = None,  # .config / macro list to filter guards by
     macro_symbol: str | None = None,  # macro-family fallback for this symbol
+    export_symbol: str | None = None,  # ctags export recovery for this symbol
     fallback_flags: list[str] | None = None,  # rerun with these when empty
     suggest_symbol: str | None = None,  # prefix suggestions when still empty
 ) -> str:
@@ -630,7 +653,17 @@ def _query_global(
     if format == "text":
         suffix = "\n(no indexed references — showing symbol usages)" if used_fallback else ""
         suffix += f"\n\n{warning}" if warning else ""
+        recovered_text = ""
+        if export_symbol:
+            paths = {r[2] for line in stdout.splitlines() if (r := _parse_cxref(line))}
+            r_hits, r_via = _export_recovery(export_symbol, project_root, root, paths)
+            if r_hits:
+                recovered_text = "\n".join(
+                    f"{s:<16} {lineno:>4} {path} {src}" for s, lineno, path, src in r_hits
+                ) + f"\n(recovered via {r_via})"
         if not stdout.strip():
+            if recovered_text:
+                return recovered_text + suffix
             if macro_symbol:
                 hits, via = _macro_resolve(macro_symbol, project_root, root, True)
                 if hits:
@@ -642,7 +675,10 @@ def _query_global(
                 if names := _prefix_suggestions(suggest_symbol, project_root):
                     suffix += "\nSimilar defined symbols: " + ", ".join(names)
             return empty_message + suffix
-        return _paginate(stdout.rstrip(), limit, offset) + suffix
+        result = _paginate(stdout.rstrip(), limit, offset)
+        if recovered_text:
+            result += "\n" + recovered_text
+        return result + suffix
     items = [
         output.record(r[0], r[2], r[1], r[3])
         for line in stdout.splitlines()
@@ -663,6 +699,20 @@ def _query_global(
                 rec for rec in resolved if (rec["path"], rec["line"]) not in known
             ] + items
             extra["resolved_via"] = via
+    if export_symbol:
+        r_hits, r_via = _export_recovery(
+            export_symbol, project_root, root, {rec["path"] for rec in items}
+        )
+        if r_hits:
+            known = {(rec["path"], rec["line"]) for rec in items}
+            recovered = [output.record(s, path, lineno, src) for s, lineno, path, src in r_hits]
+            # Parser-missed definitions come FIRST: the EXPORT_SYMBOL-marked
+            # site is the canonical one; indexed same-named records are
+            # variants or shadows.
+            items = [
+                rec for rec in recovered if (rec["path"], rec["line"]) not in known
+            ] + items
+            extra.setdefault("resolved_via", r_via)
     if active_config:
         # Explicit intent must not fail silently: bad specs and disabled
         # guard scanning are errors, not quietly-unfiltered results.
@@ -756,6 +806,78 @@ def _macro_resolve(
     return macros.resolve(
         symbol, lambda flags: _cxrefs(flags, project_root), direct_empty=direct_empty
     )
+
+
+def _export_recovery(
+    symbol: str,
+    project_root: str | None,
+    root: Path | None,
+    def_paths: set[str],
+    refs: list[macros.Cxref] | None = None,
+) -> tuple[list[macros.Cxref], str | None]:
+    """Definitions gtags' parser missed, recovered from EXPORT_SYMBOL* sites.
+
+    EXPORT_SYMBOL*(sym) always sits in the .c file that defines sym; when such
+    a file has NO definition record (GNU Global's parser derailed somewhere
+    above it — sparse annotations are the known trigger), a Universal Ctags
+    scan of that file confirms and locates the real definition. Best-effort,
+    never raises; ([], None) when there is nothing to recover. Callers that
+    already hold the symbol's reference cxrefs pass them via `refs`.
+    """
+    if root is None or not re.fullmatch(r"\w+", symbol):
+        return [], None
+    if not _enrichment_enabled(root) or not enrich.available(_bin_dir):
+        return [], None
+    if refs is None:
+        refs = _cxrefs(["-rx", "--", symbol], project_root)
+    sites = macros.export_sites(symbol, refs)
+    if not sites and not refs:
+        # A fully missed definition demotes every occurrence — including the
+        # EXPORT line — to the symbol-usage database.
+        sites = macros.export_sites(symbol, _cxrefs(["-sx", "--", symbol], project_root))
+    hits: list[macros.Cxref] = []
+    via: str | None = None
+    for path, _, variant in sites[:MAX_EXPORT_RECOVERY_FILES]:
+        if path in def_paths:
+            continue
+        tag = enrich.definition_tag(enrich.tags_for_file(root / path, _bin_dir), symbol)
+        if tag is None:
+            continue
+        try:
+            lines = (root / path).read_text(errors="replace").splitlines()
+            source = lines[tag["line"] - 1] if 0 < tag["line"] <= len(lines) else ""
+        except OSError:
+            source = ""
+        hits.append((symbol, tag["line"], path, source))
+        via = via or f"ctags:{variant}"
+    return hits, via
+
+
+def _resolve_definitions(
+    symbol: str, project_root: str | None
+) -> tuple[list[macros.Cxref], Path | None, str | None, str | None]:
+    """Full definition resolution: `global -x` plus the macro-family fallback
+    and ctags export recovery, resolved/recovered sites first.
+
+    Returns (defs, root, resolved_via, error) — the shared front end for the
+    tools that read or analyze ONE definition (get_symbol_body, find_callees),
+    so macro-generated and parser-missed symbols work there too.
+    """
+    stdout, root, err = _raw_global(["-x", "--", symbol], project_root)
+    if err:
+        return [], root, None, err
+    defs = [r for line in stdout.splitlines() if (r := _parse_cxref(line))]
+    resolved, via = _macro_resolve(symbol, project_root, root, not defs)
+    if resolved:
+        known = {(path, lineno) for _, lineno, path, _ in defs}
+        defs = [h for h in resolved if (h[2], h[1]) not in known] + defs
+    recovered, recovered_via = _export_recovery(
+        symbol, project_root, root, {p for _, _, p, _ in defs}
+    )
+    if recovered:
+        defs = recovered + defs
+        via = via or recovered_via
+    return defs, root, via, None
 
 
 def _maybe_guard(
@@ -881,6 +1003,54 @@ def _extract_body(file: Path, start_line: int) -> list[str]:
     return out
 
 
+# Per-file `global -fx` definition lists, reused across the caller-graph
+# walks: one reachability/blast_radius call runs _callers_of once per BFS
+# node, and different symbols keep being referenced in the same hot files.
+# `-fx` output depends only on index state, so entries are keyed by the
+# index generation (not file mtime) and die when the index refreshes.
+FX_CACHE_CAPACITY = 4096
+_fx_cache: OrderedDict[tuple[str, int, str], list[tuple[int, str]]] = OrderedDict()
+_fx_lock = threading.Lock()
+
+
+def _reset_fx_cache() -> None:
+    """Forget cached per-file definition lists (used by tests)."""
+    with _fx_lock:
+        _fx_cache.clear()
+
+
+def _file_definitions(
+    path: str, project_root: str | None, root: Path
+) -> list[tuple[int, str]]:
+    """Sorted (line, symbol) definitions of one indexed file (`global -fx`).
+
+    Cached per (root, index generation, path); [] on error or a file with no
+    definitions — negative results are cached too. The generation is read
+    BEFORE the query so a refresh completing mid-query stores the (possibly
+    stale) result under the old key, never poisoning the new generation.
+    """
+    generation = _current_generation(root)
+    key = (str(root), generation, path)
+    with _fx_lock:
+        if key in _fx_cache:
+            _fx_cache.move_to_end(key)
+            return _fx_cache[key]
+    defs_out, _, def_err = _raw_global(["-fx", "--", path], project_root)
+    defs: list[tuple[int, str]] = []
+    if defs_out and not def_err:
+        defs = sorted(
+            (d[1], d[0])
+            for line in defs_out.splitlines()
+            if (d := _parse_cxref(line))
+        )
+    with _fx_lock:
+        _fx_cache[key] = defs
+        _fx_cache.move_to_end(key)
+        while len(_fx_cache) > FX_CACHE_CAPACITY:
+            _fx_cache.popitem(last=False)
+    return defs
+
+
 def _callers_of(
     symbol: str, project_root: str | None
 ) -> tuple[dict[tuple[str, str], list[int]] | None, str | None]:
@@ -889,7 +1059,7 @@ def _callers_of(
     Returns ({(caller, path): [ref lines]}, None) — empty dict when there are
     no references — or (None, error message).
     """
-    stdout, _, err = _raw_global(["-rx", "--", symbol], project_root)
+    stdout, root, err = _raw_global(["-rx", "--", symbol], project_root)
     if err:
         return None, err
     refs = [r for line in stdout.splitlines() if (r := _parse_cxref(line))]
@@ -908,14 +1078,7 @@ def _callers_of(
 
     callers: dict[tuple[str, str], list[int]] = {}
     for path, ref_lines in by_file.items():
-        defs_out, _, def_err = _raw_global(["-fx", "--", path], project_root)
-        defs: list[tuple[int, str]] = []
-        if defs_out and not def_err:
-            defs = sorted(
-                (d[1], d[0])
-                for line in defs_out.splitlines()
-                if (d := _parse_cxref(line))
-            )
+        defs = _file_definitions(path, project_root, root)
         for ref_line in sorted(ref_lines):
             enclosing = "(file scope)"
             for def_line, def_sym in defs:
@@ -955,8 +1118,10 @@ def find_definition(
     Macro-generated symbols resolve too: "sys_read", "trace_sched_switch",
     or a DEFINE_SPINLOCK/module_param name returns the generator invocation
     site (SYSCALL_DEFINE3(read, ...)), flagged resolved_via — no build
-    needed. On a miss the envelope carries "suggestions": defined symbols
-    starting with the queried name.
+    needed. Definitions the index parser missed are recovered from their
+    EXPORT_SYMBOL* site via ctags, flagged resolved_via "ctags:...". On a
+    miss the envelope carries "suggestions": defined symbols starting with
+    the queried name.
 
     JSON records: {symbol, path, line, col, kind, typeref, scope, signature,
     guard, snippet} — kind/typeref/scope/signature are ctags metadata when
@@ -984,6 +1149,7 @@ def find_definition(
         guard_records=True,
         active_config=active_config,
         macro_symbol=symbol,
+        export_symbol=symbol,
         suggest_symbol=symbol,
     )
 
@@ -1037,24 +1203,25 @@ def get_symbol_body(
 
     Use this INSTEAD of reading a whole file to see how a function, struct,
     or macro is implemented: it extracts only the definition's lines, so a
-    one-screen function never costs a 5000-line file read. JSON results:
-    {path, line, body} items.
+    one-screen function never costs a 5000-line file read. Macro-generated
+    and parser-missed (EXPORT_SYMBOL-recovered) definitions resolve too,
+    flagged resolved_via. JSON results: {path, line, body} items.
 
     Args:
         symbol: Exact symbol name.
         max_definitions: Return at most this many bodies when the symbol is
             multiply defined (default 3).
     """
-    stdout, root, err = _raw_global(["-x", "--", symbol], project_root)
+    defs, root, resolved_via, err = _resolve_definitions(symbol, project_root)
     if err:
         return output.error("get_symbol_body", err, root) if format == "json" else err
-    refs = [r for line in stdout.splitlines() if (r := _parse_cxref(line))]
-    if not refs:
+    if not defs:
         message = f"No definition found for symbol '{symbol}'."
         if format == "json":
             return output.envelope("get_symbol_body", root, [], message=message)
         return message
-    omitted = max(0, len(refs) - max_definitions)
+    extra = {"resolved_via": resolved_via} if resolved_via else {}
+    omitted = max(0, len(defs) - max_definitions)
     if format == "json":
         items = [
             {
@@ -1062,20 +1229,23 @@ def get_symbol_body(
                 "line": lineno,
                 "body": "\n".join(_extract_body(root / path, lineno)),
             }
-            for _, lineno, path, _ in refs[:max_definitions]
+            for _, lineno, path, _ in defs[:max_definitions]
         ]
         return output.envelope(
             "get_symbol_body",
             root,
             items,
-            total=len(refs),
+            total=len(defs),
             truncated=omitted > 0,
             omitted_definitions=omitted,
+            **extra,
         )
     chunks: list[str] = []
-    for _, lineno, path, _ in refs[:max_definitions]:
+    for _, lineno, path, _ in defs[:max_definitions]:
         body = _extract_body(root / path, lineno)
         chunks.append(f"=== {path}:{lineno} ===\n" + "\n".join(body))
+    if resolved_via:
+        chunks[0] = f"(resolved via {resolved_via})\n" + chunks[0]
     if omitted:
         chunks.append(
             f"... {omitted} more definition(s) not shown; "
@@ -1194,15 +1364,16 @@ def find_callees(
 
     Use this to see a function's dependencies without reading any file:
     call sites are detected in its body and verified against the index.
-    JSON results: {in_tree: [{symbol, path, line}], external: [names]}.
+    Macro-generated and parser-missed (EXPORT_SYMBOL-recovered) definitions
+    resolve too, flagged resolved_via. JSON results:
+    {in_tree: [{symbol, path, line}], external: [names]}.
 
     Args:
         symbol: Exact name of the function to analyze.
     """
-    stdout, root, err = _raw_global(["-x", "--", symbol], project_root)
+    defs, root, resolved_via, err = _resolve_definitions(symbol, project_root)
     if err:
         return output.error("find_callees", err, root) if format == "json" else err
-    defs = [r for line in stdout.splitlines() if (r := _parse_cxref(line))]
     if not defs:
         message = f"No definition found for symbol '{symbol}'."
         if format == "json":
@@ -1239,9 +1410,9 @@ def find_callees(
             external.append(name)
 
     if format == "json":
-        extra = {} if candidates else {
-            "message": f"{symbol} ({path}:{lineno}) makes no detectable calls."
-        }
+        extra: dict = {"resolved_via": resolved_via} if resolved_via else {}
+        if not candidates:
+            extra["message"] = f"{symbol} ({path}:{lineno}) makes no detectable calls."
         return output.envelope(
             "find_callees",
             root,
@@ -1259,7 +1430,8 @@ def find_callees(
         if capped
         else ""
     )
-    sections = [f"Callees of {symbol} ({path}:{lineno}):"]
+    via_note = f" (resolved via {resolved_via})" if resolved_via else ""
+    sections = [f"Callees of {symbol} ({path}:{lineno}){via_note}:"]
     if in_tree:
         sections.append("In-tree (use get_symbol_body to read them):")
         sections.extend(f"  {c['symbol']}  {c['path']}:{c['line']}" for c in in_tree)
@@ -1473,14 +1645,9 @@ def blast_radius(
     # Map each changed range to the definitions whose span intersects it.
     impacted: dict[str, dict] = {}
     for path, ranges in sorted(changed_ranges.items()):
-        defs_out, _, derr = _raw_global(["-fx", "--", path], project_root)
-        if derr or not defs_out or not defs_out.strip():
+        defs = _file_definitions(path, project_root, root)
+        if not defs:
             continue  # deleted, unindexed, or non-source file
-        defs = sorted(
-            (d[1], d[0])
-            for line in defs_out.splitlines()
-            if (d := _parse_cxref(line))
-        )
         for start, end in ranges:
             for i, (def_line, def_sym) in enumerate(defs):
                 next_line = defs[i + 1][0] if i + 1 < len(defs) else float("inf")
@@ -1628,8 +1795,9 @@ def symbol_info(
     scope), under WHICH #ifdef guards each definition lives (guard_variants
     > 1 means the flat list is really a config choice), how widely it's used
     and where, plus the tool to use next. Macro-generated symbols resolve
-    (resolved_via); kernel symbols report their EXPORT_SYMBOL* variant in
-    "exported". JSON results: {definitions, definition_count, guard_variants,
+    (resolved_via); definitions the index parser missed are recovered from
+    their EXPORT_SYMBOL* site via ctags; kernel symbols report their
+    EXPORT_SYMBOL* variant in "exported". JSON results: {definitions, definition_count, guard_variants,
     resolved_via, exported, reference_count, file_count, top_files}.
 
     Args:
@@ -1655,6 +1823,19 @@ def symbol_info(
         else []
     )
     exported = macros.exported_via(symbol, (src for _, _, _, src in refs))
+
+    # Parser-missed definitions recovered from EXPORT_SYMBOL* sites (the refs
+    # are already in hand, so this costs at most one cached ctags scan).
+    recovered, recovered_via = _export_recovery(
+        symbol, project_root, root, {p for _, _, p, _ in defs}, refs=refs
+    )
+    if recovered:
+        defs = recovered + defs
+        resolved_via = resolved_via or recovered_via
+        if not exported and recovered_via:
+            # Recovery is proof of export even when every occurrence sits in
+            # the symbol-usage DB (fully missed definition -> no -rx records).
+            exported = recovered_via.removeprefix("ctags:")
     counts: dict[str, int] = {}
     for _, _, path, _ in refs:
         counts[path] = counts.get(path, 0) + 1
@@ -1841,6 +2022,7 @@ def update_index(
                 error=True,
             )
         _last_update[root] = time.monotonic()
+        _bump_generation(root)
         db_dir = _db_dir(root)
         where = str(db_dir) if db_dir != root else f"{root} (legacy root-level index)"
         label = _gtags_label(root)
@@ -1864,6 +2046,7 @@ def update_index(
     with _refresh_lock:
         _last_update[root] = time.monotonic()
         _update_cost[root] = _last_update[root] - started
+        _index_generation[root] = _index_generation.get(root, 0) + 1
     return _respond(f"Index updated for {root} (synchronous — results are now current).")
 
 
@@ -1998,8 +2181,9 @@ def main() -> None:
         "--no-enrich",
         action="store_true",
         help="Disable ctags metadata enrichment — results keep null "
-        "kind/typeref/scope/signature fields (also: GTAGS_MCP_ENRICH=0, "
-        "or `enrich = false` in .gtags-mcp.toml).",
+        "kind/typeref/scope/signature fields and parser-missed definitions "
+        "are no longer recovered from EXPORT_SYMBOL sites (also: "
+        "GTAGS_MCP_ENRICH=0, or `enrich = false` in .gtags-mcp.toml).",
     )
     parser.add_argument(
         "--no-guards",

@@ -235,3 +235,22 @@ def best_tag(tags: dict[str, list[dict]], name: str, line: int) -> dict | None:
     if len(entries) == 1:
         return entries[0]
     return None
+
+
+# Declaration-shaped kinds: they point AT a definition, they are not one.
+_NON_DEFINITION_KINDS = frozenset({"prototype", "externvar"})
+
+
+def definition_tag(tags: dict[str, list[dict]], name: str) -> dict | None:
+    """The best definition-shaped tag for `name` in a file's tags, or None.
+
+    Prototypes and extern declarations are rejected — export recovery needs
+    the site that actually defines the symbol. Ties break on kind priority,
+    then the earliest line.
+    """
+    entries = [
+        t for t in tags.get(name, []) if t["kind"] not in _NON_DEFINITION_KINDS
+    ]
+    if not entries:
+        return None
+    return min(entries, key=lambda t: (_kind_rank(t["kind"]), t["line"]))

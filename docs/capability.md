@@ -21,15 +21,16 @@ path-level so they hold across kernel versions.
 Current scores:
 
 ```
-local, mid-2026 master snapshot: 64/65 = 98.5% recall, 14/14 = 100.0% precision@1, 14s
-CI, kernel v6.16 (pinned):       published on every push (100.0% on the previous 50-case set)
+local, mid-2026 master snapshot: 65/65 = 100.0% recall, 15/15 = 100.0% precision@1, 14s
+CI, kernel v6.16 (pinned):       published on every push
 ```
 
-The one failure on newer kernels is kept in the set deliberately: recent
-kernels added sparse `__acquires()` annotations to mutex forward
-declarations, and GNU Global's C parser derails on them — the eval caught a
-real upstream parser regression triggered by a new kernel annotation style
-(see "Known limitations").
+One case (`def-mutex_lock`) was a deliberate known-fail from v1.0.0 through
+v1.3.1: recent kernels added sparse `__acquires()` annotations to mutex
+forward declarations, and GNU Global's C parser derails on them, missing the
+real `mutex_lock` definition. v1.4.0 closes it with **ctags export
+recovery** (see "What resolves"), and the case now also asserts the recovery
+mechanism itself.
 
 ## What resolves
 
@@ -67,6 +68,24 @@ server resolves them from the index alone and flags the mechanism:
 Resolution costs 20–75 ms per query on the kernel; a miss costs ~9 ms.
 `symbol_info` also reports which `EXPORT_SYMBOL*` variant exports a symbol.
 
+**Parser-missed definitions recover via their export site** (v1.4.0). When
+GNU Global's parser derails mid-file (sparse annotations like
+`__acquires(lock)` on a forward declaration are the known trigger), real
+definitions below that point vanish from the index. But `EXPORT_SYMBOL*(sym)`
+always sits in the `.c` file that defines `sym` — so when an export site's
+file has no definition record, a (cached) Universal Ctags scan of that file
+confirms and restores the definition, ranked first and flagged
+`resolved_via: "ctags:EXPORT_SYMBOL"`:
+
+| query | gtags alone | with export recovery |
+|---|---|---|
+| `mutex_lock` | 7 records, none the real one | `kernel/locking/mutex.c:314` first, kind `function` |
+
+The recovered definition flows through the whole tool surface —
+`get_symbol_body` reads its real body, `find_callees` analyzes it — and
+costs ~0.25 s once (then cached). Disabled together with enrichment
+(`--no-enrich`).
+
 **Call-graph questions** collapse into single calls:
 
 - `reachability(ksys_read, rw_verify_area)` → the shortest chain, with the
@@ -80,32 +99,36 @@ Resolution costs 20–75 ms per query on the kernel; a miss costs ~9 ms.
 ## Operational profile (measured)
 
 [scripts/stability_exercise.py](../scripts/stability_exercise.py) runs a
-27-call matrix over all 11 tools against a real kernel tree and records
+28-call matrix over all 11 tools against a real kernel tree and records
 latency and response size (`--json` for diffing between runs). Measured on
-the 37M-line mid-2026 snapshot, 8 GB machine, warm index — **27/27 sane,
+the 37M-line mid-2026 snapshot, 8 GB machine, warm index — **28/28 sane,
 zero anomalies**:
 
 | call | warm latency | response size |
 |---|---|---|
-| `find_definition` (indexed hit) | ~2 ms | 0.5–1.7 KB |
-| `find_definition` (macro-generated, e.g. `sys_read`) | ~47 ms | 0.8 KB |
-| `find_references` (`kmalloc`, 2 744 refs, one page) | ~60 ms | 23 KB |
-| `get_symbol_body` (function / struct / macro) | ~2 ms | 0.6–7.5 KB |
-| `find_callers` (typical) | 13–61 ms | 0.5–5 KB |
-| `find_callers` (worst allowed: `schedule`, 610 callers / ~430 files) | ~1.5 s | — |
-| `find_callers` (>500 files: guard refuses gracefully) | ~53 ms | 0.3 KB |
-| `summarize_references` (`kmalloc`, 1 553 files) | ~56 ms | 0.8 KB |
-| `find_callees` | 15–40 ms | 0.9–1.9 KB |
-| `symbol_info` | 5–56 ms | 1.4 KB |
-| `reachability` (3-hop chain found) | ~0.6 s | 0.6 KB |
+| `find_definition` (indexed hit) | 4–45 ms | 0.5–1.7 KB |
+| `find_definition` (macro-generated, e.g. `sys_read`) | ~40 ms | 0.8 KB |
+| `find_definition` (parser-missed, ctags-recovered: `mutex_lock`) | ~0.22 s | 2.6 KB |
+| `find_references` (`kmalloc`, 2 744 refs, one page) | ~52 ms | 23 KB |
+| `get_symbol_body` (function / struct / macro) | 4–120 ms | 0.6–7.5 KB |
+| `find_callers` (typical, `-fx` cache warm) | 2–3 ms | 0.5–5 KB |
+| `find_callers` (>500 files: guard refuses gracefully) | ~54 ms | 0.3 KB |
+| `summarize_references` (`kmalloc`, 1 553 files) | ~52 ms | 0.8 KB |
+| `find_callees` | 17–45 ms | 0.9–1.9 KB |
+| `symbol_info` | 5–48 ms | 1.4 KB |
+| `reachability` (3-hop chain found) | ~46 ms warm (~0.35 s cold) | 0.6 KB |
 | `list_file_symbols` (80-symbol file) | ~4 ms | 27 KB |
 | `blast_radius` (real one-line edit, depth 1) | ~0.1 s | 2.5 KB |
 | `update_index` (synchronous incremental, 37M lines) | 6–10 s | 0.3 KB |
 
-Every response an agent sees stays comfortably under typical MCP client
-timeouts, wide queries are bounded by pagination and breadth guards, and the
-one deliberately slow call (`update_index`) is the explicit freshness barrier
-— background refresh keeps normal queries off that path.
+The caller-graph tools share a per-file definition cache keyed by index
+generation (v1.4.0): a reachability walk that re-visits the same hot files
+went from ~0.55 s to ~46 ms warm, and repeated `find_callers` calls in one
+agent session cost single-digit milliseconds. Every response stays
+comfortably under typical MCP client timeouts, wide queries are bounded by
+pagination and breadth guards, and the one deliberately slow call
+(`update_index`) is the explicit freshness barrier — background refresh
+keeps normal queries off that path.
 
 ## Known limitations (measured, not hidden)
 
@@ -113,14 +136,14 @@ one deliberately slow call (`update_index`) is the explicit freshness barrier
   statically reaches `ext4_file_read_iter` — the route is `f_op->read_iter`.
   `reachability` says so explicitly rather than returning a wrong path; the
   golden set asserts this honest "no" (`reach-fnptr-honesty`).
-- **One upstream parser gap, kept as a failing eval case:** GNU Global's C
-  parser derails on the sparse annotation kernels newer than ~v6.16 put on
-  forward declarations
+- **Upstream parser gaps are recovered, not fixed.** GNU Global's C parser
+  derails on the sparse annotation kernels newer than ~v6.16 put on forward
+  declarations
   (`static void __sched __mutex_lock_slowpath(...) __acquires(lock);`) and
-  misses the real `mutex_lock` definition at `kernel/locking/mutex.c:314`.
-  The `CONFIG_DEBUG_LOCK_ALLOC` macro variant and the `PREEMPT_RT` variant
-  are still found, and older kernels are unaffected (hence 100% in CI on
-  v6.16 vs 98% on a 2026 master snapshot).
+  misses the real `mutex_lock` definition. Since v1.4.0, export recovery
+  restores such definitions from their `EXPORT_SYMBOL*` site via ctags — but
+  a parser-missed definition that is *not* exported (static helpers below
+  the derail point) stays invisible until the upstream parser is fixed.
 - **Prototypes rank alongside definitions.** `find_definition` can return a
   header prototype before the `.c` definition (both are index "definitions");
   the ctags `kind` field distinguishes them.

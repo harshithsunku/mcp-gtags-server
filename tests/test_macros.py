@@ -198,6 +198,21 @@ def test_exported_via():
     )
 
 
+def test_export_sites():
+    cxrefs = [
+        ("phantom_fn", 10, "lib/a.c", "\tret = phantom_fn(a);"),  # plain call
+        ("phantom_fn", 90, "lib/a.c", "EXPORT_SYMBOL(phantom_fn);"),
+        ("phantom_fn", 40, "lib/b.c", "EXPORT_SYMBOL_GPL(phantom_fn);"),
+        ("phantom_fn", 95, "lib/a.c", "EXPORT_SYMBOL(phantom_fn);"),  # dup path
+        ("phantom_fn", 7, "lib/c.c", "EXPORT_SYMBOL(other_fn);"),  # name mismatch
+    ]
+    assert macros.export_sites("phantom_fn", cxrefs) == [
+        ("lib/a.c", 90, "EXPORT_SYMBOL"),
+        ("lib/b.c", 40, "EXPORT_SYMBOL_GPL"),
+    ]
+    assert macros.export_sites("nobody", cxrefs) == []
+
+
 def test_hits_are_deduped_and_capped():
     refs = [
         ("SYSCALL_DEFINE0", n, f"f{n % 3}.c", "SYSCALL_DEFINE0(fork)")

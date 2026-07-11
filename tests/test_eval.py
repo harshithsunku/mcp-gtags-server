@@ -22,6 +22,8 @@ def _drain_refresh_state():
     server._update_cost.clear()
     server._refresh_errors.clear()
     server._refresh_threads.clear()
+    server._index_generation.clear()
+    server._reset_fx_cache()
 
 
 @pytest.fixture(autouse=True)

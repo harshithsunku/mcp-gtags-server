@@ -27,10 +27,13 @@ only ever *added*, never renamed or removed, so agent-side parsers keep
 working. Paths are repo-relative. Errors replace ``results`` with an
 ``error`` string but keep the envelope and ``next_tools``.
 
-Definition-shaped envelopes gain a ``resolved_via`` field (e.g.
-``"macro:SYSCALL_DEFINE"``, ``"fuzzy:vfs_read"``) when some results were
-found through macro-family resolution rather than a literal index match —
-see :mod:`gtags_mcp.macros`.
+Definition-shaped envelopes (find_definition, symbol_info, get_symbol_body,
+find_callees) gain a ``resolved_via`` field when some results were found
+through a resolution tier rather than a literal index match:
+``"macro:SYSCALL_DEFINE"`` / ``"fuzzy:vfs_read"`` for macro-family
+resolution (see :mod:`gtags_mcp.macros`), ``"ctags:EXPORT_SYMBOL"`` for
+definitions the index parser missed, recovered from their EXPORT_SYMBOL*
+site via Universal Ctags.
 """
 
 from __future__ import annotations
