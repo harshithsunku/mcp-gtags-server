@@ -27,7 +27,7 @@ Every AI coding agent — Claude Code, Cursor, Codex, you name it — answers *"
 - **Radically less noise** — the definition, not 7,873 lines of matches
 - **Speaks kernel** — `#ifdef` guard stacks with `.config` filtering, and macro-generated symbols (`sys_read` → its `SYSCALL_DEFINE3` site) that no other tagging tool resolves
 - **Zero index management** — first query builds the index, every query auto-refreshes it
-- **Correctness measured in CI** — a 50-case golden eval against a pinned kernel: 100% recall, 100% precision@1 ([docs/capability.md](docs/capability.md))
+- **Correctness measured in CI** — a 65-case golden eval covering all 11 tools against a pinned kernel: 100% recall, 100% precision@1 ([docs/capability.md](docs/capability.md))
 - **Works everywhere MCP does** — Claude Code, Claude Desktop, Cursor, any MCP client
 
 ## The numbers (real Linux kernel, not a toy)
@@ -53,7 +53,7 @@ One-time index build: **66 s** for the whole kernel. Incremental refresh after e
 
 The speed is nice. The real win is **precision**: an agent that gets 5 exact lines instead of 7,873 noisy ones keeps its context window for actual reasoning.
 
-And the answers are *measured*, not assumed: CI runs a [50-case golden eval](evals/golden.jsonl) against pinned kernel v6.16 on every push — currently **100% recall, 100% precision@1** across definitions, macro resolution, references, callers, `#ifdef` guards, and reachability. The full methodology, numbers, and honest limitations live in [docs/capability.md](docs/capability.md).
+And the answers are *measured*, not assumed: CI runs a [65-case golden eval](evals/golden.jsonl) against pinned kernel v6.16 on every push — currently **100% recall, 100% precision@1** across definitions, macro resolution, references, callers, callees, definition bodies, `#ifdef` guards, and reachability, covering all 11 tools. The full methodology, numbers, and honest limitations live in [docs/capability.md](docs/capability.md).
 
 ## Quick start (60 seconds)
 
@@ -433,7 +433,7 @@ npx @modelcontextprotocol/inspector mcp-gtags-server    # poke at it interactive
 
 Tests build a real C project in a temp dir and exercise auto-indexing, auto-refresh, caller mapping, body extraction, pagination, user-space binary discovery, and config layering end-to-end.
 
-Correctness is also measured, not assumed: `mcp-gtags-server eval --golden evals/golden.jsonl --root <kernel-tree>` runs a 50-case golden set (definitions, macro resolution, references, callers, guards, reachability) against a real kernel and prints recall / precision@1 — CI does this weekly against a pinned tag. See [docs/capability.md](docs/capability.md) for the current numbers.
+Correctness is also measured, not assumed: `mcp-gtags-server eval --golden evals/golden.jsonl --root <kernel-tree>` runs a 65-case golden set covering all 11 tools (definitions, macro resolution, references, callers, callees, bodies, guards, reachability, maintenance) against a real kernel and prints recall / precision@1 — CI does this weekly against a pinned tag. See [docs/capability.md](docs/capability.md) for the current numbers.
 
 Release flow: bump `version` in `pyproject.toml`, tag `vX.Y.Z`, push — CI publishes to PyPI and users pick the update up on their next installer re-run. Prebuilt GNU Global binaries are rebuilt by tagging `global-v<version>`.
 
@@ -445,7 +445,7 @@ awareness (the headline capability for kernel and firmware trees) in v0.9.0,
 then, all shipped in v1.0.0: macro-family symbol resolution (`sys_read` → its
 `SYSCALL_DEFINE3` site), the agent workflow tools (`reachability`,
 `blast_radius`), automatic recovery from corrupted index databases, and the
-correctness eval harness — a 50-case golden set against pinned kernel v6.16
+correctness eval harness — a 65-case golden set against pinned kernel v6.16
 scoring 100% recall / 100% precision@1 in CI, with the measured writeup in
 [docs/capability.md](docs/capability.md). Every technical milestone is done;
 what remains is distribution (MCP registry, directories, the writeup post).

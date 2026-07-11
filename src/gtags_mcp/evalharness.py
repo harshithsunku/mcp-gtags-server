@@ -24,6 +24,12 @@ Supported ``expect`` checks (all optional, all must hold for a pass):
 - ``top_path``         — the first result's path is one of these (ranking)
 - ``resolved_via``     — envelope/info field equals this exactly
 - ``callers``          — every listed name appears as a ``caller``
+- ``symbols``          — every listed name appears as a record ``symbol``
+- ``in_tree``          — find_callees: every name among results.in_tree[].symbol
+- ``body_contains``    — get_symbol_body: substring of at least one result body
+- ``status``           — update_index: results.status equals this exactly
+- ``suggestions_contain`` — every name among the envelope ``suggestions``
+- ``fallback``         — envelope ``fallback`` field equals this exactly
 - ``guard_variants_min`` / ``definition_count_min`` — symbol_info fields
 - ``exported``         — symbol_info field equals this exactly
 - ``path_found``       — reachability outcome equals this boolean
@@ -93,6 +99,29 @@ def _check(case: dict, data: dict) -> tuple[list[str], bool | None, bool | None]
     for name in expect.get("callers", []):
         callers = [r.get("caller") for r in records]
         content(name in callers, f"expected caller {name} not found")
+    for name in expect.get("symbols", []):
+        symbols = [r.get("symbol") for r in records]
+        content(name in symbols, f"expected symbol {name} not in results")
+    for name in expect.get("in_tree", []):
+        in_tree = [
+            c.get("symbol") for c in info.get("in_tree", []) if isinstance(c, dict)
+        ]
+        content(name in in_tree, f"expected in-tree callee {name} not found")
+    if (needle := expect.get("body_contains")) is not None:
+        bodies = [r.get("body") or "" for r in records]
+        content(
+            any(needle in body for body in bodies),
+            f"no result body contains {needle!r}",
+        )
+    if (status := expect.get("status")) is not None:
+        got = info.get("status")
+        content(got == status, f"status {got!r} != {status!r}")
+    for name in expect.get("suggestions_contain", []):
+        suggestions = data.get("suggestions") or []
+        content(name in suggestions, f"expected suggestion {name} not offered")
+    if (fallback := expect.get("fallback")) is not None:
+        got = data.get("fallback")
+        content(got == fallback, f"fallback {got!r} != {fallback!r}")
     if (via := expect.get("resolved_via")) is not None:
         got = data.get("resolved_via") or info.get("resolved_via")
         content(got == via, f"resolved_via {got!r} != {via!r}")
@@ -137,10 +166,15 @@ def run(golden: str, root: str | None, threshold: float) -> int:
     tools = {
         "find_definition": server.find_definition,
         "find_references": server.find_references,
+        "get_symbol_body": server.get_symbol_body,
         "find_callers": server.find_callers,
+        "summarize_references": server.summarize_references,
+        "find_callees": server.find_callees,
         "symbol_info": server.symbol_info,
+        "list_file_symbols": server.list_file_symbols,
         "reachability": server.reachability,
         "blast_radius": server.blast_radius,
+        "update_index": server.update_index,
     }
 
     by_category: dict[str, list[bool]] = {}

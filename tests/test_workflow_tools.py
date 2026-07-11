@@ -215,6 +215,75 @@ def test_blast_radius_bad_ref(git_project):
     assert "invalid git_ref" in result["error"]
 
 
+def test_reachability_exploration_budget(chain_project, monkeypatch):
+    """A zeroed exploration budget stops the walk and says so in the message."""
+    monkeypatch.setattr(server, "MAX_GRAPH_EXPANSIONS", 0)
+    result = json.loads(
+        server.reachability("main", "leaf", project_root=str(chain_project))
+    )
+    res = result["results"]
+    assert res["path_found"] is False
+    assert res["nodes_explored"] == 0
+    assert "0-function exploration budget" in result["message"]
+
+
+@pytest.fixture
+def macro_wrapped_project(tmp_path):
+    """helper_fn is only 'called' from inside an ALL-CAPS macro definition."""
+    (tmp_path / "wrap.h").write_text("#define WRAP_HELPER(x) helper_fn(x)\n")
+    (tmp_path / "user.c").write_text(
+        '#include "wrap.h"\n'
+        "int helper_fn(int x) { return x; }\n"
+        "int uses_wrap(void) { return WRAP_HELPER(3); }\n"
+    )
+    return tmp_path
+
+
+def test_reachability_macroish_callers_listed_not_expanded(macro_wrapped_project):
+    root = str(macro_wrapped_project)
+    # The macro itself IS found as a direct caller of helper_fn ...
+    callers = json.loads(server.find_callers("helper_fn", root))["results"]
+    assert any(c["caller"] == "WRAP_HELPER" for c in callers)
+    direct = json.loads(server.reachability("WRAP_HELPER", "helper_fn", root))["results"]
+    assert direct["path_found"] is True and direct["depth"] == 1
+    # ... but the walk never expands THROUGH it: uses_wrap only reaches
+    # helper_fn via the WRAP_HELPER macro name, so no path is reported.
+    via_macro = json.loads(server.reachability("uses_wrap", "helper_fn", root))["results"]
+    assert via_macro["path_found"] is False
+
+
+def test_blast_radius_pure_deletion_maps_to_enclosing_function(git_project):
+    source = (git_project / "chain.c").read_text()
+    (git_project / "chain.c").write_text(source.replace("    int a = leaf(x);\n", ""))
+
+    result = json.loads(server.blast_radius(project_root=str(git_project), depth=0))
+    assert [rec["symbol"] for rec in result["results"]] == ["middle"]
+    assert result["changed_functions"] == 1
+
+
+def test_blast_radius_skips_unindexed_files(git_project):
+    (git_project / "notes.txt").write_text("design notes\n")
+    _git(git_project, "add", "notes.txt")
+    _git(git_project, "commit", "-qm", "notes")
+    (git_project / "notes.txt").write_text("design notes, edited\n")
+
+    result = json.loads(server.blast_radius(project_root=str(git_project)))
+    assert result["results"] == []
+    assert result["changed_files"] == 1 and result["changed_functions"] == 0
+    assert "No indexed definitions overlap" in result["message"]
+
+
+def test_blast_radius_depth_clamped(git_project):
+    source = (git_project / "chain.c").read_text()
+    (git_project / "chain.c").write_text(source.replace("x + 1", "x + 2", 1))
+
+    result = json.loads(server.blast_radius(project_root=str(git_project), depth=99))
+    assert "error" not in result
+    assert max(rec["distance"] for rec in result["results"]) <= 3
+    negative = json.loads(server.blast_radius(project_root=str(git_project), depth=-5))
+    assert [rec["distance"] for rec in negative["results"]] == [0]
+
+
 def test_blast_radius_text_format(git_project):
     source = (git_project / "chain.c").read_text()
     (git_project / "chain.c").write_text(source.replace("x + 1", "x + 2", 1))

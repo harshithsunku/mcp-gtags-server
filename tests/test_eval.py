@@ -147,6 +147,114 @@ def test_eval_tolerates_known_fail_within_threshold(c_project, tmp_path, capsys)
     capsys.readouterr()
 
 
+def test_eval_new_tool_checks_pass(c_project, tmp_path, capsys):
+    """The five v1.3.1 tools and their expect checks, against the tiny project."""
+    (c_project / "ext.c").write_text(
+        "void wrapper(void)\n{\n    external_thing();\n}\n"
+    )
+    golden = _write_golden(
+        tmp_path,
+        [
+            {
+                "id": "body",
+                "category": "body",
+                "tool": "get_symbol_body",
+                "args": {"symbol": "helper"},
+                "expect": {"paths": ["code.c"], "body_contains": "x + 1"},
+            },
+            {
+                "id": "callees",
+                "category": "callees",
+                "tool": "find_callees",
+                "args": {"symbol": "caller_fn"},
+                "expect": {"in_tree": ["helper"], "min_results": 1},
+            },
+            {
+                "id": "summary",
+                "category": "summary",
+                "tool": "summarize_references",
+                "args": {"symbol": "helper"},
+                "expect": {"min_results": 1, "paths": ["code.c"]},
+            },
+            {
+                "id": "filesurface",
+                "category": "filesurface",
+                "tool": "list_file_symbols",
+                "args": {"file_path": "code.c"},
+                "expect": {"symbols": ["helper", "caller_fn"], "min_results": 2},
+            },
+            {
+                "id": "suggestions",
+                "category": "suggestions",
+                "tool": "find_definition",
+                "args": {"symbol": "help"},
+                "expect": {"suggestions_contain": ["helper"]},
+            },
+            {
+                "id": "fallback",
+                "category": "fallback",
+                "tool": "find_references",
+                "args": {"symbol": "external_thing"},
+                "expect": {"fallback": "symbol_usages", "min_results": 1},
+            },
+            {
+                "id": "maintenance",
+                "category": "maintenance",
+                "tool": "update_index",
+                "args": {},
+                "expect": {"status": "ok"},
+            },
+        ],
+    )
+    code = evalharness.run(str(golden), str(c_project), threshold=1.0)
+    out = capsys.readouterr().out
+    assert code == 0, out
+    assert "7 cases" in out and "PASS" in out
+
+
+def test_eval_new_tool_checks_fail_loudly(c_project, tmp_path, capsys):
+    golden = _write_golden(
+        tmp_path,
+        [
+            {
+                "id": "wrong-body",
+                "category": "body",
+                "tool": "get_symbol_body",
+                "args": {"symbol": "helper"},
+                "expect": {"body_contains": "no such text"},
+            },
+            {
+                "id": "wrong-callee",
+                "category": "callees",
+                "tool": "find_callees",
+                "args": {"symbol": "caller_fn"},
+                "expect": {"in_tree": ["not_a_callee"]},
+            },
+            {
+                "id": "wrong-symbol",
+                "category": "filesurface",
+                "tool": "list_file_symbols",
+                "args": {"file_path": "code.c"},
+                "expect": {"symbols": ["ghost_fn"]},
+            },
+            {
+                "id": "wrong-fallback",
+                "category": "fallback",
+                "tool": "find_references",
+                "args": {"symbol": "helper"},
+                "expect": {"fallback": "symbol_usages"},
+            },
+        ],
+    )
+    code = evalharness.run(str(golden), str(c_project), threshold=0.9)
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "no result body contains 'no such text'" in out
+    assert "expected in-tree callee not_a_callee not found" in out
+    assert "expected symbol ghost_fn not in results" in out
+    assert "fallback None != 'symbol_usages'" in out
+
+
 def test_eval_missing_golden_or_root(tmp_path, capsys):
     assert evalharness.run(str(tmp_path / "nope.jsonl"), str(tmp_path), 0.9) == 2
     golden = _write_golden(tmp_path, [])
@@ -168,8 +276,19 @@ def test_repo_golden_set_is_well_formed():
     from pathlib import Path
 
     cases = evalharness._load_cases(Path(__file__).parent.parent / "evals/golden.jsonl")
-    assert len(cases) >= 45
+    assert len(cases) >= 60
     ids = [case["id"] for case in cases]
     assert len(ids) == len(set(ids)), "duplicate case ids"
     categories = {case["category"] for case in cases}
-    assert {"definition", "macro", "references", "callers", "guards", "workflow"} <= categories
+    assert {
+        "definition", "macro", "references", "callers", "guards", "workflow",
+        "body", "callees", "summary", "filesurface", "suggestions",
+        "fallback", "maintenance",
+    } <= categories
+    # Every tool in the surface is exercised by at least one kernel case.
+    tools_covered = {case["tool"] for case in cases}
+    assert tools_covered >= {
+        "find_definition", "find_references", "get_symbol_body", "find_callers",
+        "summarize_references", "find_callees", "symbol_info",
+        "list_file_symbols", "reachability", "blast_radius", "update_index",
+    }

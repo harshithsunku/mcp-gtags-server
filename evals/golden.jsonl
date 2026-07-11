@@ -62,9 +62,36 @@
 {"id": "guards-kmap-defs", "category": "guards", "tool": "find_definition", "args": {"symbol": "kmap"}, "expect": {"paths": ["include/linux/highmem-internal.h"], "min_results": 2}}
 {"id": "guards-kmap-config-filter", "category": "guards", "tool": "find_definition", "args": {"symbol": "kmap", "active_config": "CONFIG_HIGHMEM,CONFIG_SMP"}, "expect": {"paths": ["include/linux/highmem-internal.h"], "config_filtered_min": 1}}
 #
+# --- body: definition-body extraction (brace/continuation heuristics) ------
+{"id": "body-tcp_v4_rcv", "category": "body", "tool": "get_symbol_body", "args": {"symbol": "tcp_v4_rcv"}, "expect": {"paths": ["net/ipv4/tcp_ipv4.c"], "body_contains": "struct sock *sk"}}
+{"id": "body-list_head", "category": "body", "tool": "get_symbol_body", "args": {"symbol": "list_head"}, "expect": {"paths": ["include/linux/types.h"], "body_contains": "struct list_head *next"}}
+{"id": "body-schedule", "category": "body", "tool": "get_symbol_body", "args": {"symbol": "schedule"}, "expect": {"paths": ["kernel/sched/core.c"], "body_contains": "__schedule"}}
+{"id": "body-wait_event-macro", "category": "body", "tool": "get_symbol_body", "args": {"symbol": "wait_event"}, "expect": {"paths": ["include/linux/wait.h"], "body_contains": "might_sleep"}}
+#
+# --- callees: outgoing call graph from a function body ----------------------
+{"id": "callees-vfs_read", "category": "callees", "tool": "find_callees", "args": {"symbol": "vfs_read"}, "expect": {"in_tree": ["rw_verify_area"], "min_results": 5}}
+{"id": "callees-ksys_read", "category": "callees", "tool": "find_callees", "args": {"symbol": "ksys_read"}, "expect": {"in_tree": ["vfs_read"]}}
+{"id": "callees-kernel_clone", "category": "callees", "tool": "find_callees", "args": {"symbol": "kernel_clone"}, "expect": {"in_tree": ["copy_process"]}}
+#
+# --- summary: per-file reference distribution --------------------------------
+{"id": "summary-kmalloc", "category": "summary", "tool": "summarize_references", "args": {"symbol": "kmalloc", "limit": 2000}, "expect": {"min_results": 1000, "paths": ["crypto/testmgr.c", "drivers/usb/core/message.c"]}}
+{"id": "summary-schedule", "category": "summary", "tool": "summarize_references", "args": {"symbol": "schedule", "limit": 1}, "expect": {"min_results": 200}}
+#
+# --- filesurface: one file's API surface -------------------------------------
+{"id": "files-read_write", "category": "filesurface", "tool": "list_file_symbols", "args": {"file_path": "fs/read_write.c", "limit": 500}, "expect": {"symbols": ["ksys_read", "vfs_read"], "min_results": 50}}
+{"id": "files-fork", "category": "filesurface", "tool": "list_file_symbols", "args": {"file_path": "kernel/fork.c", "limit": 500}, "expect": {"symbols": ["kernel_clone", "copy_process"], "min_results": 100}}
+#
+# --- suggestions / fallback: graceful-miss behaviors -------------------------
+{"id": "sugg-tcp_v4_r", "category": "suggestions", "tool": "find_definition", "args": {"symbol": "tcp_v4_r"}, "expect": {"suggestions_contain": ["tcp_v4_rcv"]}}
+{"id": "fallback-gnuc", "category": "fallback", "tool": "find_references", "args": {"symbol": "__GNUC__", "limit": 1}, "expect": {"fallback": "symbol_usages", "min_results": 50}}
+#
+# --- maintenance: synchronous index refresh ----------------------------------
+{"id": "maint-update_index", "category": "maintenance", "tool": "update_index", "args": {}, "expect": {"status": "ok"}}
+#
 # --- workflow: reachability and export facts --------------------------------
 {"id": "reach-ksys_read", "category": "workflow", "tool": "reachability", "args": {"from_symbol": "ksys_read", "to_symbol": "rw_verify_area"}, "expect": {"path_found": true}}
 {"id": "reach-openat-security", "category": "workflow", "tool": "reachability", "args": {"from_symbol": "do_sys_openat2", "to_symbol": "security_file_open"}, "expect": {"path_found": true}}
 {"id": "reach-fnptr-honesty", "category": "workflow", "tool": "reachability", "args": {"from_symbol": "vfs_read", "to_symbol": "ext4_file_read_iter", "max_depth": 4}, "expect": {"path_found": false}}
+{"id": "blast-clean-tree", "category": "workflow", "tool": "blast_radius", "args": {}, "expect": {"min_results": 0}}
 {"id": "exported-kernel_read", "category": "workflow", "tool": "symbol_info", "args": {"symbol": "kernel_read"}, "expect": {"exported": "EXPORT_SYMBOL"}}
 {"id": "exported-mutex_lock", "category": "workflow", "tool": "symbol_info", "args": {"symbol": "mutex_lock"}, "expect": {"exported": "EXPORT_SYMBOL"}}

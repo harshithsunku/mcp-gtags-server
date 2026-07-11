@@ -11,17 +11,18 @@ This page is the measured version of that claim.
 ## The eval
 
 `mcp-gtags-server eval --golden evals/golden.jsonl --root <kernel-tree>` runs
-a 50-case golden set against a real kernel checkout (CI pins one tag and
-publishes the score on every push to main — see
+a 65-case golden set — covering **all 11 tools** — against a real kernel
+checkout (CI pins one tag and publishes the score on every push to main — see
 [eval.yml](../.github/workflows/eval.yml)). Cases assert expected paths,
-callers, counts, guard variants, and reachability outcomes; expectations are
+callers, definition bodies, callees, per-file counts, guard variants,
+suggestions, fallbacks, and reachability outcomes; expectations are
 path-level so they hold across kernel versions.
 
 Current scores:
 
 ```
-CI, kernel v6.16 (pinned):      50/50 = 100.0% recall, 14/14 = 100.0% precision@1, 41s
-local, mid-2026 master snapshot: 49/50 =  98.0% recall, 14/14 = 100.0% precision@1, 3.1s
+local, mid-2026 master snapshot: 64/65 = 98.5% recall, 14/14 = 100.0% precision@1, 14s
+CI, kernel v6.16 (pinned):       published on every push (100.0% on the previous 50-case set)
 ```
 
 The one failure on newer kernels is kept in the set deliberately: recent
@@ -75,6 +76,36 @@ Resolution costs 20–75 ms per query on the kernel; a miss costs ~9 ms.
 - `blast_radius(git_ref)` maps a `git diff` to its enclosing functions and
   ranks callers by distance (a probe edit inside `ksys_read` radiates to its
   `SYSCALL_DEFINE3` sites in 0.1 s).
+
+## Operational profile (measured)
+
+[scripts/stability_exercise.py](../scripts/stability_exercise.py) runs a
+27-call matrix over all 11 tools against a real kernel tree and records
+latency and response size (`--json` for diffing between runs). Measured on
+the 37M-line mid-2026 snapshot, 8 GB machine, warm index — **27/27 sane,
+zero anomalies**:
+
+| call | warm latency | response size |
+|---|---|---|
+| `find_definition` (indexed hit) | ~2 ms | 0.5–1.7 KB |
+| `find_definition` (macro-generated, e.g. `sys_read`) | ~47 ms | 0.8 KB |
+| `find_references` (`kmalloc`, 2 744 refs, one page) | ~60 ms | 23 KB |
+| `get_symbol_body` (function / struct / macro) | ~2 ms | 0.6–7.5 KB |
+| `find_callers` (typical) | 13–61 ms | 0.5–5 KB |
+| `find_callers` (worst allowed: `schedule`, 610 callers / ~430 files) | ~1.5 s | — |
+| `find_callers` (>500 files: guard refuses gracefully) | ~53 ms | 0.3 KB |
+| `summarize_references` (`kmalloc`, 1 553 files) | ~56 ms | 0.8 KB |
+| `find_callees` | 15–40 ms | 0.9–1.9 KB |
+| `symbol_info` | 5–56 ms | 1.4 KB |
+| `reachability` (3-hop chain found) | ~0.6 s | 0.6 KB |
+| `list_file_symbols` (80-symbol file) | ~4 ms | 27 KB |
+| `blast_radius` (real one-line edit, depth 1) | ~0.1 s | 2.5 KB |
+| `update_index` (synchronous incremental, 37M lines) | 6–10 s | 0.3 KB |
+
+Every response an agent sees stays comfortably under typical MCP client
+timeouts, wide queries are bounded by pagination and breadth guards, and the
+one deliberately slow call (`update_index`) is the explicit freshness barrier
+— background refresh keeps normal queries off that path.
 
 ## Known limitations (measured, not hidden)
 

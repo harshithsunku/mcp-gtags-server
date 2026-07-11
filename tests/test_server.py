@@ -1042,6 +1042,355 @@ def test_root_autodetected_via_index_dir(c_project, monkeypatch):
     assert result["root"] == str(c_project.resolve())
 
 
+# ---------------------------------------------------------------------------
+# Stability pass: per-tool edge cases
+# ---------------------------------------------------------------------------
+
+
+@requires_global
+def test_suggestions_capped_and_absent_on_hit(c_project):
+    (c_project / "sugg.c").write_text(
+        "".join(f"int sugg_fn_{i:02d}(void) {{ return {i}; }}\n" for i in range(12))
+    )
+    root = str(c_project)
+    miss = json.loads(server.find_definition("sugg_fn", root))
+    assert miss["results"] == []
+    assert len(miss["suggestions"]) == server.MAX_SUGGESTIONS
+    assert all(s.startswith("sugg_fn_") for s in miss["suggestions"])
+
+    hit = json.loads(server.find_definition("add_numbers", root))
+    assert hit["results"] and "suggestions" not in hit
+
+
+@requires_global
+def test_suggestions_exclude_exact_name(c_project):
+    """A config-filtered miss must not suggest the queried name itself."""
+    (c_project / "gated.c").write_text(
+        "#ifdef CONFIG_ONLY\nint gated_fn(void) { return 1; }\n#endif\n"
+        "int gated_fn_helper(void) { return 2; }\n"
+    )
+    root = str(c_project)
+    miss = json.loads(
+        server.find_definition("gated_fn", root, active_config="!CONFIG_ONLY")
+    )
+    assert miss["results"] == [] and miss["config_filtered"] == 1
+    assert "gated_fn" not in miss["suggestions"]
+    assert "gated_fn_helper" in miss["suggestions"]
+
+
+@requires_global
+def test_references_no_fallback_flag_on_real_references(c_project):
+    refs = json.loads(server.find_references("add_numbers", str(c_project)))
+    assert refs["results"] and "fallback" not in refs
+
+
+@requires_global
+def test_references_fallback_preserves_case_insensitive(c_project):
+    root = str(c_project)
+    sensitive = json.loads(server.find_references("PRINTF", root))
+    assert sensitive["results"] == [] and "fallback" not in sensitive
+    ci = json.loads(server.find_references("PRINTF", root, case_insensitive=True))
+    assert ci["fallback"] == "symbol_usages"
+    assert any(r["path"] == "main.c" for r in ci["results"])
+
+
+@requires_global
+def test_references_fallback_guards_and_config_filter(c_project):
+    """Fallback (symbol-usage) records still carry guard stacks and honor
+    active_config filtering, exactly like real reference records."""
+    (c_project / "log.c").write_text(
+        '#include "util.h"\n#ifdef CONFIG_LOGGING\n'
+        "static void log_it(void) { external_log_fn(1); }\n#endif\n"
+    )
+    root = str(c_project)
+    data = json.loads(server.find_references("external_log_fn", root))
+    assert data["fallback"] == "symbol_usages"
+    (rec,) = data["results"]
+    assert rec["guard"] == ["CONFIG_LOGGING"]
+
+    filtered = json.loads(
+        server.find_references(
+            "external_log_fn", root, active_config="!CONFIG_LOGGING"
+        )
+    )
+    assert filtered["fallback"] == "symbol_usages"
+    assert filtered["results"] == [] and filtered["config_filtered"] == 1
+
+
+@requires_global
+def test_get_symbol_body_struct(c_project):
+    (c_project / "shapes.h").write_text(
+        "struct shape {\n    int width;\n    int height;\n};\n\nint after_struct;\n"
+    )
+    body = server.get_symbol_body("shape", str(c_project))
+    assert "int width;" in body and "int height;" in body
+    assert "};" in body
+    assert "after_struct" not in body
+
+
+def test_extract_body_prototype_stops_at_semicolon(tmp_path):
+    proto = tmp_path / "p.h"
+    proto.write_text("int proto_fn(int a,\n             int b);\nint other;\n")
+    body = server._extract_body(proto, 1)
+    assert body == ["int proto_fn(int a,", "             int b);"]
+
+
+@requires_global
+def test_get_symbol_body_truncates_at_max_lines(c_project, monkeypatch):
+    monkeypatch.setattr(server, "MAX_BODY_LINES", 8)
+    lines = "".join(f"    x += {i};\n" for i in range(30))
+    (c_project / "big.c").write_text(f"int big_fn(int x)\n{{\n{lines}    return x;\n}}\n")
+    data = json.loads(server.get_symbol_body("big_fn", str(c_project)))
+    body = data["results"][0]["body"]
+    assert "... body truncated at 8 lines ..." in body
+    assert len(body.splitlines()) == 9  # 8 body lines + the marker
+
+
+@requires_global
+def test_get_symbol_body_omitted_definitions(guarded_c_project):
+    root = str(guarded_c_project)
+    data = json.loads(server.get_symbol_body("foo_mode", root, max_definitions=1))
+    assert data["total"] == 2 and data["truncated"] is True
+    assert data["omitted_definitions"] == 1
+    assert len(data["results"]) == 1
+    text = server.get_symbol_body("foo_mode", root, max_definitions=1, format="text")
+    assert "1 more definition(s) not shown" in text
+
+
+@requires_global
+def test_find_callers_ranked_by_call_sites(c_project):
+    (c_project / "heavy.c").write_text(
+        '#include "util.h"\n'
+        "void heavy_user(void)\n{\n"
+        "    add_numbers(1, 1);\n"
+        "    add_numbers(2, 2);\n"
+        "    add_numbers(3, 3);\n"
+        "}\n"
+    )
+    data = json.loads(server.find_callers("add_numbers", str(c_project)))
+    top = data["results"][0]
+    assert top["caller"] == "heavy_user" and len(top["sites"]) == 3
+    site_counts = [len(r["sites"]) for r in data["results"]]
+    assert site_counts == sorted(site_counts, reverse=True)
+
+
+@requires_global
+def test_find_callers_file_scope_attribution(c_project):
+    """A reference in a file with no definitions maps to '(file scope)'."""
+    (c_project / "decl.c").write_text("int add_numbers(int a, int b);\n")
+    data = json.loads(server.find_callers("add_numbers", str(c_project)))
+    assert {"caller": "(file scope)", "path": "decl.c", "sites": [1]} in data["results"]
+
+
+@requires_global
+def test_find_callers_breadth_guard(c_project, monkeypatch):
+    """>500 referencing files aborts with the summarize_references hint."""
+    root = str(c_project)
+    server.find_definition("add_numbers", root)  # build the index first
+    resolved = c_project.resolve()
+    real_raw = server._raw_global
+
+    def fake_raw(flags, project_root, _retry=True):
+        if flags and flags[0] == "-rx":
+            out = "\n".join(
+                f"wide_sym 1 dir/file_{i:04d}.c wide_sym();" for i in range(501)
+            )
+            return out, resolved, None
+        return real_raw(flags, project_root, _retry)
+
+    monkeypatch.setattr(server, "_raw_global", fake_raw)
+    data = json.loads(server.find_callers("wide_sym", root))
+    assert "too broad" in data["error"]
+    assert "501 files" in data["error"]
+    assert data["next_tools"] == ["summarize_references"]
+    text = server.find_callers("wide_sym", root, format="text")
+    assert "too broad" in text
+
+
+@requires_global
+def test_summarize_references_sort_order(c_project):
+    (c_project / "hot.c").write_text(
+        '#include "util.h"\n'
+        "int hot_a(void)\n{\n    return add_numbers(1, 1);\n}\n"
+        "int hot_b(void)\n{\n    return add_numbers(2, 2);\n}\n"
+    )
+    data = json.loads(server.summarize_references("add_numbers", str(c_project)))
+    # Count desc, then path asc: hot.c (2 refs) first, then main.c / util.h (1 each).
+    assert [r["path"] for r in data["results"]] == ["hot.c", "main.c", "util.h"]
+    assert [r["count"] for r in data["results"]] == [2, 1, 1]
+    assert data["total_references"] == 4
+
+
+@requires_global
+def test_find_callees_caps_call_targets(c_project):
+    calls = "".join(f"    t{i:02d}(x);\n" for i in range(45))
+    (c_project / "wide.c").write_text(f"void wide_fn(int x)\n{{\n{calls}}}\n")
+    data = json.loads(server.find_callees("wide_fn", str(c_project)))
+    res = data["results"]
+    assert data["truncated"] is True
+    assert data["capped_call_targets"] == 5
+    assert len(res["in_tree"]) + len(res["external"]) == 40
+
+
+@requires_global
+def test_find_callees_filters_keywords_and_self(c_project):
+    (c_project / "kw.c").write_text(
+        '#include "util.h"\n'
+        "int keywordy(int x)\n{\n"
+        "    if (x > 0) {\n"
+        "        while (x--) { }\n"
+        "        return (int)sizeof(int) + add_numbers(x, x);\n"
+        "    }\n"
+        "    for (;;) break;\n"
+        "    switch (x) { default: break; }\n"
+        "    return keywordy(x - 1);\n"
+        "}\n"
+    )
+    data = json.loads(server.find_callees("keywordy", str(c_project)))
+    res = data["results"]
+    assert [c["symbol"] for c in res["in_tree"]] == ["add_numbers"]
+    assert res["external"] == []  # keywords and the self-call are filtered
+
+
+@requires_global
+def test_symbol_info_exported_detection(c_project):
+    source = (c_project / "util.c").read_text()
+    (c_project / "util.c").write_text(source + "EXPORT_SYMBOL(add_numbers);\n")
+    card = json.loads(server.symbol_info("add_numbers", str(c_project)))["results"]
+    assert card["exported"] == "EXPORT_SYMBOL"
+
+
+@requires_global
+def test_symbol_info_config_kills_all_definitions(guarded_c_project):
+    root = str(guarded_c_project)
+    card = json.loads(
+        server.symbol_info("bar_only", root, active_config="CONFIG_FOO")
+    )["results"]
+    assert card["definition_count"] == 0 and card["config_filtered"] == 1
+    assert card["definitions"] == []
+    text = server.symbol_info(
+        "bar_only", root, active_config="CONFIG_FOO", format="text"
+    )
+    assert "no definition is live" in text
+
+
+@requires_global
+def test_update_index_full_rebuild_keeps_legacy_location(c_project):
+    """full=True on a legacy root-level index rebuilds in place."""
+    root = str(c_project)
+    files = "util.h\nutil.c\nmain.c\n"
+    _, stderr, code = server._run(
+        ["gtags", "--skip-unreadable", "-f", "-"], c_project, input_text=files
+    )
+    assert code == 0, stderr
+
+    result = server.update_index(root, full=True)
+    assert "legacy root-level index" in result
+    assert (c_project / "GTAGS").is_file()
+    assert not (c_project / server.INDEX_DIR_NAME).exists()
+    assert "util.c" in server.find_definition("add_numbers", root)
+
+
+@requires_global
+def test_update_index_full_failure_keeps_envelope_and_recovers(c_project, monkeypatch):
+    root = str(c_project)
+    server.find_definition("add_numbers", root)  # healthy build first
+    monkeypatch.setattr(
+        server, "_run_index", lambda root_, incremental: ("", "simulated gtags crash", 1)
+    )
+    data = json.loads(server.update_index(root, full=True))
+    assert set(data) == {"tool", "root", "error", "next_tools"}
+    assert "simulated gtags crash" in data["error"]
+    monkeypatch.undo()
+    # The failed rebuild must not strand state: the next query rebuilds.
+    assert "util.c" in server.find_definition("add_numbers", root)
+
+
+# ---------------------------------------------------------------------------
+# Cross-cutting: every tool keeps the envelope contract, hit or error
+# ---------------------------------------------------------------------------
+
+ALL_TOOLS = [
+    ("find_definition", {"symbol": "add_numbers"}),
+    ("find_references", {"symbol": "add_numbers"}),
+    ("get_symbol_body", {"symbol": "add_numbers"}),
+    ("find_callers", {"symbol": "add_numbers"}),
+    ("summarize_references", {"symbol": "add_numbers"}),
+    ("find_callees", {"symbol": "main"}),
+    ("reachability", {"from_symbol": "main", "to_symbol": "add_numbers"}),
+    ("blast_radius", {}),
+    ("symbol_info", {"symbol": "add_numbers"}),
+    ("list_file_symbols", {"file_path": "util.c"}),
+    ("update_index", {"full": True}),
+]
+
+
+@pytest.fixture
+def committed_project(git_project):
+    """git_project with everything committed (blast_radius needs a HEAD)."""
+    for args in (["add", "-A"], ["commit", "-qm", "base"]):
+        subprocess.run(
+            ["git", "-C", str(git_project), "-c", "user.name=t",
+             "-c", "user.email=t@t", *args],
+            check=True,
+            capture_output=True,
+        )
+    return git_project
+
+
+@requires_global
+@pytest.mark.parametrize("tool_name,args", ALL_TOOLS, ids=[t[0] for t in ALL_TOOLS])
+def test_envelope_contract_all_tools(committed_project, tool_name, args):
+    root = str(committed_project)
+    data = json.loads(getattr(server, tool_name)(project_root=root, **args))
+    assert data["tool"] == tool_name
+    assert data["root"] == str(committed_project.resolve())
+    assert "results" in data and "error" not in data
+    assert isinstance(data["next_tools"], list)
+
+
+@requires_global
+@pytest.mark.parametrize("tool_name,args", ALL_TOOLS, ids=[t[0] for t in ALL_TOOLS])
+def test_envelope_error_contract_all_tools(tool_name, args):
+    bad_root = "/nonexistent/path/xyz"
+    data = json.loads(getattr(server, tool_name)(project_root=bad_root, **args))
+    assert data["tool"] == tool_name
+    assert data["error"].startswith("Error")
+    assert "results" not in data
+    assert isinstance(data["next_tools"], list)
+    text = getattr(server, tool_name)(project_root=bad_root, format="text", **args)
+    assert isinstance(text, str) and text.startswith("Error")
+
+
+@requires_global
+def test_concurrent_queries_during_refresh(many_symbols_project):
+    """8 threads x mixed queries racing a background refresh: no exceptions,
+    every response is a valid envelope."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    root = str(many_symbols_project)
+    server.find_definition("add_numbers", root)  # build the index
+    server._last_update.clear()  # the next query kicks a background refresh
+
+    calls = [
+        lambda: server.find_definition("add_numbers", root),
+        lambda: server.find_references("add_numbers", root),
+        lambda: server.symbol_info("add_numbers", root),
+        lambda: server.summarize_references("add_numbers", root),
+        lambda: server.list_file_symbols("util.c", root),
+        lambda: server.get_symbol_body("add_numbers", root),
+        lambda: server.find_callees("main", root),
+        lambda: server.find_definition("fn_a", root),
+    ]
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(call) for call in calls * 3]
+        outputs = [f.result(timeout=60) for f in futures]
+    for raw in outputs:
+        data = json.loads(raw)
+        assert data["tool"] and "results" in data and "error" not in data
+    server._wait_for_refresh(many_symbols_project.resolve())
+
+
 def test_mcp_tool_schemas_stable():
     """The async roots wrapper must not change the registered tool schemas."""
     import anyio
