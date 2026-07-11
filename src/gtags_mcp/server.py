@@ -46,17 +46,18 @@ mcp = FastMCP(
         "ALWAYS prefer these tools over grep/text search for code questions: "
         "they answer from a prebuilt index in milliseconds and return only "
         "the relevant lines, even on codebases with millions of lines. "
-        "Start with symbol_info for any unfamiliar symbol. "
-        "Then: get_symbol_body to "
-        "read an implementation, find_callers / call_hierarchy for impact "
+        "Start with symbol_info for any unfamiliar symbol. Then: "
+        "get_symbol_body to read an implementation, find_callers for impact "
         "analysis, find_callees to see what a function depends on, and "
         "summarize_references first for very widely used symbols. "
         "The index is built and refreshed automatically — never worry about it. "
-        "Tools operate on the client's workspace root by default; pass "
-        "project_root to target another repo (required when several "
-        "workspace roots are open). "
-        "Every tool returns machine-readable JSON by default; pass "
-        "format='text' for the human-readable rendering."
+        "Shared conventions for every tool: they operate on the client's "
+        "workspace root by default — pass project_root to target another repo "
+        "(required when several workspace roots are open). Results are a "
+        "machine-readable JSON envelope {results, total, offset, truncated, "
+        "next_tools, warning} — next_tools names the best follow-up call; pass "
+        "format='text' for a human-readable rendering. List results paginate "
+        "with limit (default 100) and offset."
     ),
 )
 
@@ -948,41 +949,27 @@ def find_definition(
 ) -> str:
     """Find where a C/C++ symbol (function, struct, macro, typedef, enum) is defined.
 
-    Use this INSTEAD of grep or text search whenever you need a symbol's
-    definition — it is an indexed lookup that returns only the definition
-    site(s), not every textual occurrence, and stays fast on codebases with
-    millions of lines. The index is built and refreshed automatically.
-    Multiply-defined symbols (kernel/firmware `#ifdef` alternates) come back
-    with each definition's guard stack, so you can tell which one applies.
-    Macro-generated symbols resolve too: querying "sys_read",
-    "trace_sched_switch", or a DEFINE_SPINLOCK/DEFINE_PER_CPU/module_param
-    name returns the generator invocation site (SYSCALL_DEFINE3(read, ...)),
-    flagged by a "resolved_via" field in the envelope — no preprocessor or
-    build needed. When nothing matches, the envelope carries "suggestions":
-    defined symbols that start with the queried name — so a partial name
-    still gets you to the right symbol in one call.
+    Use this INSTEAD of grep whenever you need a symbol's definition: an
+    indexed lookup that returns only the definition site(s). Multiply-defined
+    symbols (#ifdef alternates) carry each definition's guard stack.
+    Macro-generated symbols resolve too: "sys_read", "trace_sched_switch",
+    or a DEFINE_SPINLOCK/module_param name returns the generator invocation
+    site (SYSCALL_DEFINE3(read, ...)), flagged resolved_via — no build
+    needed. On a miss the envelope carries "suggestions": defined symbols
+    starting with the queried name.
+
+    JSON records: {symbol, path, line, col, kind, typeref, scope, signature,
+    guard, snippet} — kind/typeref/scope/signature are ctags metadata when
+    available; guard is the enclosing #if/#ifdef stack, outermost first,
+    [] = unconditional.
 
     Args:
-        symbol: Exact symbol name, e.g. "tcp_v4_rcv" or "list_head".
-        project_root: Project directory. Omit to use the client's workspace
-            root (or the server's default, auto-detected by walking up from
-            its working directory); if several workspace roots are open,
-            pass the one you mean.
-        case_insensitive: Match the symbol ignoring case.
-        limit: Maximum result lines to return (default 100).
-        offset: Skip this many result lines (for pagination).
-        format: "json" (default) for a structured envelope with
-            {symbol, path, line, col, kind, typeref, scope, signature,
-            guard, snippet} records — kind/typeref/scope/signature carry
-            ctags metadata (what the symbol is, its type/return type, its
-            enclosing scope, its parameter list) when available; guard is
-            the enclosing #if/#ifdef stack (outermost first, [] = none);
-            "text" for lines of: symbol line-number file source-line.
-        active_config: Path to a kernel .config (absolute or root-relative),
-            or a comma-separated macro list like "CONFIG_SMP,BITS_PER_LONG=64"
-            (prefix ! for known-undefined). Definitions whose guard stack is
-            DEFINITELY false under it are dropped; unknown macros never drop
-            anything. The envelope reports the drop count as config_filtered.
+        symbol: Exact symbol name, e.g. "tcp_v4_rcv".
+        case_insensitive: Match ignoring case.
+        active_config: Kernel .config path or macro list like
+            "CONFIG_SMP,BITS_PER_LONG=64,!CONFIG_DEBUG"; drops definitions
+            whose guard stack is definitely false under it (count reported
+            as config_filtered). Unknown macros never drop anything.
     """
     flags = ["-x"] + (["-i"] if case_insensitive else []) + ["--", symbol]
     return _query_global(
@@ -1013,29 +1000,16 @@ def find_references(
 ) -> str:
     """Find all call/usage sites of a C/C++ symbol.
 
-    Use this INSTEAD of grep when you need who calls a function or uses a
-    type — grep returns every textual match including comments and strings,
-    while this returns only real reference sites from the index, instantly
-    even on huge trees. Each reference carries its #if/#ifdef guard stack,
-    so you can see which call sites are conditional. Symbols with no in-tree
-    definition (libc calls like printf, some variables) are covered too: when
-    the index has no reference records, the query falls back to symbol-usage
-    records automatically, flagged by "fallback": "symbol_usages".
+    Use this INSTEAD of grep for "who calls/uses this?": only real reference
+    sites from the index, each with its #if/#ifdef guard stack. Symbols with
+    no in-tree definition (libc calls, some variables) work too — the query
+    falls back to symbol-usage records, flagged "fallback": "symbol_usages".
 
     Args:
-        symbol: Exact symbol name whose call/usage sites you want.
-        project_root: Project directory. Omit to use the client's workspace
-            root (or the server's default); if several workspace roots are
-            open, pass the one you mean.
-        case_insensitive: Match the symbol ignoring case.
-        limit: Maximum result lines to return (default 100).
-        offset: Skip this many result lines (for pagination).
-        format: "json" (default) for structured records (guard = enclosing
-            #if/#ifdef stack); "text" for lines of:
-            symbol line-number file source-line.
-        active_config: Kernel .config path or comma-separated macro list;
-            drops references whose guard stack is definitely false under it
-            (reported as config_filtered). Unknown macros never drop anything.
+        symbol: Exact symbol name.
+        case_insensitive: Match ignoring case.
+        active_config: Kernel .config path or macro list; drops references
+            whose guard stack is definitely false under it (config_filtered).
     """
     ci = ["-i"] if case_insensitive else []
     return _query_global(
@@ -1059,22 +1033,17 @@ def get_symbol_body(
     max_definitions: int = 3,
     format: Format = "json",
 ) -> str:
-    """Return the full source code of a symbol's definition — just the body.
+    """Return the full source of a symbol's definition — just the body.
 
-    Use this INSTEAD of reading a whole file when you need to see how a
-    function, struct, or macro is implemented. It jumps straight to the
-    definition via the index and extracts only that definition's lines, so
-    a one-screen function never costs you a 5000-line file read.
+    Use this INSTEAD of reading a whole file to see how a function, struct,
+    or macro is implemented: it extracts only the definition's lines, so a
+    one-screen function never costs a 5000-line file read. JSON results:
+    {path, line, body} items.
 
     Args:
-        symbol: Exact symbol name, e.g. "tcp_v4_rcv".
-        project_root: Project directory. Omit to use the client's workspace
-            root (or the server's default); if several workspace roots are
-            open, pass the one you mean.
-        max_definitions: If the symbol has multiple definitions, return at
-            most this many bodies (default 3).
-        format: "json" (default) for {path, line, body} items; "text" for
-            "=== path:line ===" separated bodies.
+        symbol: Exact symbol name.
+        max_definitions: Return at most this many bodies when the symbol is
+            multiply defined (default 3).
     """
     stdout, root, err = _raw_global(["-x", "--", symbol], project_root)
     if err:
@@ -1126,20 +1095,12 @@ def find_callers(
     """Find the FUNCTIONS that call a symbol, deduplicated, with call counts.
 
     Use this INSTEAD of find_references when you want the call graph rather
-    than raw match lines: each reference site is mapped to its enclosing
-    function, so 100 call sites inside one loop-heavy caller collapse to a
-    single result line. This is the highest signal-to-noise view of "who
-    uses this?" on a large codebase.
+    than raw match lines: each reference is mapped to its enclosing function.
+    The highest signal-to-noise "who uses this?" view; iterate it to walk
+    the caller graph upward. JSON results: {caller, path, sites} items.
 
     Args:
         symbol: Exact symbol name whose callers you want.
-        project_root: Project directory. Omit to use the client's workspace
-            root (or the server's default); if several workspace roots are
-            open, pass the one you mean.
-        limit: Maximum result lines to return (default 100).
-        offset: Skip this many result lines (for pagination).
-        format: "json" (default) for {caller, path, sites} items; "text" for
-            lines of: caller-function  file  N call site(s) at lines ...
     """
     root, _ = _effective_root(project_root)
     callers, err = _callers_of(symbol, project_root)
@@ -1187,19 +1148,12 @@ def summarize_references(
     """Per-file reference counts for a symbol — the cheapest wide view.
 
     Use this FIRST for very widely used symbols (thousands of references):
-    it collapses the result to one line per file, sorted by count, so you
-    can see where usage concentrates and then drill into a specific file
-    with find_references or find_callers. Never floods the context window.
+    one line per file, sorted by count, shows where usage concentrates;
+    then drill in with find_references or find_callers. JSON results:
+    {path, count} items plus total_references.
 
     Args:
         symbol: Exact symbol name.
-        project_root: Project directory. Omit to use the client's workspace
-            root (or the server's default); if several workspace roots are
-            open, pass the one you mean.
-        limit: Maximum result lines to return (default 100).
-        offset: Skip this many result lines (for pagination).
-        format: "json" (default) for {path, count} items plus
-            total_references; "text" for lines of: count  file.
     """
     stdout, root, err = _raw_global(["-rx", "--", symbol], project_root)
     if err:
@@ -1231,128 +1185,6 @@ def summarize_references(
 
 
 @_gtags_tool
-def call_hierarchy(
-    symbol: str,
-    project_root: str | None = None,
-    depth: int = 2,
-    format: Format = "json",
-) -> str:
-    """Multi-level callers tree: who calls X, who calls THOSE, and so on.
-
-    Use this for impact analysis — "if I change this function, what code
-    paths are affected?" — instead of running find_references over and over.
-    Each caller is expanded recursively up to `depth` levels, deduplicated,
-    cycle-safe, and capped so the output stays compact even on huge trees.
-
-    Args:
-        symbol: Exact symbol name at the root of the tree.
-        project_root: Project directory. Omit to use the client's workspace
-            root (or the server's default); if several workspace roots are
-            open, pass the one you mean.
-        depth: How many caller levels to expand (1-5, default 2).
-        format: "json" (default) for a nested {caller, path, site_count,
-            callers} tree; "text" for a box-drawing rendering.
-    """
-    depth = max(1, min(depth, 5))
-    stdout, root, err = _raw_global(["-x", "--", symbol], project_root)
-    if err:
-        return output.error("call_hierarchy", err, root) if format == "json" else err
-    defs = [r for line in stdout.splitlines() if (r := _parse_cxref(line))]
-
-    visited = {symbol}
-    state = {"nodes": 0, "capped": False}
-    MAX_NODES = 150
-    MAX_PER_NODE = 25
-
-    def expand(sym: str, level: int) -> list[dict]:
-        callers, cerr = _callers_of(sym, project_root)
-        if cerr:
-            return [{"note": f"({cerr})"}]
-        if not callers:
-            return []
-        children: list[dict] = []
-        items = sorted(callers.items(), key=lambda kv: (-len(kv[1]), kv[0]))
-        for (caller, path), sites in items[:MAX_PER_NODE]:
-            if state["nodes"] >= MAX_NODES:
-                if not state["capped"]:
-                    children.append(
-                        {
-                            "note": f"... tree capped at {MAX_NODES} nodes; "
-                            "rerun with a smaller depth or start from a deeper symbol."
-                        }
-                    )
-                    state["capped"] = True
-                return children
-            child: dict = {"caller": caller, "path": path, "site_count": len(sites)}
-            expandable = caller not in ("(file scope)",) and level < depth
-            if caller == sym:
-                child["recursive"] = True
-                expandable = False
-            elif caller in visited:
-                child["repeated"] = True  # already shown elsewhere in the tree
-                expandable = False
-            state["nodes"] += 1
-            if expandable:
-                visited.add(caller)
-                child["callers"] = expand(caller, level + 1)
-            children.append(child)
-        if len(items) > MAX_PER_NODE:
-            children.append(
-                {
-                    "note": f"... {len(items) - MAX_PER_NODE} more callers not shown "
-                    f"(use find_callers('{sym}') with offset to page through them)"
-                }
-            )
-        return children
-
-    callers_tree = expand(symbol, 1)
-
-    if format == "json":
-        tree = {
-            "symbol": symbol,
-            "definition": {"path": defs[0][2], "line": defs[0][1]} if defs else None,
-            "callers": callers_tree,
-        }
-        extra = {} if callers_tree else {"message": f"No references found for '{symbol}'."}
-        return output.envelope(
-            "call_hierarchy",
-            root,
-            tree,
-            total=state["nodes"],
-            truncated=state["capped"],
-            hints=output.next_tools("call_hierarchy", bool(callers_tree)),
-            **extra,
-        )
-
-    if defs:
-        lines = [f"{symbol}  (definition: {defs[0][2]}:{defs[0][1]})"]
-    else:
-        lines = [f"{symbol}  (no in-tree definition)"]
-
-    def render(children: list[dict], prefix: str) -> None:
-        for i, child in enumerate(children):
-            last = i == len(children) - 1
-            branch = "└─ " if last else "├─ "
-            if "note" in child:
-                lines.append(f"{prefix}└─ {child['note']}")
-                continue
-            plural = "s" if child["site_count"] != 1 else ""
-            label = f"{child['caller']}  {child['path']}  ({child['site_count']} site{plural})"
-            if child.get("recursive"):
-                label += "  (recursive)"
-            elif child.get("repeated"):
-                label += "  (already shown above)"
-            lines.append(f"{prefix}{branch}{label}")
-            if child.get("callers"):
-                render(child["callers"], prefix + ("   " if last else "│  "))
-
-    render(callers_tree, "")
-    if len(lines) == 1:
-        lines.append(f"(no references found for '{symbol}')")
-    return "\n".join(lines)
-
-
-@_gtags_tool
 def find_callees(
     symbol: str,
     project_root: str | None = None,
@@ -1360,19 +1192,12 @@ def find_callees(
 ) -> str:
     """What functions does this function CALL? (the outgoing call graph)
 
-    Use this to understand a function's dependencies without reading any
-    file: it extracts the function's body, detects call sites, and verifies
-    each against the index. In-tree callees come back with their definition
-    locations (ready for get_symbol_body); external names (libc etc.) are
-    listed separately.
+    Use this to see a function's dependencies without reading any file:
+    call sites are detected in its body and verified against the index.
+    JSON results: {in_tree: [{symbol, path, line}], external: [names]}.
 
     Args:
         symbol: Exact name of the function to analyze.
-        project_root: Project directory. Omit to use the client's workspace
-            root (or the server's default); if several workspace roots are
-            open, pass the one you mean.
-        format: "json" (default) for {in_tree: [{symbol, path, line}],
-            external: [names]}; "text" for a sectioned listing.
     """
     stdout, root, err = _raw_global(["-x", "--", symbol], project_root)
     if err:
@@ -1464,24 +1289,17 @@ def reachability(
 ) -> str:
     """Does FROM transitively call TO — and through which call chain?
 
-    Use this instead of chaining find_callers/find_callees rounds when the
-    question is "can this function end up in that one?" (does a syscall
-    reach this driver? can this cleanup path hit this allocator?). It
-    breadth-first-searches the caller graph upward from `to_symbol` and
-    returns the SHORTEST call chain, each hop with the file:line of the
-    call site — one call answers what would otherwise take many.
+    Use this instead of chaining find_callers rounds when the question is
+    "can this function end up in that one?". BFS over the caller graph
+    returns the SHORTEST chain, each hop with the call site's file:line.
+    JSON results: {path_found, hops, depth, nodes_explored}; hops run from
+    from_symbol to to_symbol. Static analysis cannot follow function
+    pointers (ops structs, callbacks).
 
     Args:
-        from_symbol: The caller end of the question ("can this reach ...").
+        from_symbol: The caller end ("can this reach ...").
         to_symbol: The callee end ("... this function?").
-        project_root: Project directory. Omit to use the client's workspace
-            root (or the server's default); if several workspace roots are
-            open, pass the one you mean.
         max_depth: Longest chain to consider, in calls (1-12, default 8).
-        format: "json" (default) for {path_found, hops, depth,
-            nodes_explored}; "text" for the chain rendering. Hops run from
-            from_symbol to to_symbol; each hop's path/line is the call site
-            of the NEXT hop (the last hop is to_symbol at its definition).
     """
     max_depth = max(1, min(max_depth, 12))
     stdout, root, err = _raw_global(["-x", "--", to_symbol], project_root)
@@ -1604,26 +1422,17 @@ def blast_radius(
 ) -> str:
     """Which functions are impacted by a change? (refactoring blast radius)
 
-    Use this after editing code, or before merging, to see how far a change
-    reaches: it takes the `git diff` against `git_ref`, maps every changed
-    line to its enclosing function via the index, then walks the caller
-    graph outward. Results are ranked by distance — the changed functions
-    themselves first (distance 0), their direct callers next (distance 1),
-    and so on — so the top of the list is always what to re-check first.
+    Use this after editing or before merging: maps every line of
+    `git diff <git_ref>` to its enclosing function via the index, then walks
+    the caller graph outward. Ranked by distance — changed functions first,
+    direct callers next. JSON results: {symbol, path, line, distance, via,
+    call_sites} records.
 
     Args:
-        git_ref: Diff base understood by `git diff` — a commit, branch, or
-            range (default HEAD = uncommitted changes; use "HEAD~1" for the
-            last commit, "main..." for a whole branch).
-        project_root: Project directory (must be a git work tree). Omit to
-            use the client's workspace root (or the server's default).
+        git_ref: Diff base for `git diff` (default HEAD = uncommitted
+            changes; "HEAD~1" for the last commit, "main..." for a branch).
         depth: Caller levels to expand beyond the changed functions (0-3,
             default 1; 0 = just list the changed functions).
-        limit: Maximum results to return (default 100).
-        offset: Skip this many results (for pagination).
-        format: "json" (default) for records {symbol, path, line, distance,
-            via, call_sites} — `via` is the already-impacted function this
-            caller reaches the change through; "text" for a ranked listing.
     """
     depth = max(0, min(depth, 3))
     if git_ref.startswith("-"):
@@ -1815,31 +1624,19 @@ def symbol_info(
 ) -> str:
     """One-shot overview card for a symbol — the best FIRST query.
 
-    Use this before anything else when you encounter an unfamiliar symbol:
-    one call returns where it's defined, WHAT it is (function/macro/struct/
-    typedef/enum-constant, with signature and enclosing scope when
-    available), under WHICH #ifdef guards each definition lives (kernel and
-    firmware code defines symbols multiple times under different configs —
-    guard_variants > 1 tells you the flat list is really a config choice),
-    how widely it's used, which files use it most, and which tool to reach
-    for next. Cheaper than any combination of grep and file reads.
-    Macro-generated symbols (sys_*, trace_*, DEFINE_SPINLOCK/DEFINE_PER_CPU
-    names) resolve to their generator invocation site, flagged by
-    resolved_via; kernel symbols report their EXPORT_SYMBOL* variant in
-    "exported".
+    One call returns where a symbol is defined, WHAT it is (kind, signature,
+    scope), under WHICH #ifdef guards each definition lives (guard_variants
+    > 1 means the flat list is really a config choice), how widely it's used
+    and where, plus the tool to use next. Macro-generated symbols resolve
+    (resolved_via); kernel symbols report their EXPORT_SYMBOL* variant in
+    "exported". JSON results: {definitions, definition_count, guard_variants,
+    resolved_via, exported, reference_count, file_count, top_files}.
 
     Args:
         symbol: Exact symbol name.
-        project_root: Project directory. Omit to use the client's workspace
-            root (or the server's default); if several workspace roots are
-            open, pass the one you mean.
-        format: "json" (default) for {definitions, definition_count,
-            guard_variants, resolved_via, exported, reference_count,
-            file_count, top_files}; "text" for the overview card.
-        active_config: Kernel .config path or comma-separated macro list
-            (e.g. "CONFIG_SMP,!CONFIG_DEBUG"); definitions whose guard stack
-            is definitely false under it are dropped and reported as
-            config_filtered. Unknown macros never drop anything.
+        active_config: Kernel .config path or macro list; definitions whose
+            guard stack is definitely false under it are dropped
+            (config_filtered).
     """
     defs_out, root, err = _raw_global(["-x", "--", symbol], project_root)
     if err:
@@ -1868,8 +1665,8 @@ def symbol_info(
             hint = "summarize_references (usage is very widespread), then find_callers on hot files"
             hint_tools = ["summarize_references", "find_callers"]
         else:
-            hint = "get_symbol_body to read it; find_callers or call_hierarchy for impact"
-            hint_tools = ["get_symbol_body", "find_callers", "call_hierarchy"]
+            hint = "get_symbol_body to read it; find_callers for impact"
+            hint_tools = ["get_symbol_body", "find_callers"]
     elif defs:
         hint = "get_symbol_body to read it"
         hint_tools = ["get_symbol_body"]
@@ -1977,19 +1774,12 @@ def list_file_symbols(
 ) -> str:
     """List every symbol defined in one source file.
 
-    Use this INSTEAD of reading a whole file when you only need its API
-    surface — functions, structs, macros it defines — as a compact list.
+    Use this INSTEAD of reading a file when you only need its API surface —
+    the functions, structs, and macros it defines — as a compact list with
+    ctags metadata and #ifdef guard stacks when available.
 
     Args:
-        file_path: Path to the source file, relative to the project root or absolute.
-        project_root: Project directory. Omit to use the client's workspace
-            root (or the server's default); if several workspace roots are
-            open, pass the one you mean.
-        limit: Maximum result lines to return (default 100).
-        offset: Skip this many result lines (for pagination).
-        format: "json" (default) for structured records with ctags metadata
-            (kind/typeref/scope/signature) and #ifdef guard stacks when
-            available; "text" for raw lines.
+        file_path: Source file, relative to the project root or absolute.
     """
     return _query_global(
         "list_file_symbols",
@@ -2012,20 +1802,14 @@ def update_index(
 ) -> str:
     """Synchronously refresh the index — the guaranteed-freshness barrier.
 
-    Query tools refresh the index automatically in the BACKGROUND, so their
-    results can lag very recent edits by a few seconds. Call this when you
-    just edited files and need the very next query to see the changes: it
-    blocks until the refresh is complete. Pass full=true to rebuild the
-    index from scratch instead (rarely needed — e.g. after a large branch
-    switch, or if the index seems corrupt).
+    Query tools refresh the index automatically in the background, so
+    results can lag very recent edits by a few seconds. Call this right
+    after editing files when the very next query must see the changes.
 
     Args:
-        project_root: Project directory. Omit to use the client's workspace
-            root (or the server's default); if several workspace roots are
-            open, pass the one you mean.
         full: Rebuild the index from scratch instead of refreshing it
-            incrementally.
-        format: "json" (default) for {status, message}; "text" for a sentence.
+            incrementally (rarely needed — large branch switch, suspected
+            corruption).
     """
     def _respond(message: str, error: bool = False) -> str:
         if format != "json":

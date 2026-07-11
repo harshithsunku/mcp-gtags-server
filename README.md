@@ -201,25 +201,11 @@ Precedence: tool-call argument > CLI flag > environment variable > project confi
 |---|---|
 | `symbol_info` | **A one-shot overview card** — definitions (with kind, signature, scope, and `#ifdef` guard), reference count, hottest files, `EXPORT_SYMBOL*` status, and which tool to use next. Multiply-defined symbols are explained as "N definitions under M distinct guards"; macro-generated ones resolve with a `resolved_via` flag. The best first query for any unfamiliar symbol. |
 | `get_symbol_body` | **Just the source of a definition.** The 271-line `tcp_v4_rcv` function — not the 3,500-line file it lives in. Handles functions, structs, and multi-line macros. |
-| `find_callers` | **The call graph, deduplicated.** Every reference mapped to its enclosing function with call counts: 245 raw lines for `ext4_mark_inode_dirty` collapse to 62 callers. |
-| `call_hierarchy` | **Multi-level impact analysis.** Who calls X, who calls *those*, up to 5 levels — a cycle-safe, capped tree instead of N rounds of grep. |
+| `find_callers` | **The call graph, deduplicated.** Every reference mapped to its enclosing function with call counts: 245 raw lines for `ext4_mark_inode_dirty` collapse to 62 callers. Iterate it to walk the caller graph as deep as you need. |
 | `find_callees` | **The outgoing call graph.** What does this function call? Body-extracted call sites, each verified against the index, split into in-tree (with locations) and external. |
 | `reachability` | **"Can this function end up in that one?"** — BFS over the caller graph returns the *shortest* call chain from A to B with the file:line of every call site (`ksys_read → vfs_read → rw_verify_area`), or an honest "no static path" that names the function-pointer caveat. One call instead of a dozen find_callers rounds. |
 | `blast_radius` | **What does my diff impact?** Takes `git diff <ref>`, maps changed lines to their enclosing functions via the index, then walks callers outward — results ranked by distance (changed functions first, direct callers next). The pre-merge "what else must I re-check" answer, tied to real git state. |
 | `summarize_references` | **A ranked per-file count.** The cheap first move for hot symbols — `kmalloc`'s 2,744 references become one screen of "where usage concentrates". |
-
-A two-level `call_hierarchy` on the kernel's `ext4_mark_inode_dirty` — 87 compact lines instead of dozens of grep rounds:
-
-```text
-ext4_mark_inode_dirty  (definition: fs/ext4/ext4_jbd2.h:138)
-├─ ext4_rename  fs/ext4/namei.c  (6 sites)
-│  └─ ext4_rename2  fs/ext4/namei.c  (1 site)
-├─ swap_inode_boot_loader  fs/ext4/ioctl.c  (5 sites)
-│  └─ __ext4_ioctl  fs/ext4/ioctl.c  (1 site)
-├─ ext4_mkdir  fs/ext4/namei.c  (3 sites)
-│  └─ ext4_rename2  fs/ext4/namei.c  (1 site)
-...
-```
 
 ### Core lookups
 
@@ -258,7 +244,7 @@ Since v0.8.0 every tool returns a **machine-readable JSON envelope by default** 
 - **`resolved_via` says *how* a symbol was found** when it took macro-family resolution rather than a literal index match (`"macro:SYSCALL_DEFINE"`, `"fuzzy:vfs_read"`) — see [Macro-generated symbols](#macro-generated-symbols-resolve-too-sys_read--syscall_define3).
 - `next_tools` tells the agent the highest-value follow-up call for what was (or wasn't) found.
 - `total`/`offset`/`truncated` replace the text continuation footer; errors keep the envelope with an `error` field.
-- Composite tools return tool-shaped `results` (e.g. `call_hierarchy` a nested caller tree, `find_callees` `{in_tree, external}`, `symbol_info` an overview object, `reachability` a hop chain) inside the same envelope.
+- Composite tools return tool-shaped `results` (e.g. `find_callees` `{in_tree, external}`, `symbol_info` an overview object, `reachability` a hop chain) inside the same envelope.
 
 ### `#ifdef`-aware: know which definition your config actually compiles
 
@@ -336,7 +322,7 @@ Incremental refreshes recollect the list, so newly ignored files drop out of the
 
 ```text
 1. symbol_info("kmalloc")                    → definitions + usage spread + next step (12 lines)
-2. call_hierarchy("ext4_mark_inode_dirty")   → multi-level impact tree (1 line/caller)
+2. find_callers("ext4_mark_inode_dirty")     → deduped callers with counts (1 line/caller)
 3. get_symbol_body("tcp_v4_rcv")             → read the ONE function that matters
 4. find_callees("tcp_v4_rcv")                → what it depends on, with locations
 5. reachability("ksys_read", "rw_verify_area") → the call chain, one line per hop
@@ -360,7 +346,7 @@ sudo dnf install ctags python3-pygments             # Fedora
 brew install ctags && pip install pygments          # macOS
 ```
 
-Now `find_definition("py_util")`, `get_symbol_body` (indentation-aware for Python), `find_callees`, `call_hierarchy` — all work across every language in the tree, in one index.
+Now `find_definition("py_util")`, `get_symbol_body` (indentation-aware for Python), `find_callees`, `find_callers` — all work across every language in the tree, in one index.
 
 Force a specific parser label with `--label`, `GTAGS_MCP_LABEL`, or `label` in `.gtags-mcp.toml` (e.g. `default` for native-only, `pygments` for plugin-everything).
 
@@ -380,7 +366,7 @@ flowchart LR
     end
 
     subgraph proc["mcp-gtags-server — spawned once per window, lives for the session"]
-        T["12 navigation tools"]
+        T["11 navigation tools"]
         RR["root resolution<br/>project_root → env → config → client roots → cwd"]
     end
 

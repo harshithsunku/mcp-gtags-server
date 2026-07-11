@@ -55,15 +55,14 @@ _NEXT_TOOLS: dict[str, tuple[list[str], list[str]]] = {
         ["find_references"],
     ),
     "find_callers": (
-        ["call_hierarchy", "get_symbol_body"],
+        ["get_symbol_body", "find_callees"],
         ["find_references"],
     ),
     "summarize_references": (
         ["find_callers", "find_references"],
         [],
     ),
-    "call_hierarchy": (["get_symbol_body", "find_callees"], ["find_references"]),
-    "find_callees": (["get_symbol_body", "call_hierarchy"], []),
+    "find_callees": (["get_symbol_body", "find_callers"], []),
     "reachability": (
         ["get_symbol_body", "find_callers"],
         ["find_callers", "find_callees"],

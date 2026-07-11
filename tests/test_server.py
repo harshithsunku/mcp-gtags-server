@@ -367,44 +367,6 @@ def test_summarize_references(c_project):
     assert {r["path"] for r in summary["results"]} == {"main.c", "util.h"}
 
 
-CHAIN_C = """\
-#include "util.h"
-int level1(void) { return add_numbers(1, 2); }
-int level2(void) { return level1(); }
-int level3(void) { return level2(); }
-int rec_fn(int n) { return n <= 0 ? 0 : rec_fn(n - 1); }
-"""
-
-
-@requires_global
-def test_call_hierarchy_multi_level(c_project):
-    (c_project / "chain.c").write_text(CHAIN_C)
-    root = str(c_project)
-
-    deep = server.call_hierarchy("add_numbers", root, depth=3, format="text")
-    assert deep.startswith("add_numbers  (definition: util.c:3)")
-    assert "level1" in deep and "level2" in deep and "level3" in deep
-    # level2 is one level deeper than level1 in the rendered tree
-    l1 = next(l for l in deep.splitlines() if "level1" in l)
-    l2 = next(l for l in deep.splitlines() if "level2" in l)
-    assert len(l2) - len(l2.lstrip("│ ")) > len(l1) - len(l1.lstrip("│ "))
-
-    shallow = server.call_hierarchy("add_numbers", root, depth=1, format="text")
-    assert "level1" in shallow and "level2" not in shallow
-
-    tree = json.loads(server.call_hierarchy("add_numbers", root, depth=3))["results"]
-    assert tree["definition"] == {"path": "util.c", "line": 3}
-    level1 = next(c for c in tree["callers"] if c["caller"] == "level1")
-    assert any(c["caller"] == "level2" for c in level1["callers"])
-
-
-@requires_global
-def test_call_hierarchy_handles_recursion(c_project):
-    (c_project / "chain.c").write_text(CHAIN_C)
-    result = server.call_hierarchy("rec_fn", str(c_project), depth=3, format="text")
-    assert "(recursive)" in result
-
-
 @requires_global
 def test_find_callees(c_project):
     root = str(c_project)
@@ -1085,7 +1047,7 @@ def test_mcp_tool_schemas_stable():
     import anyio
 
     tools = {t.name: t for t in anyio.run(server.mcp.list_tools)}
-    assert len(tools) == 12
+    assert len(tools) == 11
     props = tools["find_definition"].inputSchema["properties"]
     assert {
         "symbol", "project_root", "case_insensitive",
