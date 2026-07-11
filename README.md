@@ -80,6 +80,8 @@ Or click the **Cursor one-click install** badge at the top of this page.
 
 On the very first tool call the server bootstraps everything else by itself: GNU Global (prebuilt user-space binaries — no compiler, no sudo), universal-ctags, and Pygments, all into `~/.gtags-mcp`. While that one-time install runs (a few seconds on most platforms), tool calls return a *"toolchain is being installed — retry shortly"* status instead of failing. Opt out with `--no-auto-setup` or `GTAGS_MCP_AUTO_SETUP=0`.
 
+The prebuilt Linux binaries run on any distro with glibc ≥ 2.28 (RHEL/Rocky 8+, Ubuntu 18.10+, Debian 10+). On older hosts — or if a downloaded binary fails its post-install execution check — setup automatically compiles GNU Global from source instead, which only needs `make` and a C compiler.
+
 ### Option B — one-line installer (shared background server)
 
 **One command. No sudo. Works everywhere** — restricted corporate machines, containers, build servers:
@@ -436,7 +438,7 @@ Tests build a real C project in a temp dir and exercise auto-indexing, auto-refr
 
 Correctness is also measured, not assumed: `mcp-gtags-server eval --golden evals/golden.jsonl --root <kernel-tree>` runs a 65-case golden set covering all 11 tools (definitions, macro resolution, references, callers, callees, bodies, guards, reachability, maintenance) against a real kernel and prints recall / precision@1 — CI does this weekly against a pinned tag. See [docs/capability.md](docs/capability.md) for the current numbers.
 
-Release flow: bump `version` in `pyproject.toml`, tag `vX.Y.Z`, push — CI publishes to PyPI and users pick the update up on their next installer re-run. Prebuilt GNU Global binaries are rebuilt by tagging `global-v<version>`.
+Release flow: bump `version` in `pyproject.toml`, tag `vX.Y.Z`, push — CI publishes to PyPI and users pick the update up on their next installer re-run. Prebuilt GNU Global binaries are rebuilt by tagging `global-v<version>` (or `gh workflow run release-binaries.yml -f version=<version>` to replace the assets of an existing release in place); Linux builds run inside manylinux_2_28 containers so they work on any glibc ≥ 2.28 host, enforced by a CI symbol-ceiling check.
 
 ## Roadmap
 
