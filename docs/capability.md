@@ -21,7 +21,7 @@ path-level so they hold across kernel versions.
 Current scores:
 
 ```
-local, mid-2026 master snapshot: 65/65 = 100.0% recall, 15/15 = 100.0% precision@1, 14s
+local, mid-2026 master snapshot: 65/65 = 100.0% recall, 14/14 = 100.0% precision@1, 14s
 CI, kernel v6.16 (pinned):       published on every push
 ```
 
@@ -29,8 +29,10 @@ One case (`def-mutex_lock`) was a deliberate known-fail from v1.0.0 through
 v1.3.1: recent kernels added sparse `__acquires()` annotations to mutex
 forward declarations, and GNU Global's C parser derails on them, missing the
 real `mutex_lock` definition. v1.4.0 closes it with **ctags export
-recovery** (see "What resolves"), and the case now also asserts the recovery
-mechanism itself.
+recovery** (see "What resolves"). The golden case stays path-level so it
+holds on every kernel version — old kernels index the definition natively,
+new ones get it via recovery — while the recovery mechanism itself is
+asserted deterministically in the unit suite.
 
 ## What resolves
 
