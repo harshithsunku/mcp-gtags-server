@@ -113,17 +113,21 @@ def test_query_flow(c_project):
     symbols = server.list_file_symbols("util.c", root)
     assert "add_numbers" in symbols
 
-    completions = server.complete_symbol("add_", root)
-    assert "add_numbers" in completions
+    # printf has no in-tree reference records: find_references falls back to
+    # the symbol-usage database (`global -sx`) and flags it in the envelope.
+    usages = json.loads(server.find_references("printf", root))
+    assert usages["fallback"] == "symbol_usages"
+    assert any(r["path"] == "main.c" for r in usages["results"])
 
-    grep = server.grep_project("TODO", root)
-    assert "main.c" in grep
 
-    files = server.find_files(r"util\.c$", root)
-    assert "util.c" in files
-
-    usages = server.find_symbol_usages("printf", root)
-    assert "main.c" in usages
+@requires_global
+def test_definition_miss_carries_prefix_suggestions(c_project):
+    root = str(c_project)
+    miss = json.loads(server.find_definition("add_", root))
+    assert miss["results"] == []
+    assert "add_numbers" in miss["suggestions"]
+    text = server.find_definition("add_", root, format="text")
+    assert "Similar defined symbols: add_numbers" in text
 
 
 @requires_global
@@ -258,30 +262,40 @@ def test_corrupted_index_auto_recovers(c_project):
 @requires_global
 def test_explicit_index_and_update_tools(c_project):
     root = str(c_project)
-    assert "Indexed" in server.index_project(root)
+    assert "Rebuilt" in server.update_index(root, full=True)
 
     (c_project / "extra.c").write_text("int extra_fn(void) { return 42; }\n")
     assert "updated" in server.update_index(root)
     assert "extra.c" in server.find_definition("extra_fn", root)
 
 
+@pytest.fixture
+def many_symbols_project(c_project):
+    """The tiny C project plus a file defining four functions (pagination)."""
+    (c_project / "many.c").write_text(
+        "int fn_a(void) { return 1; }\n"
+        "int fn_b(void) { return 2; }\n"
+        "int fn_c(void) { return 3; }\n"
+        "int fn_d(void) { return 4; }\n"
+    )
+    return c_project
+
+
 @requires_global
-def test_pagination(c_project):
-    root = str(c_project)
-    # 4 symbols total across the project: UTIL_H, add_numbers (x2 via -c? no)
-    # Use grep for a predictable multi-line result: every line containing 'int'.
-    full = server.grep_project("int", root, limit=100, format="text")
+def test_pagination(many_symbols_project):
+    root = str(many_symbols_project)
+    full = server.list_file_symbols("many.c", root, limit=100, format="text")
     total = len(full.splitlines())
     assert total >= 3
 
-    page = server.grep_project("int", root, limit=2, format="text")
+    page = server.list_file_symbols("many.c", root, limit=2, format="text")
     assert f"showing 1-2 of {total} matches" in page
     assert "pass offset=2 to continue" in page
 
-    page2 = server.grep_project("int", root, limit=2, offset=2, format="text")
+    page2 = server.list_file_symbols("many.c", root, limit=2, offset=2, format="text")
     assert f"showing 3-{min(4, total)} of {total} matches" in page2
 
-    past_end = server.grep_project("int", root, offset=999, format="text")
+    past_end = server.list_file_symbols("many.c", root, offset=999, format="text")
     assert "past the last" in past_end
 
 
@@ -418,36 +432,6 @@ def test_symbol_info(c_project):
     assert "get_symbol_body" in info["next_tools"]
 
 
-@requires_global
-def test_project_overview(c_project):
-    result = server.project_overview(str(c_project), format="text")
-    assert "3 indexed source files" in result
-    assert ".c (2)" in result and ".h (1)" in result
-
-    overview = json.loads(server.project_overview(str(c_project)))["results"]
-    assert overview["file_count"] == 3
-    assert {"ext": ".c", "files": 2} in overview["file_types"]
-
-
-@requires_global
-def test_find_dead_symbols(c_project):
-    (c_project / "dead.c").write_text(
-        '#include "util.h"\n'
-        "int dead_fn(void) { return 0; }\n"
-        "int live_fn(void) { return add_numbers(1, 1); }\n"
-        "int caller_of_live(void) { return live_fn(); }\n"
-    )
-    result = server.find_dead_symbols("dead.c", str(c_project))
-    assert "dead_fn" in result
-    assert "live_fn  " not in result  # live_fn is referenced by caller_of_live
-
-
-@requires_global
-def test_find_includers(c_project):
-    result = server.find_includers("util.h", str(c_project))
-    assert "main.c" in result and "util.c" in result
-
-
 @pytest.fixture
 def mixed_project(c_project):
     (c_project / "pylib.py").write_text(
@@ -516,7 +500,7 @@ def test_python_callees(mixed_project):
 
 @requires_pygments
 def test_index_reports_multilanguage_label(mixed_project):
-    result = server.index_project(str(mixed_project))
+    result = server.update_index(str(mixed_project), full=True)
     assert "native-pygments" in result
 
 
@@ -571,25 +555,25 @@ def test_json_next_tools_hints(c_project):
     hit = json.loads(server.find_definition("add_numbers", root))
     assert "get_symbol_body" in hit["next_tools"]
     miss = json.loads(server.find_definition("no_such_symbol", root))
-    assert "find_symbol_usages" in miss["next_tools"]
+    assert "find_references" in miss["next_tools"]
 
 
 @requires_global
-def test_json_pagination(c_project):
-    root = str(c_project)
-    full = json.loads(server.grep_project("int", root, limit=100))
+def test_json_pagination(many_symbols_project):
+    root = str(many_symbols_project)
+    full = json.loads(server.list_file_symbols("many.c", root, limit=100))
     total = full["total"]
     assert total >= 3 and full["truncated"] is False
 
-    page = json.loads(server.grep_project("int", root, limit=2))
+    page = json.loads(server.list_file_symbols("many.c", root, limit=2))
     assert len(page["results"]) == 2
     assert page["total"] == total and page["truncated"] is True
 
-    page2 = json.loads(server.grep_project("int", root, limit=2, offset=2))
+    page2 = json.loads(server.list_file_symbols("many.c", root, limit=2, offset=2))
     assert page2["offset"] == 2
     assert page2["results"][0] == full["results"][2]
 
-    past_end = json.loads(server.grep_project("int", root, offset=999))
+    past_end = json.loads(server.list_file_symbols("many.c", root, offset=999))
     assert past_end["results"] == [] and past_end["total"] == total
 
 
@@ -609,8 +593,8 @@ def test_gitignored_files_are_not_indexed(git_project):
     assert "util.c" in server.find_definition("add_numbers", root)  # indexed fine
     result = json.loads(server.find_definition("generated_fn", root))
     assert result["results"] == []
-    files = json.loads(server.find_files(r"\.c$", root))["results"]
-    assert {"path": "build/generated.c"} not in files
+    paths, _, err = server._raw_global(["-P"], root)
+    assert err is None and "build/generated.c" not in paths
 
 
 @requires_global
@@ -772,12 +756,10 @@ def test_symbol_info_card_enriched(rich_c_project):
 
 @requires_global
 @requires_ctags_json
-def test_references_and_grep_stay_unenriched(rich_c_project):
+def test_references_stay_unenriched(rich_c_project):
     root = str(rich_c_project)
     refs = json.loads(server.find_references("SQUARE", root))["results"]
     assert refs and all(r["kind"] is None for r in refs)
-    hits = json.loads(server.grep_project("int", root))["results"]
-    assert hits and all(r["kind"] is None for r in hits)
 
 
 @requires_global
@@ -1060,19 +1042,21 @@ def test_index_dir_never_indexed(c_project):
     """The .gtags-mcp database itself must not appear in any results."""
     root = str(c_project)
     server.find_definition("add_numbers", root)  # builds .gtags-mcp/
-    server.index_project(root)  # full rebuild with the dir already present
+    server.update_index(root, full=True)  # full rebuild with the dir already present
 
-    files = json.loads(server.find_files(".", root, limit=500))["results"]
-    assert files and not any(server.INDEX_DIR_NAME in f["path"] for f in files)
+    paths, _, err = server._raw_global(["-P"], root)
+    assert err is None and paths.strip()
+    assert server.INDEX_DIR_NAME not in paths
 
 
 @requires_global
 def test_index_dir_never_indexed_in_git_repo(git_project):
     root = str(git_project)
     server.find_definition("add_numbers", root)
-    server.index_project(root)
-    files = json.loads(server.find_files(".", root, limit=500))["results"]
-    assert files and not any(server.INDEX_DIR_NAME in f["path"] for f in files)
+    server.update_index(root, full=True)
+    paths, _, err = server._raw_global(["-P"], root)
+    assert err is None and paths.strip()
+    assert server.INDEX_DIR_NAME not in paths
     # git must not see the index either (self-gitignoring directory).
     status = subprocess.run(
         ["git", "-C", root, "status", "--porcelain"],
@@ -1101,7 +1085,7 @@ def test_mcp_tool_schemas_stable():
     import anyio
 
     tools = {t.name: t for t in anyio.run(server.mcp.list_tools)}
-    assert len(tools) == 20
+    assert len(tools) == 12
     props = tools["find_definition"].inputSchema["properties"]
     assert {
         "symbol", "project_root", "case_insensitive",

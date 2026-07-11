@@ -46,8 +46,8 @@ mcp = FastMCP(
         "ALWAYS prefer these tools over grep/text search for code questions: "
         "they answer from a prebuilt index in milliseconds and return only "
         "the relevant lines, even on codebases with millions of lines. "
-        "Start with symbol_info for any unfamiliar symbol, or "
-        "project_overview for an unfamiliar repo. Then: get_symbol_body to "
+        "Start with symbol_info for any unfamiliar symbol. "
+        "Then: get_symbol_body to "
         "read an implementation, find_callers / call_hierarchy for impact "
         "analysis, find_callees to see what a function depends on, and "
         "summarize_references first for very widely used symbols. "
@@ -67,6 +67,8 @@ MAX_LINE_CHARS = 200
 MAX_BODY_LINES = 300
 # symbol_info guard-scans at most this many definitions of one symbol.
 MAX_GUARDED_DEFS = 50
+# Empty find_definition results carry at most this many prefix suggestions.
+MAX_SUGGESTIONS = 10
 QUERY_TIMEOUT_SECONDS = 120
 INDEX_TIMEOUT_SECONDS = 600
 # Skip the incremental freshness check when the same root was updated this
@@ -97,12 +99,6 @@ _no_enrich = False
 _no_guards = False
 # Macro-family symbol resolution disabled by --no-macro-resolve.
 _no_macro_resolve = False
-
-# File extensions GNU Global's built-in parser understands.
-_NATIVE_EXTENSIONS = frozenset(
-    ".c .h .cc .cpp .cxx .hh .hpp .hxx .java .php .php3 .phtml .y .s .S .asm".split()
-)
-
 
 def _plugin_deps_available() -> bool:
     """True when the ctags + Pygments plugin-parser dependencies are usable."""
@@ -592,6 +588,15 @@ def _raw_global(
     return stdout, root, None
 
 
+def _prefix_suggestions(symbol: str, project_root: str | None) -> list[str]:
+    """Defined symbols starting with `symbol`, for empty-result envelopes."""
+    stdout, _, err = _raw_global(["-c", "--", symbol], project_root)
+    if err or not stdout:
+        return []
+    names = [line.strip() for line in stdout.splitlines() if line.strip()]
+    return [name for name in names if name != symbol][:MAX_SUGGESTIONS]
+
+
 def _query_global(
     tool: str,
     flags: list[str],
@@ -600,20 +605,30 @@ def _query_global(
     limit: int = DEFAULT_LIMIT,
     offset: int = 0,
     format: Format = "json",
-    parse: str = "cxref",  # cxref | symbol | path — shape of `global` stdout
-    record_symbol: str | None = None,
     enrich_records: bool = False,  # ctags metadata on definition-shaped results
-    guard_records: bool = False,  # #ifdef guard stacks on cxref results
+    guard_records: bool = False,  # #ifdef guard stacks on results
     active_config: str | None = None,  # .config / macro list to filter guards by
     macro_symbol: str | None = None,  # macro-family fallback for this symbol
+    fallback_flags: list[str] | None = None,  # rerun with these when empty
+    suggest_symbol: str | None = None,  # prefix suggestions when still empty
 ) -> str:
-    """Shared plumbing for all read-only `global` queries."""
+    """Shared plumbing for all read-only `global` cxref queries."""
     stdout, root, err = _raw_global(flags, project_root)
     if err:
         return output.error(tool, err, root) if format == "json" else err
+    used_fallback = False
+    if fallback_flags and not stdout.strip():
+        # e.g. find_references: no indexed reference (`-rx`) — fall back to
+        # symbol usages (`-sx`), which cover identifiers gtags recorded
+        # without an in-tree definition (libc calls, some variables).
+        fb_stdout, _, fb_err = _raw_global(fallback_flags, project_root)
+        if not fb_err and fb_stdout.strip():
+            stdout = fb_stdout
+            used_fallback = True
     warning = _pop_refresh_warning(root)
     if format == "text":
-        suffix = f"\n\n{warning}" if warning else ""
+        suffix = "\n(no indexed references — showing symbol usages)" if used_fallback else ""
+        suffix += f"\n\n{warning}" if warning else ""
         if not stdout.strip():
             if macro_symbol:
                 hits, via = _macro_resolve(macro_symbol, project_root, root, True)
@@ -622,24 +637,20 @@ def _query_global(
                         f"{s:<16} {lineno:>4} {path} {src}" for s, lineno, path, src in hits
                     )
                     return _paginate(text, limit, offset) + f"\n(resolved via {via})" + suffix
+            if suggest_symbol:
+                if names := _prefix_suggestions(suggest_symbol, project_root):
+                    suffix += "\nSimilar defined symbols: " + ", ".join(names)
             return empty_message + suffix
         return _paginate(stdout.rstrip(), limit, offset) + suffix
-    if parse == "cxref":
-        items = [
-            output.record(record_symbol or r[0], r[2], r[1], r[3])
-            for line in stdout.splitlines()
-            if (r := _parse_cxref(line))
-        ]
-    elif parse == "symbol":
-        items = [{"symbol": line.strip()} for line in stdout.splitlines() if line.strip()]
-    else:  # path
-        items = [
-            {"path": p[2:] if p.startswith("./") else p}
-            for line in stdout.splitlines()
-            if (p := line.strip())
-        ]
+    items = [
+        output.record(r[0], r[2], r[1], r[3])
+        for line in stdout.splitlines()
+        if (r := _parse_cxref(line))
+    ]
     extra: dict = {}
-    if macro_symbol and parse == "cxref":
+    if used_fallback:
+        extra["fallback"] = "symbol_usages"
+    if macro_symbol:
         hits, via = _macro_resolve(macro_symbol, project_root, root, not items)
         if hits:
             known = {(rec["path"], rec["line"]) for rec in items}
@@ -651,7 +662,7 @@ def _query_global(
                 rec for rec in resolved if (rec["path"], rec["line"]) not in known
             ] + items
             extra["resolved_via"] = via
-    if active_config and parse == "cxref":
+    if active_config:
         # Explicit intent must not fail silently: bad specs and disabled
         # guard scanning are errors, not quietly-unfiltered results.
         if not _guards_enabled(root):
@@ -669,12 +680,14 @@ def _query_global(
         items, dropped = _maybe_guard(items, root, cfg)
         extra["config_filtered"] = dropped
     page, total, truncated = output.paginate(items, limit, offset)
-    if enrich_records and parse == "cxref":
+    if enrich_records:
         _maybe_enrich(page, root)  # after pagination: only one page pays ctags
-    if guard_records and parse == "cxref" and not active_config:
+    if guard_records and not active_config:
         _maybe_guard(page, root)  # guards already filled when config-filtered
     if not items:
         extra["message"] = empty_message
+        if suggest_symbol:
+            extra["suggestions"] = _prefix_suggestions(suggest_symbol, project_root)
     return output.envelope(
         tool,
         root,
@@ -945,7 +958,9 @@ def find_definition(
     "trace_sched_switch", or a DEFINE_SPINLOCK/DEFINE_PER_CPU/module_param
     name returns the generator invocation site (SYSCALL_DEFINE3(read, ...)),
     flagged by a "resolved_via" field in the envelope — no preprocessor or
-    build needed.
+    build needed. When nothing matches, the envelope carries "suggestions":
+    defined symbols that start with the queried name — so a partial name
+    still gets you to the right symbol in one call.
 
     Args:
         symbol: Exact symbol name, e.g. "tcp_v4_rcv" or "list_head".
@@ -982,6 +997,7 @@ def find_definition(
         guard_records=True,
         active_config=active_config,
         macro_symbol=symbol,
+        suggest_symbol=symbol,
     )
 
 
@@ -995,13 +1011,16 @@ def find_references(
     format: Format = "json",
     active_config: str | None = None,
 ) -> str:
-    """Find all call/usage sites of a defined C/C++ symbol.
+    """Find all call/usage sites of a C/C++ symbol.
 
     Use this INSTEAD of grep when you need who calls a function or uses a
     type — grep returns every textual match including comments and strings,
     while this returns only real reference sites from the index, instantly
     even on huge trees. Each reference carries its #if/#ifdef guard stack,
-    so you can see which call sites are conditional.
+    so you can see which call sites are conditional. Symbols with no in-tree
+    definition (libc calls like printf, some variables) are covered too: when
+    the index has no reference records, the query falls back to symbol-usage
+    records automatically, flagged by "fallback": "symbol_usages".
 
     Args:
         symbol: Exact symbol name whose call/usage sites you want.
@@ -1018,10 +1037,10 @@ def find_references(
             drops references whose guard stack is definitely false under it
             (reported as config_filtered). Unknown macros never drop anything.
     """
-    flags = ["-rx"] + (["-i"] if case_insensitive else []) + ["--", symbol]
+    ci = ["-i"] if case_insensitive else []
     return _query_global(
         "find_references",
-        flags,
+        ["-rx", *ci, "--", symbol],
         project_root,
         f"No references found for symbol '{symbol}'.",
         limit,
@@ -1029,6 +1048,7 @@ def find_references(
         format,
         guard_records=True,
         active_config=active_config,
+        fallback_flags=["-sx", *ci, "--", symbol],
     )
 
 
@@ -1854,8 +1874,8 @@ def symbol_info(
         hint = "get_symbol_body to read it"
         hint_tools = ["get_symbol_body"]
     else:
-        hint = "find_symbol_usages to see usage sites"
-        hint_tools = ["find_symbol_usages"]
+        hint = "find_references to see usage sites"
+        hint_tools = ["find_references"]
 
     # Guard-scan EVERY definition (bounded), not just the first three: "N
     # definitions under M distinct guards" must describe the whole set, and
@@ -1937,7 +1957,7 @@ def symbol_info(
             f"({config_filtered} filtered out)"
         )
     else:
-        lines.append("  no in-tree definition (external symbol? try find_symbol_usages)")
+        lines.append("  no in-tree definition (external symbol? try find_references)")
     if refs:
         lines.append(f"  referenced {len(refs)} time(s) across {len(counts)} file(s); top files:")
         lines.extend(f"    {count:5d}  {path}" for path, count in top)
@@ -1945,241 +1965,6 @@ def symbol_info(
         lines.append("  no references found")
     lines.append(f"  next: {hint}")
     return "\n".join(lines)
-
-
-@_gtags_tool
-def project_overview(
-    project_root: str | None = None,
-    top: int = 15,
-    format: Format = "json",
-) -> str:
-    """High-level map of the indexed tree: size, structure, and languages.
-
-    Use this FIRST in an unfamiliar repository to orient yourself before
-    drilling into symbols — it shows where the code mass lives without
-    reading a single file.
-
-    Args:
-        project_root: Project directory. Omit to use the client's workspace
-            root (or the server's default); if several workspace roots are
-            open, pass the one you mean.
-        top: How many top-level directories to list (default 15).
-        format: "json" (default) for {file_count, directories, file_types};
-            "text" for the summary card.
-    """
-    stdout, root, err = _raw_global(["-P"], project_root)
-    if err:
-        return output.error("project_overview", err, root) if format == "json" else err
-    paths = [p for p in stdout.splitlines() if p.strip()]
-
-    dir_counts: dict[str, int] = {}
-    ext_counts: dict[str, int] = {}
-    for p in paths:
-        clean = p[2:] if p.startswith("./") else p
-        head = clean.split("/", 1)[0] if "/" in clean else "(top level)"
-        dir_counts[head] = dir_counts.get(head, 0) + 1
-        ext = ("." + clean.rsplit(".", 1)[1]) if "." in clean.rsplit("/", 1)[-1] else "(none)"
-        ext_counts[ext] = ext_counts.get(ext, 0) + 1
-    ranked = sorted(dir_counts.items(), key=lambda kv: (-kv[1], kv[0]))
-    top_exts = sorted(ext_counts.items(), key=lambda kv: -kv[1])[:8]
-
-    if format == "json":
-        overview = {
-            "file_count": len(paths),
-            "directories": [
-                {"name": name, "files": count} for name, count in ranked[:top]
-            ],
-            "more_directories": max(0, len(ranked) - top),
-            "file_types": [{"ext": ext, "files": count} for ext, count in top_exts],
-        }
-        extra = {} if paths else {"message": "The index contains no files."}
-        return output.envelope(
-            "project_overview", root, overview, total=len(paths), **extra
-        )
-    if not paths:
-        return "The index contains no files."
-    lines = [f"Project: {root} — {len(paths)} indexed source files"]
-    lines.append("Top-level directories by file count:")
-    lines.extend(f"  {count:6d}  {name}/" for name, count in ranked[:top])
-    if len(ranked) > top:
-        lines.append(f"  ... {len(ranked) - top} more directories")
-    lines.append("File types: " + ", ".join(f"{ext} ({count})" for ext, count in top_exts))
-    return "\n".join(lines)
-
-
-@_gtags_tool
-def find_dead_symbols(
-    file_path: str,
-    project_root: str | None = None,
-    format: Format = "json",
-) -> str:
-    """List symbols defined in a file that have ZERO references anywhere.
-
-    Use this for cleanup and refactoring tasks: instead of checking each
-    function by hand, one call reports every dead-code candidate in the
-    file. Caveat: entry points (main), exported APIs, and functions only
-    referenced via pointers or macro tricks can be false positives — treat
-    results as candidates, not verdicts.
-
-    Args:
-        file_path: Source file to audit, relative to the project root or absolute.
-        project_root: Project directory. Omit to use the client's workspace
-            root (or the server's default); if several workspace roots are
-            open, pass the one you mean.
-        format: "json" (default) for {symbol, path, line} items; "text"
-            for a summary listing.
-    """
-    defs_out, root, err = _raw_global(["-fx", "--", file_path], project_root)
-    if err:
-        return output.error("find_dead_symbols", err, root) if format == "json" else err
-    defs = [r for line in defs_out.splitlines() if (r := _parse_cxref(line))]
-    if not defs:
-        message = f"No symbols defined in '{file_path}'."
-        if format == "json":
-            return output.envelope("find_dead_symbols", root, [], message=message)
-        return message
-
-    capped = len(defs) > 100
-    total_defs = len(defs)
-    defs = defs[:100]
-
-    dead: list[dict] = []
-    for sym, lineno, path, _ in defs:
-        refs_out, _, rerr = _raw_global(["-rx", "--", sym], project_root)
-        if not rerr and (not refs_out or not refs_out.strip()):
-            dead.append({"symbol": sym, "path": path, "line": lineno})
-
-    if format == "json":
-        extra = {} if dead else {
-            "message": f"All {len(defs)} symbols defined in '{file_path}' "
-            "are referenced somewhere."
-        }
-        return output.envelope(
-            "find_dead_symbols",
-            root,
-            dead,
-            truncated=capped,
-            checked_definitions=len(defs),
-            total_definitions=total_defs,
-            **extra,
-        )
-    note = f"\n(audit capped at the first 100 of {total_defs} definitions)" if capped else ""
-    if not dead:
-        return f"All {len(defs)} symbols defined in '{file_path}' are referenced somewhere." + note
-    rows = "\n".join(f"  {d['symbol']}  {d['path']}:{d['line']}" for d in dead)
-    return (
-        f"{len(dead)} of {len(defs)} symbols defined in '{file_path}' have no references "
-        "(dead-code candidates):\n" + rows + note
-    )
-
-
-@_gtags_tool
-def find_includers(
-    header_name: str,
-    project_root: str | None = None,
-    limit: int = DEFAULT_LIMIT,
-    offset: int = 0,
-    format: Format = "json",
-) -> str:
-    """Which files #include this header? (C/C++ include-graph impact)
-
-    Use this when changing a header to see the blast radius: every file
-    that includes it, matched by basename so both "util.h" and
-    <net/tcp.h>-style paths are found.
-
-    Args:
-        header_name: Header file name, e.g. "tcp.h" or "net/tcp.h".
-        project_root: Project directory. Omit to use the client's workspace
-            root (or the server's default); if several workspace roots are
-            open, pass the one you mean.
-        limit: Maximum result lines to return (default 100).
-        offset: Skip this many result lines (for pagination).
-        format: "json" (default) for structured records; "text" for raw lines.
-    """
-    base_name = header_name.rsplit("/", 1)[-1]
-    pattern = f'#[[:space:]]*include[[:space:]]*["<]([^">]*/)?{re.escape(base_name)}[">]'
-    return _query_global(
-        "find_includers",
-        ["-gx", "--", pattern],
-        project_root,
-        f"No files include '{header_name}'.",
-        limit,
-        offset,
-        format,
-        record_symbol=base_name,
-    )
-
-
-@_gtags_tool
-def find_symbol_usages(
-    symbol: str,
-    project_root: str | None = None,
-    limit: int = DEFAULT_LIMIT,
-    offset: int = 0,
-    format: Format = "json",
-) -> str:
-    """Find usages of symbols that have no definition inside the project.
-
-    Use this when find_definition returns nothing — typically external or
-    library identifiers (e.g. printf, malloc) and variables gtags did not
-    record as definitions. Still an indexed lookup, not a scan.
-
-    Args:
-        symbol: Exact symbol name.
-        project_root: Project directory. Omit to use the client's workspace
-            root (or the server's default); if several workspace roots are
-            open, pass the one you mean.
-        limit: Maximum result lines to return (default 100).
-        offset: Skip this many result lines (for pagination).
-        format: "json" (default) for structured records; "text" for raw lines.
-    """
-    return _query_global(
-        "find_symbol_usages",
-        ["-sx", "--", symbol],
-        project_root,
-        f"No usages found for undefined symbol '{symbol}'.",
-        limit,
-        offset,
-        format,
-    )
-
-
-@_gtags_tool
-def grep_project(
-    pattern: str,
-    project_root: str | None = None,
-    case_insensitive: bool = False,
-    limit: int = DEFAULT_LIMIT,
-    offset: int = 0,
-    format: Format = "json",
-) -> str:
-    """Regex-search all indexed source files (POSIX extended regex).
-
-    Prefer find_definition / find_references for symbol questions — they are
-    indexed and far narrower. Use this only for arbitrary text that is not a
-    symbol name (comments, string literals, TODO markers). It still beats
-    plain grep: it searches only files the index knows about.
-
-    Args:
-        pattern: Regex to search for, e.g. "TODO|FIXME".
-        project_root: Project directory. Omit to use the client's workspace
-            root (or the server's default); if several workspace roots are
-            open, pass the one you mean.
-        case_insensitive: Match the pattern ignoring case.
-        limit: Maximum result lines to return (default 100).
-        offset: Skip this many result lines (for pagination).
-        format: "json" (default) for structured records; "text" for raw lines.
-    """
-    flags = ["-gx"] + (["-i"] if case_insensitive else []) + ["--", pattern]
-    return _query_global(
-        "grep_project",
-        flags,
-        project_root,
-        f"No matches for pattern '{pattern}'.",
-        limit,
-        offset,
-        format,
-    )
 
 
 @_gtags_tool
@@ -2220,155 +2005,26 @@ def list_file_symbols(
 
 
 @_gtags_tool
-def complete_symbol(
-    prefix: str,
+def update_index(
     project_root: str | None = None,
-    limit: int = DEFAULT_LIMIT,
-    offset: int = 0,
+    full: bool = False,
     format: Format = "json",
 ) -> str:
-    """List defined symbols that start with the given prefix.
-
-    Use this when you know roughly what a function is called but not its
-    exact name — then follow up with find_definition on the right match.
-
-    Args:
-        prefix: Symbol name prefix, e.g. "tcp_" or "init".
-        project_root: Project directory. Omit to use the client's workspace
-            root (or the server's default); if several workspace roots are
-            open, pass the one you mean.
-        limit: Maximum result lines to return (default 100).
-        offset: Skip this many result lines (for pagination).
-        format: "json" (default) for {symbol} items; "text" for one name per line.
-    """
-    return _query_global(
-        "complete_symbol",
-        ["-c", "--", prefix],
-        project_root,
-        f"No symbols starting with '{prefix}'.",
-        limit,
-        offset,
-        format,
-        parse="symbol",
-    )
-
-
-@_gtags_tool
-def find_files(
-    pattern: str,
-    project_root: str | None = None,
-    limit: int = DEFAULT_LIMIT,
-    offset: int = 0,
-    format: Format = "json",
-) -> str:
-    """Find indexed source files whose path matches a regex pattern.
-
-    Use this INSTEAD of `find` or glob scans to locate files in a large
-    tree — it queries the index rather than walking the filesystem.
-
-    Args:
-        pattern: Regex matched against file paths, e.g. "net/.*\\.c$".
-        project_root: Project directory. Omit to use the client's workspace
-            root (or the server's default); if several workspace roots are
-            open, pass the one you mean.
-        limit: Maximum result lines to return (default 100).
-        offset: Skip this many result lines (for pagination).
-        format: "json" (default) for {path} items; "text" for one path per line.
-    """
-    return _query_global(
-        "find_files",
-        ["-P", "--", pattern],
-        project_root,
-        f"No indexed files match '{pattern}'.",
-        limit,
-        offset,
-        format,
-        parse="path",
-    )
-
-
-@_gtags_tool
-def index_project(project_root: str | None = None, format: Format = "json") -> str:
-    """Force a full (re)build of the gtags index.
-
-    Normally unnecessary — every query tool indexes automatically on first
-    use and refreshes incrementally. Call this only to force a from-scratch
-    rebuild (e.g. after a large branch switch or if the index seems corrupt).
-
-    Args:
-        project_root: Project directory. Omit to use the client's workspace
-            root (or the server's default); if several workspace roots are
-            open, pass the one you mean.
-        format: "json" (default) for {status, message}; "text" for a sentence.
-    """
-    def _respond(message: str, error: bool = False) -> str:
-        if format != "json":
-            return message
-        if error:
-            return output.error("index_project", message, root)
-        return output.envelope(
-            "index_project", root, {"status": "ok", "message": message}, total=None
-        )
-
-    root = None
-    if err := _ensure_toolchain():
-        return _respond(err, error=True)
-    root, err = _effective_root(project_root)
-    if err:
-        return _respond(err, error=True)
-    # From-scratch means from scratch: drop any existing (possibly corrupt)
-    # database first. Legacy root-level indexes are left for gtags to
-    # overwrite in place so their location doesn't silently move.
-    if (db_dir := _db_dir(root)) != root:
-        _delete_index_files(db_dir)
-    stdout, stderr, code = _run_index(root, incremental=False)
-    if code != 0:
-        return _respond(
-            f"Error: gtags exited with code {code}: {stderr.strip() or stdout.strip()}",
-            error=True,
-        )
-    _last_update[root] = time.monotonic()
-    db_dir = _db_dir(root)
-    where = str(db_dir) if db_dir != root else f"{root} (legacy root-level index)"
-    label = _gtags_label(root)
-    if label:
-        return _respond(
-            f"Indexed {root} (database in {where}) "
-            f"using parser label '{label}' (multi-language)."
-        )
-    message = f"Indexed {root} (database in {where}) using the native parser."
-    non_native = set()
-    try:
-        from itertools import islice
-
-        for entry in islice(root.rglob("*"), 20000):
-            suffix = entry.suffix
-            if suffix in (".py", ".go", ".rs", ".js", ".ts", ".rb") and entry.is_file():
-                non_native.add(suffix)
-    except OSError:
-        pass
-    if non_native:
-        message += (
-            f" Note: {', '.join(sorted(non_native))} files were NOT indexed — "
-            "run `mcp-gtags-server setup` (installs ctags + Pygments into user space, "
-            "no sudo) to enable multi-language indexing."
-        )
-    return _respond(message)
-
-
-@_gtags_tool
-def update_index(project_root: str | None = None, format: Format = "json") -> str:
     """Synchronously refresh the index — the guaranteed-freshness barrier.
 
     Query tools refresh the index automatically in the BACKGROUND, so their
     results can lag very recent edits by a few seconds. Call this when you
     just edited files and need the very next query to see the changes: it
-    blocks until the refresh is complete.
+    blocks until the refresh is complete. Pass full=true to rebuild the
+    index from scratch instead (rarely needed — e.g. after a large branch
+    switch, or if the index seems corrupt).
 
     Args:
         project_root: Project directory. Omit to use the client's workspace
             root (or the server's default); if several workspace roots are
             open, pass the one you mean.
+        full: Rebuild the index from scratch instead of refreshing it
+            incrementally.
         format: "json" (default) for {status, message}; "text" for a sentence.
     """
     def _respond(message: str, error: bool = False) -> str:
@@ -2386,9 +2042,32 @@ def update_index(project_root: str | None = None, format: Format = "json") -> st
     root, err = _effective_root(project_root)
     if err:
         return _respond(err, error=True)
+    if full:
+        # From-scratch means from scratch: drop any existing (possibly
+        # corrupt) database first. Legacy root-level indexes are left for
+        # gtags to overwrite in place so their location doesn't silently move.
+        _wait_for_refresh(root)
+        if (db_dir := _db_dir(root)) != root:
+            _delete_index_files(db_dir)
+        stdout, stderr, code = _run_index(root, incremental=False)
+        if code != 0:
+            return _respond(
+                f"Error: gtags exited with code {code}: "
+                f"{stderr.strip() or stdout.strip()}",
+                error=True,
+            )
+        _last_update[root] = time.monotonic()
+        db_dir = _db_dir(root)
+        where = str(db_dir) if db_dir != root else f"{root} (legacy root-level index)"
+        label = _gtags_label(root)
+        parser = (
+            f"parser label '{label}' (multi-language)" if label else "the native parser"
+        )
+        return _respond(f"Rebuilt index for {root} (database in {where}) using {parser}.")
     if not (_db_dir(root) / "GTAGS").is_file():
         return _respond(
-            f"Error: no GTAGS index found for {root}. Run index_project first.",
+            f"Error: no GTAGS index found for {root}. Any query tool builds "
+            "it automatically, or call update_index with full=true.",
             error=True,
         )
     _wait_for_refresh(root)  # don't race an in-flight background refresh

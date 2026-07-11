@@ -1,3 +1,3 @@
 """MCP server exposing GNU Global (gtags) code navigation for C/C++ codebases."""
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"

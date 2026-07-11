@@ -207,9 +207,6 @@ Precedence: tool-call argument > CLI flag > environment variable > project confi
 | `reachability` | **"Can this function end up in that one?"** — BFS over the caller graph returns the *shortest* call chain from A to B with the file:line of every call site (`ksys_read → vfs_read → rw_verify_area`), or an honest "no static path" that names the function-pointer caveat. One call instead of a dozen find_callers rounds. |
 | `blast_radius` | **What does my diff impact?** Takes `git diff <ref>`, maps changed lines to their enclosing functions via the index, then walks callers outward — results ranked by distance (changed functions first, direct callers next). The pre-merge "what else must I re-check" answer, tied to real git state. |
 | `summarize_references` | **A ranked per-file count.** The cheap first move for hot symbols — `kmalloc`'s 2,744 references become one screen of "where usage concentrates". |
-| `project_overview` | **Orientation in an unfamiliar repo** — file counts by top-level directory and language, straight from the index. |
-| `find_dead_symbols` | **Dead-code candidates** — every symbol a file defines that nothing references. |
-| `find_includers` | **Header blast radius** — every file that `#include`s a header, matched by basename. |
 
 A two-level `call_hierarchy` on the kernel's `ext4_mark_inode_dirty` — 87 compact lines instead of dozens of grep rounds:
 
@@ -228,14 +225,10 @@ ext4_mark_inode_dirty  (definition: fs/ext4/ext4_jbd2.h:138)
 
 | Tool | What it does | Underlying command |
 |---|---|---|
-| `find_definition` | Where is this symbol defined? Falls back to macro-family resolution (`sys_*`, `trace_*`, `DEFINE_*` names) when there's no literal definition | `global -x` + [macro resolution](#macro-generated-symbols-resolve-too-sys_read--syscall_define3) |
-| `find_references` | Raw reference lines for a symbol | `global -rx` |
-| `find_symbol_usages` | Usages of symbols with no in-tree definition (libc calls etc.) | `global -sx` |
-| `grep_project` | Regex search across indexed files | `global -gx` |
+| `find_definition` | Where is this symbol defined? Falls back to macro-family resolution (`sys_*`, `trace_*`, `DEFINE_*` names) when there's no literal definition, and suggests prefix matches when nothing matches at all | `global -x` + [macro resolution](#macro-generated-symbols-resolve-too-sys_read--syscall_define3) |
+| `find_references` | Raw reference lines for a symbol — falls back to symbol-usage records (libc calls, some variables) when the index has no in-tree references, flagged `fallback` | `global -rx`, fallback `global -sx` |
 | `list_file_symbols` | A file's API surface — every symbol it defines | `global -fx` |
-| `complete_symbol` | Symbols starting with a prefix | `global -c` |
-| `find_files` | Indexed files whose path matches a regex | `global -P` |
-| `index_project` / `update_index` | Force rebuild / refresh (rarely needed — it's automatic) | `gtags` / `global -u` |
+| `update_index` | Synchronous freshness barrier after edits; `full=true` rebuilds from scratch (rarely needed — indexing is automatic) | `gtags -i` / `gtags` |
 
 Every query tool supports `limit`/`offset` pagination, long-line truncation, and (where it makes sense) `case_insensitive` — output is *engineered* to never flood a context window.
 
@@ -342,7 +335,6 @@ Incremental refreshes recollect the list, so newly ignored files drop out of the
 ### The flow that saves your context window
 
 ```text
-0. project_overview()                        → orient in an unfamiliar repo (12 lines)
 1. symbol_info("kmalloc")                    → definitions + usage spread + next step (12 lines)
 2. call_hierarchy("ext4_mark_inode_dirty")   → multi-level impact tree (1 line/caller)
 3. get_symbol_body("tcp_v4_rcv")             → read the ONE function that matters
@@ -388,7 +380,7 @@ flowchart LR
     end
 
     subgraph proc["mcp-gtags-server — spawned once per window, lives for the session"]
-        T["20 navigation tools"]
+        T["12 navigation tools"]
         RR["root resolution<br/>project_root → env → config → client roots → cwd"]
     end
 
@@ -436,7 +428,7 @@ LSP servers give richer semantics but need a working build configuration, per-ed
 C, C++, Yacc, Java, PHP, and assembly natively — plus Python, Go, Rust, JS/TS, Ruby, and ~150 others via the ctags/Pygments plugin parsers (see [Multi-language projects](#multi-language-projects-c--python--more)).
 
 **Does the agent have to manage the index?**
-No. That's the point. Build-on-first-query, background refresh with adaptive debounce, zero blocking — queries never wait for index maintenance. The explicit `index_project`/`update_index` tools exist only as escape hatches (`update_index` doubles as a synchronous freshness barrier after edits).
+No. That's the point. Build-on-first-query, background refresh with adaptive debounce, zero blocking — queries never wait for index maintenance. The explicit `update_index` tool exists only as an escape hatch: a synchronous freshness barrier after edits, and a from-scratch rebuild with `full=true`.
 
 **Where does the index live? Can I delete it?**
 In `.gtags-mcp/` at the project root (self-gitignored). Delete it freely any time — the next query rebuilds it from scratch.

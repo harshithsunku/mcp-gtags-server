@@ -43,28 +43,24 @@ MAX_SNIPPET_CHARS = 200
 _NEXT_TOOLS: dict[str, tuple[list[str], list[str]]] = {
     "find_definition": (
         ["get_symbol_body", "find_callers", "symbol_info"],
-        ["find_symbol_usages", "complete_symbol"],
+        ["find_references"],
     ),
     "find_references": (
         ["find_callers", "summarize_references"],
-        ["find_symbol_usages", "find_definition"],
+        ["find_definition"],
     ),
-    "find_symbol_usages": (["grep_project"], ["complete_symbol", "grep_project"]),
-    "grep_project": (["find_definition", "list_file_symbols"], ["find_files"]),
-    "list_file_symbols": (["get_symbol_body", "find_dead_symbols"], ["find_files"]),
-    "complete_symbol": (["find_definition", "symbol_info"], ["grep_project"]),
-    "find_files": (["list_file_symbols"], ["project_overview"]),
+    "list_file_symbols": (["get_symbol_body", "find_references"], []),
     "get_symbol_body": (
         ["find_callees", "find_callers"],
-        ["find_symbol_usages", "complete_symbol"],
+        ["find_references"],
     ),
     "find_callers": (
         ["call_hierarchy", "get_symbol_body"],
-        ["find_references", "find_symbol_usages"],
+        ["find_references"],
     ),
     "summarize_references": (
         ["find_callers", "find_references"],
-        ["find_symbol_usages"],
+        [],
     ),
     "call_hierarchy": (["get_symbol_body", "find_callees"], ["find_references"]),
     "find_callees": (["get_symbol_body", "call_hierarchy"], []),
@@ -74,10 +70,6 @@ _NEXT_TOOLS: dict[str, tuple[list[str], list[str]]] = {
     ),
     "blast_radius": (["find_callers", "get_symbol_body"], ["summarize_references"]),
     "symbol_info": ([], []),  # computed dynamically by the tool
-    "project_overview": (["find_files", "symbol_info"], []),
-    "find_dead_symbols": (["find_references", "get_symbol_body"], []),
-    "find_includers": (["list_file_symbols"], ["find_files"]),
-    "index_project": (["project_overview", "symbol_info"], []),
     "update_index": (["symbol_info"], []),
 }
 
