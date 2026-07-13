@@ -13,6 +13,11 @@
 
 mcp-name: io.github.harshithsunku/mcp-gtags-server
 
+```bash
+# If you don't have uv yet (one-time, no sudo):
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
 ```json
 { "mcpServers": { "gtags": { "command": "uvx", "args": ["mcp-gtags-server"] } } }
 ```
