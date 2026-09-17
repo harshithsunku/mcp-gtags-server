@@ -1514,12 +1514,33 @@ def test_mcp_tool_schemas_stable():
 
     tools = {t.name: t for t in anyio.run(server.mcp.list_tools)}
     assert len(tools) == 11
-    props = tools["find_definition"].inputSchema["properties"]
+    props = tools["find_definition"].input_schema["properties"]
     assert {
         "symbol", "project_root", "case_insensitive",
         "limit", "offset", "format", "active_config",
     } <= set(props)
-    assert tools["find_definition"].inputSchema["required"] == ["symbol"]
-    # Every tool keeps the per-call project_root escape hatch.
+    assert tools["find_definition"].input_schema["required"] == ["symbol"]
     for name, tool in tools.items():
-        assert "project_root" in tool.inputSchema["properties"], name
+        # Every tool keeps the per-call project_root escape hatch.
+        assert "project_root" in tool.input_schema["properties"], name
+        # The injected Context stays out of the agent-facing schema.
+        assert "ctx" not in tool.input_schema["properties"], name
+        # Bodies return a JSON/text string: no derived {"result": str}
+        # outputSchema, or every response is sent twice.
+        assert tool.output_schema is None, name
+        assert tool.title, name
+
+
+def test_mcp_tool_annotations():
+    """Clients gate permissions / parallel calls on these hints."""
+    import anyio
+
+    tools = {t.name: t for t in anyio.run(server.mcp.list_tools)}
+    for name, tool in tools.items():
+        hints = tool.annotations
+        assert hints is not None, name
+        assert hints.open_world_hint is False, name
+        assert hints.read_only_hint is (name != "update_index"), name
+    update = tools["update_index"].annotations
+    assert update.destructive_hint is False
+    assert update.idempotent_hint is True

@@ -29,7 +29,7 @@ src/gtags_mcp/
   output.py      JSON envelope: {tool, root, results, total, truncated, hints, message, ...}
   fileset.py     file listing helpers
   evalharness.py golden-set eval runner (see Evals below)
-tests/           pytest suite (315 tests, ~4s, no network; heavy use of tmp fixture projects)
+tests/           pytest suite (318 tests, ~4s, no network; heavy use of tmp fixture projects)
 evals/golden.jsonl        65-case golden set run against a real kernel tree
 evals/agent/              agent A/B eval harness (run_ab.py, grade.py, questions.jsonl)
 scripts/stability_exercise.py  operational latency/size matrix against a real tree
@@ -38,7 +38,7 @@ mcpb/manifest.json        Claude Desktop bundle manifest
 .github/workflows/        ci.yml, eval.yml, publish.yml, publish-registry.yml, release-binaries.yml
 ```
 
-## The 11 MCP tools (all in server.py, decorated `@_gtags_tool`)
+## The 11 MCP tools (all in server.py, decorated `@_gtags_tool("Title")`)
 
 `find_definition`, `find_references`, `get_symbol_body`, `find_callers`,
 `summarize_references`, `find_callees`, `reachability`, `blast_radius`,
@@ -58,6 +58,28 @@ Conventions shared by all tools:
 - Index freshness: queries auto-refresh in the background (may lag a few seconds);
   `update_index` is the synchronous barrier. Index lives in `<root>/.gtags-mcp/`
   unless legacy root-level GTAGS files exist (`_db_dir` respects those).
+- Tool metadata (v1.5.0): every tool has a `title` and `ToolAnnotations`
+  (`readOnlyHint` true except `update_index`, `openWorldHint` false), and
+  `structured_output=False`. Without that flag the SDK derives a
+  `{"result": str}` outputSchema and sends each response twice.
+
+## MCP SDK (2.x, `mcp>=2.2,<3`)
+
+- `MCPServer` (FastMCP is gone in 2.x). There is no `get_context()`:
+  `_gtags_tool` grafts a keyword-only `ctx: Context` onto the async wrapper's
+  `__signature__` and `__annotations__`, since `functools.wraps` points both at
+  the sync body. The SDK injects it and keeps it out of the input schema. The
+  module attribute stays the plain sync fn, which is what tests and eval call.
+- Roots: 2.x builds a new `ServerSession` per request, so the roots cache is
+  keyed by `session._connection` (private; no public accessor). Protocol
+  2026-07-28 deprecated roots (SEP-2577) and has no back-channel, so
+  `can_send_request` gates the fetch and those clients fall through to cwd.
+  The module-level warnings filter silences `MCPDeprecationWarning` (pytest
+  needs its own filter in pyproject).
+- Tests use `mcp.Client(server.mcp, mode="legacy" | "2026-07-28")` in-process.
+  Legacy mode is required for any roots test.
+- HTTP: host/port go to `mcp.run(transport="streamable-http", host=, port=)`,
+  not to settings.
 
 ## CLI
 

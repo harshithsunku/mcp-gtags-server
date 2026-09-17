@@ -1,10 +1,10 @@
 """MCP roots-protocol behavior: root resolution from client workspace roots.
 
-Uses the SDK's in-memory transport so a real ClientSession (with a
-list_roots_callback) talks to the real FastMCP server, exercising the
-async wrapper, the per-session cache, and the resolution ladder end to end.
-The lowlevel server (mcp._mcp_server) is passed because older SDKs' helper
-does not accept a FastMCP instance directly.
+Uses the SDK's in-process Client so a real client (with a
+list_roots_callback) talks to the real MCPServer, exercising the async
+wrapper, Context injection, the per-session cache, and the resolution ladder
+end to end. mode="legacy" forces the initialize handshake — the protocol era
+in which roots exist; protocol 2026-07-28 deprecated them (SEP-2577).
 """
 
 import json
@@ -13,8 +13,7 @@ from pathlib import Path
 
 import anyio
 import pytest
-from mcp import types
-from mcp.shared.memory import create_connected_server_and_client_session
+from mcp import Client, types
 
 from gtags_mcp import server, toolchain
 
@@ -64,6 +63,10 @@ def _roots_callback(*paths: Path, counter: list | None = None):
         )
 
     return callback
+
+
+def _client(**kwargs) -> Client:
+    return Client(server.mcp, mode="legacy", **kwargs)
 
 
 async def _call(session, tool: str, **arguments) -> dict:
@@ -140,9 +143,7 @@ def test_explicit_project_root_beats_client_roots(project_a, project_b):
 @requires_global
 def test_client_root_used_for_queries(project_a):
     async def run():
-        async with create_connected_server_and_client_session(
-            server.mcp._mcp_server, list_roots_callback=_roots_callback(project_a)
-        ) as session:
+        async with _client(list_roots_callback=_roots_callback(project_a)) as session:
             return await _call(session, "find_definition", symbol="alpha_fn")
 
     envelope = anyio.run(run)
@@ -154,9 +155,8 @@ def test_client_root_used_for_queries(project_a):
 @requires_global
 def test_two_client_roots_error_then_explicit_choice(project_a, project_b):
     async def run():
-        async with create_connected_server_and_client_session(
-            server.mcp._mcp_server,
-            list_roots_callback=_roots_callback(project_a, project_b),
+        async with _client(
+            list_roots_callback=_roots_callback(project_a, project_b)
         ) as session:
             ambiguous = await _call(session, "find_definition", symbol="beta_fn")
             explicit = await _call(
@@ -179,9 +179,8 @@ def test_roots_fetched_once_per_session(project_a):
     calls: list = []
 
     async def run():
-        async with create_connected_server_and_client_session(
-            server.mcp._mcp_server,
-            list_roots_callback=_roots_callback(project_a, counter=calls),
+        async with _client(
+            list_roots_callback=_roots_callback(project_a, counter=calls)
         ) as session:
             await _call(session, "find_definition", symbol="alpha_fn")
             await _call(session, "find_references", symbol="alpha_fn")
@@ -195,11 +194,44 @@ def test_client_without_roots_capability_uses_cwd(project_a, monkeypatch):
     monkeypatch.chdir(project_a)
 
     async def run():
-        async with create_connected_server_and_client_session(
-            server.mcp._mcp_server  # no list_roots_callback -> no roots capability
-        ) as session:
+        async with _client() as session:  # no list_roots_callback -> no roots capability
             return await _call(session, "find_definition", symbol="alpha_fn")
 
     envelope = anyio.run(run)
     assert envelope.get("error") is None
     assert envelope["root"] == str(project_a)
+
+
+@requires_global
+def test_modern_protocol_client_falls_back_to_cwd(project_a, project_b, monkeypatch):
+    """2026-07-28 has no roots back-channel: even a client that would answer
+    roots/list must resolve via cwd, without an error or a stall."""
+    monkeypatch.chdir(project_a)
+    calls: list = []
+
+    async def run():
+        async with Client(
+            server.mcp,
+            mode="2026-07-28",
+            list_roots_callback=_roots_callback(project_b, counter=calls),
+        ) as client:
+            return await _call(client, "find_definition", symbol="alpha_fn")
+
+    envelope = anyio.run(run)
+    assert envelope.get("error") is None
+    assert envelope["root"] == str(project_a)
+    assert calls == []
+
+
+@requires_global
+def test_tool_results_are_text_only(project_a):
+    """One copy of the envelope per response — no structuredContent echo."""
+
+    async def run():
+        async with _client(list_roots_callback=_roots_callback(project_a)) as client:
+            return await client.call_tool("find_definition", {"symbol": "alpha_fn"})
+
+    result = anyio.run(run)
+    assert result.structured_content is None
+    assert len(result.content) == 1
+    assert json.loads(result.content[0].text)["results"][0]["path"] == "main.c"

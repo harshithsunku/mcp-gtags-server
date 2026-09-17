@@ -130,6 +130,24 @@ against the kernel (28-call matrix, zero anomalies — table in the writeup). Th
 writeup lives at [docs/capability.md](docs/capability.md); posting it to the
 blog/HN is the Reach item below.
 
+### 8. MCP SDK 2.x + protocol 2026-07-28 ✅ (v1.5.0)
+Keep the transport layer current, and make the protocol metadata work for agents.
+
+- [x] Port from `FastMCP` (SDK 1.x) to `MCPServer` (SDK 2.x): injected `Context`
+      replaces `get_context()`, and host/port move to `run()`. Pinned to
+      `mcp>=2.2,<3`. v1.4.3 first capped `mcp<2` to heal fresh `uvx` installs,
+      which SDK 2.0 had broken.
+- [x] Serve every protocol revision from 2024-11-05 through 2026-07-28, verified
+      over stdio and HTTP with SDK 1.30 (2025-11-25) and 2.2 (2026-07-28) clients.
+- [x] Tool annotations (`readOnlyHint`, `openWorldHint`) and titles, so clients
+      can auto-approve and parallelize read-only calls. Stop sending each
+      response twice (the derived `{"result": str}` outputSchema is gone).
+- [x] CI `fresh-deps` job (highest + lowest-direct resolution, weekly cron):
+      `uv.lock` had hidden the SDK 2.0 break from CI.
+
+**Done when:** a fresh `uvx mcp-gtags-server` resolves SDK 2.x, and old and new
+clients both navigate the kernel. ✅
+
 ---
 
 ## Known limitations (track honestly)
@@ -138,6 +156,9 @@ blog/HN is the Reach item below.
   (e.g. `->read()` through a `file_operations`). Documented; a candidate-target
   heuristic is a future stretch goal.
 - C++ templates/overloads are weaker than C. Enrichment in step 2 helps.
+- Clients on protocol 2026-07-28 have no MCP roots (SEP-2577 deprecated them). A
+  shared HTTP server can't infer their workspace, so agents pass `project_root`.
+  Stdio servers still auto-detect from cwd.
 - Semantically-exact resolution (types, overloads, callback targets) needs a real
   compiler frontend. Deliberately out of scope (see dropped step 6): when a compile
   database exists, clangd and its ecosystem already serve that user.

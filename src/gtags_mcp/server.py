@@ -16,12 +16,14 @@ from __future__ import annotations
 import argparse
 import contextvars
 import functools
+import inspect
 import os
 import re
 import subprocess
 import sys
 import threading
 import time
+import warnings
 import weakref
 from collections import OrderedDict
 from pathlib import Path
@@ -30,8 +32,10 @@ from urllib.parse import unquote, urlparse
 
 import anyio
 from mcp import types
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import Context, MCPServer
+from mcp.shared.exceptions import MCPDeprecationWarning
 
+from . import __version__
 from . import config as config_module
 from . import enrich
 from . import fileset
@@ -40,8 +44,9 @@ from . import macros
 from . import output
 from . import toolchain
 
-mcp = FastMCP(
+mcp = MCPServer(
     "gtags-code-navigator",
+    version=__version__,
     instructions=(
         "Indexed C/C++ code navigation backed by GNU Global (gtags). "
         "ALWAYS prefer these tools over grep/text search for code questions: "
@@ -284,11 +289,23 @@ def _detect_root(start: Path) -> Path:
 # MCP roots protocol: clients (IDEs) advertise their open workspace folders
 # via roots/list. With a single user-level config entry serving many repos,
 # this is how the server picks the right repo when a tool call carries no
-# explicit project_root. Roots are fetched once per client session (cached
-# in a WeakKeyDictionary keyed by the session, so the shared HTTP server
+# explicit project_root. Roots are fetched once per client connection (cached
+# in a WeakKeyDictionary keyed by the connection, so the shared HTTP server
 # keeps concurrent clients isolated) and handed to the sync tool bodies via
 # a ContextVar (anyio propagates context into worker threads).
+#
+# Protocol 2026-07-28 deprecated roots (SEP-2577): a client on that revision
+# has no back-channel for roots/list, so the fetch degrades to () and the
+# resolution ladder falls through to cwd auto-detection — which is what a
+# stdio server spawned inside the repo needs anyway. Handshake-era clients
+# (2025-11-25 and older) keep full roots support.
 # --------------------------------------------------------------------------
+
+# The SDK warns on every roots call; the deprecation is handled above, so the
+# warning would only spam a stdio server's stderr on each first query.
+warnings.filterwarnings(
+    "ignore", message=r".*roots capability is deprecated", category=MCPDeprecationWarning
+)
 
 _session_roots: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 _roots_ctx: contextvars.ContextVar[tuple[Path, ...]] = contextvars.ContextVar(
@@ -308,24 +325,32 @@ def _root_uri_to_path(uri: object) -> Path | None:
     return path.resolve()
 
 
-async def _fetch_session_roots() -> tuple[Path, ...]:
-    """Workspace roots of the current client session (cached per session).
+async def _fetch_session_roots(ctx: Context | None) -> tuple[Path, ...]:
+    """Workspace roots of the client behind *ctx* (cached per connection).
 
     Degrades to () — never an error — for clients without the roots
-    capability, clients that fail to answer within the timeout, and direct
-    (non-MCP) invocation from tests or the eval harness.
+    capability (including every 2026-07-28 client), clients that fail to
+    answer within the timeout, and direct (non-MCP) invocation from tests or
+    the eval harness.
     """
     try:
-        session = mcp.get_context().session
-    except (LookupError, ValueError, AttributeError):
+        session = ctx.session
+    except (ValueError, AttributeError):
         return ()  # direct invocation, no active MCP request
+    # SDK 2.x builds a fresh ServerSession for every request; the per-client
+    # object is its Connection, which has no public accessor. Keying by the
+    # session instead silently re-fetches roots (a client round-trip) on
+    # every tool call — test_roots_fetched_once_per_session guards this.
+    key = getattr(session, "_connection", session)
     try:
-        return _session_roots[session]
+        return _session_roots[key]
     except (KeyError, TypeError):
         pass
     roots: tuple[Path, ...] = ()
     try:
-        if session.check_client_capability(
+        # can_send_request is False on a 2026-07-28 request (no back-channel):
+        # skip the doomed roots/list rather than raise and swallow per call.
+        if session.can_send_request and session.check_client_capability(
             types.ClientCapabilities(roots=types.RootsCapability())
         ):
             with anyio.fail_after(ROOTS_FETCH_TIMEOUT_SECONDS):
@@ -336,40 +361,68 @@ async def _fetch_session_roots() -> tuple[Path, ...]:
     except Exception:  # noqa: BLE001 — roots are best-effort, cwd still works
         roots = ()
     try:
-        _session_roots[session] = roots
+        _session_roots[key] = roots
     except TypeError:
         pass
     return roots
 
 
-async def _on_roots_changed(_notification: object) -> None:
+async def _on_roots_changed(_ctx: object, _params: object) -> None:
     """Client workspaces changed: drop cached roots so they are re-fetched."""
     _session_roots.clear()
 
 
-mcp._mcp_server.notification_handlers[types.RootsListChangedNotification] = (
-    _on_roots_changed
+mcp._lowlevel_server.add_notification_handler(
+    "notifications/roots/list_changed", types.NotificationParams, _on_roots_changed
 )
 
 
-def _gtags_tool(fn):
-    """Register *fn* as an MCP tool behind an async roots-aware wrapper.
+def _gtags_tool(title: str, *, read_only: bool = True):
+    """Register the decorated function as an MCP tool behind an async
+    roots-aware wrapper.
 
     The wrapper fetches the session's workspace roots (an await on the
     client — impossible from sync code on the event loop) and then runs the
     sync tool body in a worker thread, keeping slow gtags subprocess work
     off the event loop. The module-level attribute stays the plain sync
-    function so tests and the eval harness call it directly; the MCP schema
-    is derived from *fn* itself through ``functools.wraps``/``__wrapped__``.
+    function so tests and the eval harness call it directly.
+
+    Tools write only caches (the project index, the managed toolchain), so
+    all but update_index — whose whole point is the write — are read-only;
+    the destructive/idempotent hints are only meaningful (per spec) on a
+    non-read-only tool, so they ride on that one alone.
+
+    The body returns a JSON (or text) string, so structured output is off:
+    otherwise the SDK derives a {"result": string} outputSchema and sends
+    every response twice — once as text, once as an escaped JSON string.
     """
 
-    @functools.wraps(fn)
-    async def wrapper(**kwargs):
-        _roots_ctx.set(await _fetch_session_roots())
-        return await anyio.to_thread.run_sync(functools.partial(fn, **kwargs))
+    def register(fn):
+        @functools.wraps(fn)
+        async def wrapper(*, ctx: Context, **kwargs):
+            _roots_ctx.set(await _fetch_session_roots(ctx))
+            return await anyio.to_thread.run_sync(functools.partial(fn, **kwargs))
 
-    mcp.tool()(wrapper)
-    return fn
+        # MCPServer derives the input schema from inspect.signature and finds
+        # the Context parameter via get_type_hints — both of which functools
+        # .wraps pointed at fn. Graft ctx onto each, or it is neither injected
+        # nor hidden from the schema.
+        sig = inspect.signature(fn, eval_str=True)
+        ctx_param = inspect.Parameter("ctx", inspect.Parameter.KEYWORD_ONLY, annotation=Context)
+        wrapper.__signature__ = sig.replace(parameters=[*sig.parameters.values(), ctx_param])
+        wrapper.__annotations__ = {**fn.__annotations__, "ctx": Context}
+
+        write_hints = {} if read_only else {"destructiveHint": False, "idempotentHint": True}
+        mcp.tool(
+            title=title,
+            annotations=types.ToolAnnotations(
+                readOnlyHint=read_only, openWorldHint=False, **write_hints
+            ),
+            structured_output=False,
+        )(wrapper)
+        return fn
+
+    return register
 
 
 def _effective_root(project_root: str | None) -> tuple[Path | None, str | None]:
@@ -1114,7 +1167,7 @@ _NON_CALLS = frozenset(
 )
 
 
-@_gtags_tool
+@_gtags_tool("Find definition")
 def find_definition(
     symbol: str,
     project_root: str | None = None,
@@ -1168,7 +1221,7 @@ def find_definition(
     )
 
 
-@_gtags_tool
+@_gtags_tool("Find references")
 def find_references(
     symbol: str,
     project_root: str | None = None,
@@ -1206,7 +1259,7 @@ def find_references(
     )
 
 
-@_gtags_tool
+@_gtags_tool("Get symbol body")
 def get_symbol_body(
     symbol: str,
     project_root: str | None = None,
@@ -1268,7 +1321,7 @@ def get_symbol_body(
     return "\n\n".join(chunks)
 
 
-@_gtags_tool
+@_gtags_tool("Find callers")
 def find_callers(
     symbol: str,
     project_root: str | None = None,
@@ -1321,7 +1374,7 @@ def find_callers(
     return _paginate("\n".join(rows), limit, offset)
 
 
-@_gtags_tool
+@_gtags_tool("Summarize references")
 def summarize_references(
     symbol: str,
     project_root: str | None = None,
@@ -1368,7 +1421,7 @@ def summarize_references(
     return header + "\n" + _paginate("\n".join(rows), limit, offset)
 
 
-@_gtags_tool
+@_gtags_tool("Find callees")
 def find_callees(
     symbol: str,
     project_root: str | None = None,
@@ -1465,7 +1518,7 @@ MAX_GRAPH_EXPANSIONS = 200
 _MACROISH_RE = re.compile(r"[A-Z][A-Z0-9_]*")
 
 
-@_gtags_tool
+@_gtags_tool("Call-path reachability")
 def reachability(
     from_symbol: str,
     to_symbol: str,
@@ -1597,7 +1650,7 @@ def reachability(
     return "\n".join(lines)
 
 
-@_gtags_tool
+@_gtags_tool("Change blast radius")
 def blast_radius(
     git_ref: str = "HEAD",
     project_root: str | None = None,
@@ -1796,7 +1849,7 @@ def _describe_definition(rec: dict, source: str) -> str:
     return desc
 
 
-@_gtags_tool
+@_gtags_tool("Symbol overview")
 def symbol_info(
     symbol: str,
     project_root: str | None = None,
@@ -1959,7 +2012,7 @@ def symbol_info(
     return "\n".join(lines)
 
 
-@_gtags_tool
+@_gtags_tool("List file symbols")
 def list_file_symbols(
     file_path: str,
     project_root: str | None = None,
@@ -1989,7 +2042,7 @@ def list_file_symbols(
     )
 
 
-@_gtags_tool
+@_gtags_tool("Update index", read_only=False)
 def update_index(
     project_root: str | None = None,
     full: bool = False,
@@ -2304,8 +2357,6 @@ def main() -> None:
     if _auto_setup_enabled() and _check_global_installed() is not None:
         _start_bootstrap()
     if args.transport == "http":
-        mcp.settings.host = args.host
-        mcp.settings.port = args.port
         print(
             f"mcp-gtags-server v{_package_version()} — streamable HTTP server on "
             f"{args.host}:{args.port}\n",
@@ -2313,7 +2364,7 @@ def main() -> None:
         )
         print(_client_config_text("http", args.host, args.port), flush=True)
         try:
-            mcp.run(transport="streamable-http")
+            mcp.run(transport="streamable-http", host=args.host, port=args.port)
         except KeyboardInterrupt:
             pass
         return

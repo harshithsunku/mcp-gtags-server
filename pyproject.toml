@@ -1,6 +1,6 @@
 [project]
 name = "mcp-gtags-server"
-version = "1.4.3"
+version = "1.5.0"
 description = "Indexed code navigation for AI coding agents — replace grep scans with GNU Global (gtags) lookups over MCP. ~100x faster and radically less noise on million-line C/C++ codebases."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -31,12 +31,11 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
-    # >=1.14: earlier FastMCP releases crash at import on this package's
-    # union-typed tool signatures (Tool.from_function issubclass TypeError);
-    # 1.14 is the oldest release the server imports and the suite passes on.
-    # <2: mcp 2.x removed mcp.server.fastmcp (FastMCP -> MCPServer), so an
-    # uncapped pin makes a fresh `uvx mcp-gtags-server` die at import.
-    "mcp>=1.14.0,<2",
+    # >=2.2: the MCPServer API (Context injection, run(host=, port=),
+    # add_notification_handler) this server is written against. <3: a new SDK
+    # major removed the server class once already (2.0 dropped FastMCP) and
+    # every fresh `uvx` install resolves the newest release — keep it capped.
+    "mcp>=2.2.0,<3",
     "anyio>=4.0",
     "tomli>=2.0; python_version < '3.11'",
 ]
@@ -62,3 +61,10 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/gtags_mcp"]
+
+[tool.pytest.ini_options]
+# pytest resets warning filters per test, overriding the module-level filter
+# in gtags_mcp.server that keeps the SDK's roots-deprecation notice quiet.
+filterwarnings = [
+    "ignore:The roots capability is deprecated:mcp.shared.exceptions.MCPDeprecationWarning",
+]

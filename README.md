@@ -109,7 +109,7 @@ However you install it, **one user-level entry serves every repo you open** — 
 1. `project_root` argument on the tool call (agents pass this to target any tree)
 2. `--root` flag / `GTAGS_MCP_ROOT` env var
 3. `root` in a [config file](#config-files) *(note: pinning a root here defeats multi-repo)*
-4. **The client's workspace roots** (MCP roots protocol) — IDEs that advertise their open folders get the right repo automatically, even on the shared HTTP server; with several folders open, agents are asked to pass `project_root`
+4. **The client's workspace roots** (MCP roots protocol) — IDEs that advertise their open folders get the right repo automatically, even on the shared HTTP server; with several folders open, agents are asked to pass `project_root`. Roots exist only for clients on protocol revisions up to 2025-11-25: the 2026-07-28 revision deprecated them, so those clients skip this step (stdio servers still resolve through step 5; on the shared HTTP server, agents pass `project_root`)
 5. Walk up from the server's working directory to the nearest `.git`/`GTAGS` — this is why stdio servers spawned by Claude Code/Cursor inside a repo just work
 
 That's it. No indexing step, no configuration. Ask your agent *"who calls `tcp_v4_rcv`?"* — the first query in any repo builds that repo's index automatically, and every query after that is answered in milliseconds. Run `mcp-gtags-server doctor` any time to see what the server detects, or `mcp-gtags-server config` to re-print the client configuration.
@@ -225,6 +225,8 @@ Precedence: tool-call argument > CLI flag > environment variable > project confi
 | `update_index` | Synchronous freshness barrier after edits; `full=true` rebuilds from scratch (rarely needed — indexing is automatic) | `gtags -i` / `gtags` |
 
 Every query tool supports `limit`/`offset` pagination, long-line truncation, and (where it makes sense) `case_insensitive` — output is *engineered* to never flood a context window.
+
+Every tool also declares MCP tool annotations: all are `readOnlyHint: true` except `update_index`, and none reach outside your machine (`openWorldHint: false`). Clients use these hints to auto-approve and parallelize read-only calls. Each response carries the envelope exactly once, as text content, with no duplicate `structuredContent` copy.
 
 ### Structured output (JSON by default)
 
@@ -431,14 +433,14 @@ In `.gtags-mcp/` at the project root (self-gitignored). Delete it freely any tim
 The tool descriptions are written to steer the model: they say *when* to use indexed lookups instead of grep. In practice agents pick the faster, narrower tool naturally.
 
 **`ModuleNotFoundError: No module named 'mcp.server.fastmcp'` on startup?**
-Releases up to v1.4.2 declared an uncapped `mcp` dependency, so installs made after the MCP Python SDK 2.0 release resolve an SDK they can't import. v1.4.3 fixes it. Pick up the fix with `uvx --refresh mcp-gtags-server --help` (or `uvx mcp-gtags-server@latest`), or re-run the installer. If you must stay on an older release, pin the SDK yourself: `uvx --with 'mcp<2' mcp-gtags-server@1.4.2`.
+Releases up to v1.4.2 declared an uncapped `mcp` dependency, so installs made after the MCP Python SDK 2.0 release resolve an SDK they can't import. v1.4.3 fixes it by capping the SDK below 2.0, and v1.5.0+ runs natively on SDK 2.x (`mcp>=2.2,<3`), speaking every protocol revision from 2024-11-05 through 2026-07-28. Pick up the fix with `uvx --refresh mcp-gtags-server --help` (or `uvx mcp-gtags-server@latest`), or re-run the installer. If you must stay on an older release, pin the SDK yourself: `uvx --with 'mcp<2' mcp-gtags-server@1.4.2`.
 
 ## Development
 
 ```bash
 git clone https://github.com/harshithsunku/mcp-gtags-server
 cd mcp-gtags-server
-uv run --extra dev pytest       # 229 tests; e2e tests auto-skip if GNU Global is absent
+uv run --extra dev pytest       # 318 tests; e2e tests auto-skip if GNU Global is absent
 npx @modelcontextprotocol/inspector mcp-gtags-server    # poke at it interactively
 ```
 
