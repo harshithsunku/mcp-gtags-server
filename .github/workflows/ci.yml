@@ -4,6 +4,11 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Weekly, so a new upstream dependency release that breaks fresh installs
+  # fails here within days even when nobody pushes (see fresh-deps).
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
 
 jobs:
   test:
@@ -27,3 +32,37 @@ jobs:
 
       - name: Shellcheck installer
         run: bash -n scripts/install.sh
+
+  # The test job runs against uv.lock, so it never sees what `uvx` / pip users
+  # actually resolve — mcp 2.0 broke every fresh install while it stayed green.
+  # These install from the pyproject constraints alone: `highest` is exactly
+  # what a new user gets today, `lowest-direct` keeps the declared floors honest.
+  fresh-deps:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - resolution: highest
+            python-version: "3.13"
+          - resolution: lowest-direct
+            python-version: "3.10"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install GNU Global (for end-to-end tests)
+        run: sudo apt-get update && sudo apt-get install -y global universal-ctags exuberant-ctags python3-pygments
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install without the lockfile (${{ matrix.resolution }})
+        run: |
+          uv venv .fresh
+          uv pip install --python .fresh/bin/python --resolution ${{ matrix.resolution }} ".[dev]"
+          uv pip list --python .fresh/bin/python
+
+      - name: Run tests
+        run: .fresh/bin/python -m pytest -q

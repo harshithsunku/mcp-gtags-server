@@ -123,7 +123,7 @@ uv run mcp-gtags-server doctor                      # what the server detects he
   prove the CI eval passes.
 - CI installs BOTH ctags flavours (`universal-ctags exuberant-ctags`) — see the
   ctags section above for why both are needed.
-- Headline numbers as of v1.4.x: eval 65/65 recall, 15/15 precision@1;
+- Headline numbers as of v1.4.x: eval 65/65 recall, 14/14 precision@1;
   warm latencies: reachability ~46ms, find_callers ~2-3ms, recovered
   mutex_lock lookup ~0.22s.
 
@@ -139,6 +139,10 @@ uv run mcp-gtags-server doctor                      # what the server detects he
    `gh run watch` **per job** — a run can show partial success.
 
 Gotchas:
+- `uv.lock` hides dependency drift: `uvx`/pip users resolve fresh from pyproject.
+  mcp 2.0 (2026-07-28, removed `mcp.server.fastmcp`) broke every fresh install
+  of ≤1.4.2 while CI stayed green. Keep upper bounds on SDK majors; the
+  `fresh-deps` CI job (highest + lowest-direct, weekly cron) is the guard.
 - MCP Registry rejects server.json descriptions > 100 chars (422 at publish, not
   schema-validated). Fix on main, then `gh workflow run publish-registry.yml -f version=X.Y.Z`.
 - Prebuilt Global binaries live on the `global-v<GLOBAL_VERSION>` release

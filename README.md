@@ -430,6 +430,9 @@ In `.gtags-mcp/` at the project root (self-gitignored). Delete it freely any tim
 **Will it fight my agent's built-in tools?**
 The tool descriptions are written to steer the model: they say *when* to use indexed lookups instead of grep. In practice agents pick the faster, narrower tool naturally.
 
+**`ModuleNotFoundError: No module named 'mcp.server.fastmcp'` on startup?**
+Releases up to v1.4.2 declared an uncapped `mcp` dependency, so installs made after the MCP Python SDK 2.0 release resolve an SDK they can't import. v1.4.3 fixes it. Pick up the fix with `uvx --refresh mcp-gtags-server --help` (or `uvx mcp-gtags-server@latest`), or re-run the installer. If you must stay on an older release, pin the SDK yourself: `uvx --with 'mcp<2' mcp-gtags-server@1.4.2`.
+
 ## Development
 
 ```bash
