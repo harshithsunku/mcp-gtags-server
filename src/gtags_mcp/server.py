@@ -17,6 +17,7 @@ import argparse
 import contextvars
 import functools
 import inspect
+import json
 import os
 import re
 import subprocess
@@ -47,39 +48,48 @@ from . import toolchain
 mcp = MCPServer(
     "gtags-code-navigator",
     version=__version__,
+    # Clients read the start of this first: Codex keeps the first 512 chars
+    # self-contained guidance, Claude Code truncates at 2KB and loads it (and
+    # only tool NAMES) at session start. Routing by task, not "always use us":
+    # agents that are told to replace grep wholesale end up re-verifying with
+    # grep anyway. tests/test_contract.py pins the budgets.
     instructions=(
-        "Indexed C/C++ code navigation backed by GNU Global (gtags). "
-        "ALWAYS prefer these tools over grep/text search for code questions: "
-        "they answer from a prebuilt index in milliseconds and return only "
-        "the relevant lines, even on codebases with millions of lines. "
-        "Start with symbol_info for any unfamiliar symbol. Then: "
-        "get_symbol_body to read an implementation, find_callers for impact "
-        "analysis, find_callees to see what a function depends on, and "
-        "summarize_references first for very widely used symbols. "
-        "The index is built and refreshed automatically — never worry about it. "
-        "Shared conventions for every tool: they operate on the client's "
-        "workspace root by default — pass project_root to target another repo "
-        "(required when several workspace roots are open). Results are a "
-        "machine-readable JSON envelope {results, total, offset, truncated, "
-        "next_tools, warning} — next_tools names the best follow-up call; pass "
-        "format='text' for a human-readable rendering. List results paginate "
-        "with limit (default 100) and offset."
+        "Indexed C/C++ code navigation (GNU Global) for what grep can't do cheaply: "
+        "callers of a function (find_callers), usages grouped by file "
+        "(find_references), call chains (reachability), a body without reading its "
+        "file (get_symbol_body), definitions incl. #ifdef variants and "
+        "macro-generated kernel symbols (find_definition). Keep grep for strings, "
+        "comments, non-code files. Output: compact text (path:line: source); "
+        "format='json' for structured data. Pass project_root=<absolute repo path> "
+        "if the repo is ambiguous. "
+        "Change impact: run `git diff`, then find_callers on each changed function. "
+        "The index builds and refreshes itself; if a first query reports indexing "
+        "in progress, retry shortly, and call update_index after editing files when "
+        "the next query must see the edits. List results paginate with limit "
+        "(default 100) and offset; each result ends with the most useful next tools."
     ),
 )
 
 Format = Literal["json", "text"]
 
 DEFAULT_LIMIT = 100
-MAX_LINE_CHARS = 200
 MAX_BODY_LINES = 300
-# symbol_info guard-scans at most this many definitions of one symbol.
-MAX_GUARDED_DEFS = 50
+# find_references groups by file (count per path) above this many references
+# when group_by="auto" — beyond it, raw lines flood the context window.
+REFERENCE_GROUP_THRESHOLD = 200
+# find_definition's usage summary lists this many hottest files.
+TOP_FILES = 5
 # Empty find_definition results carry at most this many prefix suggestions.
 MAX_SUGGESTIONS = 10
 # Export recovery ctags-scans at most this many EXPORT_SYMBOL* files per query.
 MAX_EXPORT_RECOVERY_FILES = 5
 QUERY_TIMEOUT_SECONDS = 120
 INDEX_TIMEOUT_SECONDS = 600
+# A live MCP call waits this long for a first-time index build, then returns a
+# "retry shortly" status while the build continues: clients enforce their own
+# per-call timeouts (Codex: 60 s by default) and a kernel-sized tree takes ~35 s
+# on a fast laptop, far longer on slow disks.
+INDEX_BUILD_WAIT_SECONDS = 20.0
 # Skip the incremental freshness check when the same root was updated this
 # recently — agent turns often fire many queries back to back. The window is
 # adaptive: at least this many seconds, and at least 10x the measured cost of
@@ -112,6 +122,9 @@ _no_enrich = False
 _no_guards = False
 # Macro-family symbol resolution disabled by --no-macro-resolve.
 _no_macro_resolve = False
+# Falling back to the server's working directory as project root disabled by
+# --no-cwd-fallback (plugin installs run the server from the plugin folder).
+_no_cwd_fallback = False
 
 def _plugin_deps_available() -> bool:
     """True when the ctags + Pygments plugin-parser dependencies are usable."""
@@ -251,6 +264,31 @@ _CORRUPT_SIGNATURE = "seems corrupted"
 _INDEX_FILES = ("GTAGS", "GRTAGS", "GSYMS", "GPATH")
 
 
+def _index_unreadable(root: Path, stderr: str) -> bool:
+    """True when `global` failed because root's existing database is damaged.
+
+    `global -x` reports a damaged file as "GTAGS seems corrupted"; other query
+    modes (e.g. `-rx`) report the same garbage file as "GTAGS not found" —
+    corruption too, whenever the file is in fact present.
+    """
+    if _CORRUPT_SIGNATURE in stderr:
+        return True
+    db_dir = _db_dir(root)
+    return any(
+        f"{name} not found" in stderr and (db_dir / name).is_file()
+        for name in _INDEX_FILES
+    )
+
+
+def _index_vanished(root: Path, stderr: str) -> bool:
+    """True when `global` failed because root's database files are missing."""
+    db_dir = _db_dir(root)
+    return any(
+        f"{name} not found" in stderr and not (db_dir / name).is_file()
+        for name in _INDEX_FILES
+    )
+
+
 def _loader_hint(stderr: str) -> str:
     """Remediation suffix when a binary fails with a glibc loader error."""
     if "GLIBC_" in stderr or "GLIBCXX_" in stderr:
@@ -268,6 +306,15 @@ def _delete_index_files(db_dir: Path) -> None:
         (db_dir / name).unlink(missing_ok=True)
 
 
+def _has_root_marker(path: Path) -> bool:
+    """True when path holds an index (legacy or .gtags-mcp/) or a .git entry."""
+    return (
+        (path / "GTAGS").is_file()
+        or (path / INDEX_DIR_NAME / "GTAGS").is_file()
+        or (path / ".git").exists()
+    )
+
+
 def _detect_root(start: Path) -> Path:
     """Walk up from start to the nearest directory holding an index or .git.
 
@@ -276,13 +323,24 @@ def _detect_root(start: Path) -> Path:
     Falls back to start itself when no marker is found.
     """
     for candidate in (start, *start.parents):
-        if (
-            (candidate / "GTAGS").is_file()
-            or (candidate / INDEX_DIR_NAME / "GTAGS").is_file()
-            or (candidate / ".git").exists()
-        ):
+        if _has_root_marker(candidate):
             return candidate
     return start
+
+
+def _cwd_fallback_enabled() -> bool:
+    """Bare-cwd root fallback: --no-cwd-fallback > GTAGS_MCP_CWD_FALLBACK
+    > user config `cwd_fallback` > on.
+
+    Plugin installs turn it off: Agent Plugins clients launch the server from
+    the plugin's own folder, which must never be mistaken for (and indexed as)
+    the user's project.
+    """
+    if _no_cwd_fallback:
+        return False
+    if env := os.environ.get("GTAGS_MCP_CWD_FALLBACK"):
+        return env.strip().lower() not in ("0", "false", "no", "off")
+    return config_module.get_bool_setting("cwd_fallback", None, default=True)
 
 
 # --------------------------------------------------------------------------
@@ -377,40 +435,81 @@ mcp._lowlevel_server.add_notification_handler(
 )
 
 
-def _gtags_tool(title: str, *, read_only: bool = True):
-    """Register the decorated function as an MCP tool behind an async
-    roots-aware wrapper.
+# Set by the async MCP wrapper: this call serves a live client, which enforces
+# its own per-call timeout, so a first-time index build must not block it past
+# INDEX_BUILD_WAIT_SECONDS. Direct calls (tests, the eval harness) still wait.
+_live_mcp_call: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "gtags_mcp_live_call", default=False
+)
 
-    The wrapper fetches the session's workspace roots (an await on the
-    client — impossible from sync code on the event loop) and then runs the
-    sync tool body in a worker thread, keeping slow gtags subprocess work
-    off the event loop. The module-level attribute stays the plain sync
-    function so tests and the eval harness call it directly.
+
+def _gtags_tool(title: str, *, read_only: bool = True, always_load: bool = False):
+    """Register the decorated tool body as an MCP tool.
+
+    Tool bodies return the JSON envelope only; ONE renderer
+    (:func:`gtags_mcp.output.render_text`) turns it into the compact text
+    agents get by default, so the two formats can never drift apart. The
+    module-level attribute becomes a sync function with a ``format``
+    parameter (default "text") that tests and the eval harness call directly.
+
+    The MCP-facing async wrapper fetches the session's workspace roots (an
+    await on the client — impossible from sync code on the event loop), runs
+    the body in a worker thread (slow gtags subprocess work stays off the
+    event loop), and marks error envelopes with ``isError``. It returns a
+    CallToolResult for those rather than raising ToolError: the SDK would
+    rewrite the message ("Error executing tool ...") and log a failure line.
 
     Tools write only caches (the project index, the managed toolchain), so
     all but update_index — whose whole point is the write — are read-only;
     the destructive/idempotent hints are only meaningful (per spec) on a
-    non-read-only tool, so they ride on that one alone.
+    non-read-only tool, so they ride on that one alone. ``always_load`` marks
+    core tools to skip Claude Code's deferred tool search (one fewer
+    round-trip before the first call).
 
-    The body returns a JSON (or text) string, so structured output is off:
-    otherwise the SDK derives a {"result": string} outputSchema and sends
-    every response twice — once as text, once as an escaped JSON string.
+    Structured output is off: the body returns a string, so the SDK would
+    otherwise derive a {"result": string} outputSchema and send every
+    response twice — once as text, once as an escaped JSON string.
     """
 
     def register(fn):
+        body_sig = inspect.signature(fn, eval_str=True)
+        format_param = inspect.Parameter(
+            "format", inspect.Parameter.KEYWORD_ONLY, default="text", annotation=Format
+        )
+
         @functools.wraps(fn)
+        def rendered(*args, format: Format = "text", **kwargs) -> str:
+            raw = fn(*args, **kwargs)
+            return raw if format == "json" else output.render_text(json.loads(raw))
+
+        rendered.__signature__ = body_sig.replace(
+            parameters=[*body_sig.parameters.values(), format_param]
+        )
+        rendered.__annotations__ = {**fn.__annotations__, "format": Format}
+
+        @functools.wraps(rendered)
         async def wrapper(*, ctx: Context, **kwargs):
             _roots_ctx.set(await _fetch_session_roots(ctx))
-            return await anyio.to_thread.run_sync(functools.partial(fn, **kwargs))
+            _live_mcp_call.set(True)
+            fmt = kwargs.pop("format", "text")
+            raw = await anyio.to_thread.run_sync(functools.partial(fn, **kwargs))
+            data = json.loads(raw)
+            text = raw if fmt == "json" else output.render_text(data)
+            if data.get("error"):
+                return types.CallToolResult(
+                    content=[types.TextContent(type="text", text=text)], is_error=True
+                )
+            return text
 
         # MCPServer derives the input schema from inspect.signature and finds
         # the Context parameter via get_type_hints — both of which functools
-        # .wraps pointed at fn. Graft ctx onto each, or it is neither injected
-        # nor hidden from the schema.
-        sig = inspect.signature(fn, eval_str=True)
+        # .wraps pointed at the body. Graft format and ctx onto each, or ctx is
+        # neither injected nor hidden from the schema.
         ctx_param = inspect.Parameter("ctx", inspect.Parameter.KEYWORD_ONLY, annotation=Context)
-        wrapper.__signature__ = sig.replace(parameters=[*sig.parameters.values(), ctx_param])
-        wrapper.__annotations__ = {**fn.__annotations__, "ctx": Context}
+        wrapper.__signature__ = rendered.__signature__.replace(
+            parameters=[*rendered.__signature__.parameters.values(), ctx_param]
+        )
+        wrapper.__annotations__ = {**rendered.__annotations__, "ctx": Context}
 
         write_hints = {} if read_only else {"destructiveHint": False, "idempotentHint": True}
         mcp.tool(
@@ -418,9 +517,10 @@ def _gtags_tool(title: str, *, read_only: bool = True):
             annotations=types.ToolAnnotations(
                 readOnlyHint=read_only, openWorldHint=False, **write_hints
             ),
+            meta={"anthropic/alwaysLoad": True} if always_load else None,
             structured_output=False,
         )(wrapper)
-        return fn
+        return rendered
 
     return register
 
@@ -428,7 +528,7 @@ def _gtags_tool(title: str, *, read_only: bool = True):
 def _effective_root(project_root: str | None) -> tuple[Path | None, str | None]:
     """Resolve the project root: explicit arg > --root/env default > config
     > client workspace roots (MCP roots protocol) > auto-detected (walk up
-    from cwd to GTAGS/.git) > cwd."""
+    from cwd to GTAGS/.git) > cwd (unless the cwd fallback is disabled)."""
     raw = project_root or _default_root or config_module.get_setting("root")
     if raw is not None:
         root = Path(raw).expanduser().resolve()
@@ -450,7 +550,16 @@ def _effective_root(project_root: str | None) -> tuple[Path | None, str | None]:
             f"Error: the client has {len(roots)} workspace roots open "
             f"({listing}). Pass project_root=<one of them> to choose."
         )
-    return _detect_root(Path(os.getcwd()).resolve()), None
+    cwd = Path(os.getcwd()).resolve()
+    detected = _detect_root(cwd)
+    if not _has_root_marker(detected) and not _cwd_fallback_enabled():
+        return None, (
+            "Error: no project root could be determined (no client workspace "
+            f"roots, and the server's working directory {cwd} is not inside a "
+            "repository). Pass project_root=<absolute path of the repository "
+            "you are working in>."
+        )
+    return detected, None
 
 
 def _run(
@@ -530,6 +639,78 @@ def _run_index(root: Path, incremental: bool) -> tuple[str, str, int]:
     return stdout, stderr, code
 
 
+class _Build:
+    """One in-flight from-scratch index build that concurrent callers join."""
+
+    def __init__(self) -> None:
+        self.started = time.monotonic()
+        self.done = threading.Event()
+        self.result: tuple[str, str, int] = ("", "", -1)
+
+
+# Full builds, one per root at a time (guarded by _refresh_lock). Parallel
+# read-only tool calls on a fresh repo — which clients dispatch concurrently
+# once tools declare readOnlyHint — used to each start their own `gtags` over
+# the same database files: "GTAGS not found", "chmod(2) failed", corruption.
+_builds: dict[Path, _Build] = {}
+# The last failed full build per root, reported once to the next caller.
+_build_errors: dict[Path, str] = {}
+
+
+def _build_body(root: Path, build: _Build, wipe_dir: Path | None) -> None:
+    """Thread body: run the from-scratch build, then publish its outcome."""
+    try:
+        _wait_for_refresh(root)  # never race a background `gtags -i`
+        if wipe_dir is not None:
+            _delete_index_files(wipe_dir)
+        result = _run_index(root, incremental=False)
+    except Exception as exc:  # noqa: BLE001 — must never kill the thread silently
+        result = ("", str(exc), -1)
+    with _refresh_lock:
+        if result[2] == 0:
+            _last_update[root] = time.monotonic()
+            _index_generation[root] = _index_generation.get(root, 0) + 1
+            _build_errors.pop(root, None)
+        else:
+            _build_errors[root] = (
+                f"Error: automatic indexing failed (gtags exited {result[2]}): "
+                f"{result[1].strip() or result[0].strip()}{_loader_hint(result[1])}"
+            )
+        build.result = result
+        _builds.pop(root, None)
+    build.done.set()
+
+
+def _build_index(
+    root: Path, *, wipe_dir: Path | None = None, wait: float | None = None
+) -> tuple[str, str, int] | None:
+    """Start — or join — the single in-flight full build of root's index.
+
+    Returns gtags' (stdout, stderr, returncode) once the build has finished,
+    or None when `wait` seconds elapse first (the build keeps running in its
+    thread). `wipe_dir` deletes stale database files first; a caller joining
+    an already-running build gets that build's outcome instead.
+    """
+    with _refresh_lock:
+        build = _builds.get(root)
+        if build is None:
+            build = _builds[root] = _Build()
+            threading.Thread(
+                target=_build_body,
+                args=(root, build, wipe_dir),
+                name=f"gtags-mcp-build:{root.name}",
+                daemon=True,
+            ).start()
+    if not build.done.wait(wait):
+        return None
+    return build.result
+
+
+def _build_in_flight(root: Path) -> _Build | None:
+    with _refresh_lock:
+        return _builds.get(root)
+
+
 def _refresh_in_background(root: Path) -> None:
     """Thread body: refresh the index incrementally, record outcome under the lock."""
     started = time.monotonic()
@@ -567,18 +748,31 @@ def _ensure_index(root: Path) -> str | None:
     while `gtags -i` catches up in a daemon thread. Staleness is bounded by
     the adaptive debounce window plus the refresh duration; the update_index
     tool is the synchronous barrier when guaranteed freshness is needed.
-    Returns an error string only for fatal conditions (failed full build);
-    a failed *background* refresh is surfaced as a warning on the next query.
+
+    A missing index goes through the single-flight full build. Live MCP calls
+    wait at most INDEX_BUILD_WAIT_SECONDS and then get a "retry shortly"
+    status; direct calls (tests, the eval harness) wait for the build.
+    Returns a status/error string, or None when the index is usable; a failed
+    *background* refresh is surfaced as a warning on the next query.
     """
-    if not (_db_dir(root) / "GTAGS").is_file():
-        stdout, stderr, code = _run_index(root, incremental=False)
-        if code != 0:
+    if not (_db_dir(root) / "GTAGS").is_file() or _build_in_flight(root):
+        with _refresh_lock:
+            failed = None if root in _builds else _build_errors.pop(root, None)
+        if failed:
+            return failed  # the previous attempt failed; report it once, then retry
+        live = _live_mcp_call.get()
+        result = _build_index(root, wait=INDEX_BUILD_WAIT_SECONDS if live else None)
+        if result is None:
+            build = _build_in_flight(root)
+            elapsed = time.monotonic() - build.started if build else 0.0
             return (
-                f"Error: automatic indexing failed (gtags exited {code}): "
-                f"{stderr.strip() or stdout.strip()}{_loader_hint(stderr)}"
+                f"Indexing {root} for the first time ({elapsed:.0f}s elapsed; a "
+                "Linux-kernel-sized tree takes about a minute). Retry this call "
+                "shortly."
             )
-        _last_update[root] = time.monotonic()
-        _bump_generation(root)
+        if result[2] != 0:
+            with _refresh_lock:
+                return _build_errors.pop(root, None) or f"Error: indexing failed ({result[2]})"
         return None
 
     with _refresh_lock:
@@ -588,20 +782,13 @@ def _ensure_index(root: Path) -> str | None:
             max(UPDATE_DEBOUNCE_SECONDS, 10.0 * _update_cost.get(root, 0.0)),
         )
         refresh_due = now - _last_update.get(root, 0.0) >= window
-        if refresh_due and root not in _refresh_threads:
+        if refresh_due and root not in _refresh_threads and root not in _builds:
             thread = threading.Thread(
                 target=_refresh_in_background, args=(root,), daemon=True
             )
             _refresh_threads[root] = thread
             thread.start()
     return None
-
-
-def _bump_generation(root: Path) -> None:
-    """Mark root's index as changed. Never call with _refresh_lock held —
-    the already-locked refresh paths bump the counter inline instead."""
-    with _refresh_lock:
-        _index_generation[root] = _index_generation.get(root, 0) + 1
 
 
 def _current_generation(root: Path) -> int:
@@ -615,27 +802,6 @@ def _pop_refresh_warning(root: Path | None) -> str | None:
         return None
     with _refresh_lock:
         return _refresh_errors.pop(root, None)
-
-
-def _paginate(text: str, limit: int, offset: int) -> str:
-    lines = [
-        line if len(line) <= MAX_LINE_CHARS else line[:MAX_LINE_CHARS] + " ..."
-        for line in text.splitlines()
-    ]
-    total = len(lines)
-    limit = max(1, limit)
-    offset = max(0, offset)
-    page = lines[offset : offset + limit]
-    if not page:
-        return f"No results in range: offset {offset} is past the last of {total} matches."
-    body = "\n".join(page)
-    end = offset + len(page)
-    if offset == 0 and end == total:
-        return body
-    footer = f"— showing {offset + 1}-{end} of {total} matches"
-    if end < total:
-        footer += f"; pass offset={end} to continue"
-    return f"{body}\n{footer}"
 
 
 def _raw_global(
@@ -655,21 +821,27 @@ def _raw_global(
     if code != 0 and stderr.strip():
         # A corrupted database (interrupted build, older version's partial
         # index) is recoverable: wipe it, rebuild from scratch, retry once.
-        if _retry and _CORRUPT_SIGNATURE in stderr:
-            _delete_index_files(_db_dir(root))
-            _, rebuild_err, rebuild_code = _run_index(root, incremental=False)
+        if _retry and _index_unreadable(root, stderr):
+            _, rebuild_err, rebuild_code = _build_index(root, wipe_dir=_db_dir(root))
             if rebuild_code != 0:
+                with _refresh_lock:
+                    _build_errors.pop(root, None)  # reported right here instead
                 return None, root, (
                     f"Error: index was corrupted and the automatic rebuild failed "
                     f"(gtags exited {rebuild_code}): {rebuild_err.strip()}"
                 )
-            _last_update[root] = time.monotonic()
             with _refresh_lock:  # surfaced via the envelope's warning field
-                _index_generation[root] = _index_generation.get(root, 0) + 1
                 _refresh_errors[root] = (
                     "Warning: the index database was corrupted and has been "
                     "rebuilt automatically."
                 )
+            return _raw_global(flags, project_root, _retry=False)
+        if _retry and _index_vanished(root, stderr):
+            # A from-scratch rebuild (update_index full=True, or another
+            # caller's) deleted the database under this query: join that
+            # build — or start one — then retry once.
+            if err := _ensure_index(root):
+                return None, root, err
             return _raw_global(flags, project_root, _retry=False)
         return None, root, (
             f"Error: global exited with code {code}: "
@@ -694,7 +866,6 @@ def _query_global(
     empty_message: str,
     limit: int = DEFAULT_LIMIT,
     offset: int = 0,
-    format: Format = "json",
     enrich_records: bool = False,  # ctags metadata on definition-shaped results
     guard_records: bool = False,  # #ifdef guard stacks on results
     active_config: str | None = None,  # .config / macro list to filter guards by
@@ -702,56 +873,47 @@ def _query_global(
     export_symbol: str | None = None,  # ctags export recovery for this symbol
     fallback_flags: list[str] | None = None,  # rerun with these when empty
     suggest_symbol: str | None = None,  # prefix suggestions when still empty
+    refs: list[macros.Cxref] | None = None,  # the symbol's -rx cxrefs, if in hand
+    path_prefix: str | None = None,  # keep only results under this directory
+    group_by: str = "line",  # "line" | "file" | "auto" (file above threshold)
+    **fields,  # extra envelope fields (e.g. the queried symbol)
 ) -> str:
-    """Shared plumbing for all read-only `global` cxref queries."""
-    stdout, root, err = _raw_global(flags, project_root)
+    """Shared plumbing for the `global` cxref query tools; returns the JSON envelope."""
+    prefix = path_prefix.strip().removeprefix("./").strip("/") if path_prefix else None
+    scope: list[str] = []
+    if prefix:
+        # `global -S dir` filters inside GNU Global: 8 ms instead of 200 ms
+        # for mutex_lock's 22k references. It errors on anything but an
+        # existing directory, so files and typos use the Python filter below.
+        guess, _ = _effective_root(project_root)
+        if guess is not None and (guess / prefix).is_dir():
+            scope = ["-S", prefix]
+    stdout, root, err = _raw_global(scope + flags, project_root)
     if err:
-        return output.error(tool, err, root) if format == "json" else err
+        return output.error(tool, err, root)
     used_fallback = False
     if fallback_flags and not stdout.strip():
         # e.g. find_references: no indexed reference (`-rx`) — fall back to
         # symbol usages (`-sx`), which cover identifiers gtags recorded
         # without an in-tree definition (libc calls, some variables).
-        fb_stdout, _, fb_err = _raw_global(fallback_flags, project_root)
+        fb_stdout, _, fb_err = _raw_global(scope + fallback_flags, project_root)
         if not fb_err and fb_stdout.strip():
             stdout = fb_stdout
             used_fallback = True
     warning = _pop_refresh_warning(root)
-    if format == "text":
-        suffix = "\n(no indexed references — showing symbol usages)" if used_fallback else ""
-        suffix += f"\n\n{warning}" if warning else ""
-        recovered_text = ""
-        if export_symbol:
-            paths = {r[2] for line in stdout.splitlines() if (r := _parse_cxref(line))}
-            r_hits, r_via = _export_recovery(export_symbol, project_root, root, paths)
-            if r_hits:
-                recovered_text = "\n".join(
-                    f"{s:<16} {lineno:>4} {path} {src}" for s, lineno, path, src in r_hits
-                ) + f"\n(recovered via {r_via})"
-        if not stdout.strip():
-            if recovered_text:
-                return recovered_text + suffix
-            if macro_symbol:
-                hits, via = _macro_resolve(macro_symbol, project_root, root, True)
-                if hits:
-                    text = "\n".join(
-                        f"{s:<16} {lineno:>4} {path} {src}" for s, lineno, path, src in hits
-                    )
-                    return _paginate(text, limit, offset) + f"\n(resolved via {via})" + suffix
-            if suggest_symbol:
-                if names := _prefix_suggestions(suggest_symbol, project_root):
-                    suffix += "\nSimilar defined symbols: " + ", ".join(names)
-            return empty_message + suffix
-        result = _paginate(stdout.rstrip(), limit, offset)
-        if recovered_text:
-            result += "\n" + recovered_text
-        return result + suffix
+
+    def wanted(path: str) -> bool:
+        path = path.removeprefix("./")
+        return prefix is None or path == prefix or path.startswith(prefix + "/")
+
+    # Filter BEFORE building records: a hot symbol has tens of thousands of
+    # reference lines and the caller usually wants one directory of them.
     items = [
         output.record(r[0], r[2], r[1], r[3])
         for line in stdout.splitlines()
-        if (r := _parse_cxref(line))
+        if (r := _parse_cxref(line)) and wanted(r[2])
     ]
-    extra: dict = {}
+    extra: dict = dict(fields)
     if used_fallback:
         extra["fallback"] = "symbol_usages"
     if macro_symbol:
@@ -768,7 +930,7 @@ def _query_global(
             extra["resolved_via"] = via
     if export_symbol:
         r_hits, r_via = _export_recovery(
-            export_symbol, project_root, root, {rec["path"] for rec in items}
+            export_symbol, project_root, root, {rec["path"] for rec in items}, refs=refs
         )
         if r_hits:
             known = {(rec["path"], rec["line"]) for rec in items}
@@ -780,6 +942,9 @@ def _query_global(
                 rec for rec in recovered if (rec["path"], rec["line"]) not in known
             ] + items
             extra.setdefault("resolved_via", r_via)
+    if prefix is not None:
+        items = [rec for rec in items if wanted(rec["path"])]  # resolved/recovered too
+        extra["path_prefix"] = prefix
     if active_config:
         # Explicit intent must not fail silently: bad specs and disabled
         # guard scanning are errors, not quietly-unfiltered results.
@@ -797,15 +962,30 @@ def _query_global(
         # scans every result file (not just one page) — opt-in cost, cached.
         items, dropped = _maybe_guard(items, root, cfg)
         extra["config_filtered"] = dropped
+    if not items:
+        extra["message"] = empty_message
+        if suggest_symbol:
+            extra["suggestions"] = _prefix_suggestions(suggest_symbol, project_root)
+    if group_by == "file" or (group_by == "auto" and len(items) > REFERENCE_GROUP_THRESHOLD):
+        counts: dict[str, int] = {}
+        for rec in items:
+            counts[rec["path"]] = counts.get(rec["path"], 0) + 1
+        ranked = [
+            {"path": path, "count": count}
+            for path, count in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        ]
+        page, total, truncated = output.paginate(ranked, limit, offset)
+        extra["grouped_by"] = "file"
+        extra["total_references"] = len(items)
+        return output.envelope(
+            tool, root, page, total=total, offset=offset, truncated=truncated,
+            warning=warning, **extra,
+        )
     page, total, truncated = output.paginate(items, limit, offset)
     if enrich_records:
         _maybe_enrich(page, root)  # after pagination: only one page pays ctags
     if guard_records and not active_config:
         _maybe_guard(page, root)  # guards already filled when config-filtered
-    if not items:
-        extra["message"] = empty_message
-        if suggest_symbol:
-            extra["suggestions"] = _prefix_suggestions(suggest_symbol, project_root)
     return output.envelope(
         tool,
         root,
@@ -1071,7 +1251,7 @@ def _extract_body(file: Path, start_line: int) -> list[str]:
 
 
 # Per-file `global -fx` definition lists, reused across the caller-graph
-# walks: one reachability/blast_radius call runs _callers_of once per BFS
+# walks: one reachability call runs _callers_of once per BFS
 # node, and different symbols keep being referenced in the same hot files.
 # `-fx` output depends only on index state, so entries are keyed by the
 # index generation (not file mtime) and die when the index refreshes.
@@ -1119,12 +1299,15 @@ def _file_definitions(
 
 
 def _callers_of(
-    symbol: str, project_root: str | None
+    symbol: str,
+    project_root: str | None,
+    sources: dict[tuple[str, int], str] | None = None,
 ) -> tuple[dict[tuple[str, str], list[int]] | None, str | None]:
     """Map every reference to `symbol` to its enclosing function.
 
     Returns ({(caller, path): [ref lines]}, None) — empty dict when there are
-    no references — or (None, error message).
+    no references — or (None, error message). When `sources` is given it is
+    filled with {(path, line): source text} for every reference site.
     """
     stdout, root, err = _raw_global(["-rx", "--", symbol], project_root)
     if err:
@@ -1132,6 +1315,8 @@ def _callers_of(
     refs = [r for line in stdout.splitlines() if (r := _parse_cxref(line))]
     if not refs:
         return {}, None
+    if sources is not None:
+        sources.update(((path, lineno), src.strip()) for _, lineno, path, src in refs)
 
     by_file: dict[str, list[int]] = {}
     for _, lineno, path, _ in refs:
@@ -1139,8 +1324,8 @@ def _callers_of(
     if len(by_file) > 500:
         return None, (
             f"'{symbol}' is referenced in {len(by_file)} files ({len(refs)} sites) — "
-            "too broad for caller analysis. Use summarize_references to see the "
-            "per-file distribution, then narrow down."
+            "too broad for caller analysis. Use find_references (it groups by "
+            "file) to see where usage concentrates, then narrow with path_prefix."
         )
 
     callers: dict[tuple[str, str], list[int]] = {}
@@ -1167,58 +1352,89 @@ _NON_CALLS = frozenset(
 )
 
 
-@_gtags_tool("Find definition")
+@_gtags_tool("Find definition", always_load=True)
 def find_definition(
     symbol: str,
     project_root: str | None = None,
     case_insensitive: bool = False,
     limit: int = DEFAULT_LIMIT,
     offset: int = 0,
-    format: Format = "json",
     active_config: str | None = None,
 ) -> str:
-    """Find where a C/C++ symbol (function, struct, macro, typedef, enum) is defined.
+    """Go to definition: where a C/C++ symbol (function, struct, macro,
+    typedef, enum) is defined, with a usage summary — the best first query.
 
-    Use this INSTEAD of grep whenever you need a symbol's definition: an
-    indexed lookup that returns only the definition site(s). Multiply-defined
-    symbols (#ifdef alternates) carry each definition's guard stack.
-    Macro-generated symbols resolve too: "sys_read", "trace_sched_switch",
-    or a DEFINE_SPINLOCK/module_param name returns the generator invocation
-    site (SYSCALL_DEFINE3(read, ...)), flagged resolved_via — no build
-    needed. Definitions the index parser missed are recovered from their
-    EXPORT_SYMBOL* site via ctags, flagged resolved_via "ctags:...". On a
-    miss the envelope carries "suggestions": defined symbols starting with
-    the queried name.
+    Each definition carries its #if/#ifdef guard stack (several guarded
+    definitions = a config choice) and ctags kind/signature. The summary
+    gives reference and file counts, the hottest files and the
+    EXPORT_SYMBOL* variant. Macro-generated symbols resolve ("sys_read" ->
+    SYSCALL_DEFINE3(read, ...), DEFINE_SPINLOCK names), and definitions the
+    index parser missed are recovered from their EXPORT_SYMBOL* site —
+    both flagged resolved_via. A miss suggests similarly named symbols.
 
-    JSON records: {symbol, path, line, col, kind, typeref, scope, signature,
-    guard, snippet} — kind/typeref/scope/signature are ctags metadata when
-    available; guard is the enclosing #if/#ifdef stack, outermost first,
-    [] = unconditional.
+    JSON: results are {symbol, path, line, col, kind, typeref, scope,
+    signature, guard, snippet} records; the envelope adds definition_count,
+    guard_variants, reference_count, file_count, top_files, exported.
 
     Args:
         symbol: Exact symbol name, e.g. "tcp_v4_rcv".
-        case_insensitive: Match ignoring case.
+        case_insensitive: Match ignoring case (skips the usage summary).
         active_config: Kernel .config path or macro list like
             "CONFIG_SMP,BITS_PER_LONG=64,!CONFIG_DEBUG"; drops definitions
             whose guard stack is definitely false under it (count reported
             as config_filtered). Unknown macros never drop anything.
     """
+    refs: list[macros.Cxref] | None = None
+    if not case_insensitive:
+        # References first: they feed the usage summary AND export recovery
+        # (one -rx query, not two), and this call surfaces index/toolchain
+        # status exactly once.
+        refs_out, root, err = _raw_global(["-rx", "--", symbol], project_root)
+        if err:
+            return output.error("find_definition", err, root)
+        refs = [r for line in (refs_out or "").splitlines() if (r := _parse_cxref(line))]
     flags = ["-x"] + (["-i"] if case_insensitive else []) + ["--", symbol]
-    return _query_global(
+    raw = _query_global(
         "find_definition",
         flags,
         project_root,
         f"No definition found for symbol '{symbol}'.",
         limit,
         offset,
-        format,
         enrich_records=True,
         guard_records=True,
         active_config=active_config,
         macro_symbol=symbol,
         export_symbol=symbol,
         suggest_symbol=symbol,
+        refs=refs,
+        symbol=symbol,
     )
+    data = json.loads(raw)
+    if refs is None or data.get("error"):
+        return raw
+    counts: dict[str, int] = {}
+    for _, _, path, _ in refs:
+        counts[path] = counts.get(path, 0) + 1
+    top = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:TOP_FILES]
+    exported = macros.exported_via(symbol, (src for _, _, _, src in refs))
+    via = data.get("resolved_via") or ""
+    if not exported and via.startswith("ctags:"):
+        # Recovery is proof of export even when every occurrence sits in the
+        # symbol-usage DB (fully missed definition -> no -rx records).
+        exported = via.removeprefix("ctags:")
+    variants = {tuple(rec["guard"]) for rec in data["results"] if rec.get("guard") is not None}
+    data.update(
+        definition_count=data["total"],
+        guard_variants=len(variants) if variants else None,
+        reference_count=len(refs),
+        file_count=len(counts),
+        top_files=[{"path": path, "count": count} for path, count in top],
+        exported=exported,
+    )
+    if data["results"] and len(counts) > 50:
+        data["next_tools"] = ["find_references", "find_callers"]
+    return json.dumps(data, ensure_ascii=False)
 
 
 @_gtags_tool("Find references")
@@ -1228,21 +1444,26 @@ def find_references(
     case_insensitive: bool = False,
     limit: int = DEFAULT_LIMIT,
     offset: int = 0,
-    format: Format = "json",
     active_config: str | None = None,
+    group_by: Literal["auto", "line", "file"] = "auto",
+    path_prefix: str | None = None,
 ) -> str:
-    """Find all call/usage sites of a C/C++ symbol.
+    """Find all references / usages of a C/C++ symbol — every call and use site.
 
-    Use this INSTEAD of grep for "who calls/uses this?": only real reference
-    sites from the index, each with its #if/#ifdef guard stack. Symbols with
-    no in-tree definition (libc calls, some variables) work too — the query
-    falls back to symbol-usage records, flagged "fallback": "symbol_usages".
+    Only real reference sites from the index, each with its #if/#ifdef guard
+    stack. Very widely used symbols (more than 200 sites, e.g. kmalloc) come
+    back grouped by file with counts — see where usage concentrates, then
+    narrow with path_prefix. Symbols with no in-tree definition (libc calls,
+    some variables) work too, flagged "fallback": "symbol_usages".
 
     Args:
         symbol: Exact symbol name.
         case_insensitive: Match ignoring case.
         active_config: Kernel .config path or macro list; drops references
             whose guard stack is definitely false under it (config_filtered).
+        group_by: "auto" (default: per-file counts above 200 references),
+            "line" (always individual sites) or "file" (always per-file counts).
+        path_prefix: Only references under this directory, e.g. "fs/ext4".
     """
     ci = ["-i"] if case_insensitive else []
     return _query_global(
@@ -1252,27 +1473,28 @@ def find_references(
         f"No references found for symbol '{symbol}'.",
         limit,
         offset,
-        format,
         guard_records=True,
         active_config=active_config,
         fallback_flags=["-sx", *ci, "--", symbol],
+        path_prefix=path_prefix,
+        group_by=group_by,
+        symbol=symbol,
     )
 
 
-@_gtags_tool("Get symbol body")
+@_gtags_tool("Get symbol body", always_load=True)
 def get_symbol_body(
     symbol: str,
     project_root: str | None = None,
     max_definitions: int = 3,
-    format: Format = "json",
 ) -> str:
-    """Return the full source of a symbol's definition — just the body.
+    """Read a symbol's source: the full body of a function, struct or macro
+    definition, without reading the whole file.
 
-    Use this INSTEAD of reading a whole file to see how a function, struct,
-    or macro is implemented: it extracts only the definition's lines, so a
-    one-screen function never costs a 5000-line file read. Macro-generated
-    and parser-missed (EXPORT_SYMBOL-recovered) definitions resolve too,
-    flagged resolved_via. JSON results: {path, line, body} items.
+    Extracts only the definition's lines, so a one-screen function never
+    costs a 5000-line file read. Macro-generated and parser-missed
+    (EXPORT_SYMBOL-recovered) definitions resolve too, flagged resolved_via.
+    JSON results: {path, line, body} items.
 
     Args:
         symbol: Exact symbol name.
@@ -1281,156 +1503,96 @@ def get_symbol_body(
     """
     defs, root, resolved_via, err = _resolve_definitions(symbol, project_root)
     if err:
-        return output.error("get_symbol_body", err, root) if format == "json" else err
+        return output.error("get_symbol_body", err, root)
     if not defs:
-        message = f"No definition found for symbol '{symbol}'."
-        if format == "json":
-            return output.envelope("get_symbol_body", root, [], message=message)
-        return message
-    extra = {"resolved_via": resolved_via} if resolved_via else {}
-    omitted = max(0, len(defs) - max_definitions)
-    if format == "json":
-        items = [
-            {
-                "path": path,
-                "line": lineno,
-                "body": "\n".join(_extract_body(root / path, lineno)),
-            }
-            for _, lineno, path, _ in defs[:max_definitions]
-        ]
         return output.envelope(
             "get_symbol_body",
             root,
-            items,
-            total=len(defs),
-            truncated=omitted > 0,
-            omitted_definitions=omitted,
-            **extra,
+            [],
+            message=f"No definition found for symbol '{symbol}'.",
+            symbol=symbol,
         )
-    chunks: list[str] = []
-    for _, lineno, path, _ in defs[:max_definitions]:
-        body = _extract_body(root / path, lineno)
-        chunks.append(f"=== {path}:{lineno} ===\n" + "\n".join(body))
-    if resolved_via:
-        chunks[0] = f"(resolved via {resolved_via})\n" + chunks[0]
-    if omitted:
-        chunks.append(
-            f"... {omitted} more definition(s) not shown; "
-            "use find_definition to list them all."
-        )
-    return "\n\n".join(chunks)
+    extra = {"resolved_via": resolved_via} if resolved_via else {}
+    omitted = max(0, len(defs) - max_definitions)
+    items = [
+        {
+            "path": path,
+            "line": lineno,
+            "body": "\n".join(_extract_body(root / path, lineno)),
+        }
+        for _, lineno, path, _ in defs[:max_definitions]
+    ]
+    return output.envelope(
+        "get_symbol_body",
+        root,
+        items,
+        total=len(defs),
+        truncated=omitted > 0,
+        omitted_definitions=omitted,
+        symbol=symbol,
+        **extra,
+    )
 
 
-@_gtags_tool("Find callers")
+@_gtags_tool("Find callers", always_load=True)
 def find_callers(
     symbol: str,
     project_root: str | None = None,
     limit: int = DEFAULT_LIMIT,
     offset: int = 0,
-    format: Format = "json",
 ) -> str:
-    """Find the FUNCTIONS that call a symbol, deduplicated, with call counts.
+    """Who calls this function? Callers / call hierarchy / incoming calls,
+    deduplicated per calling function with call counts.
 
-    Use this INSTEAD of find_references when you want the call graph rather
-    than raw match lines: each reference is mapped to its enclosing function.
-    The highest signal-to-noise "who uses this?" view; iterate it to walk
-    the caller graph upward. JSON results: {caller, path, sites} items.
+    Each reference is mapped to its enclosing function and shown with the
+    source line of its first call site, so there is nothing to re-grep. The
+    highest signal-to-noise "who uses this?" view for impact analysis;
+    iterate it to walk the caller graph upward. JSON results: {caller, path,
+    sites, call} items (call = source of the first site).
 
     Args:
         symbol: Exact symbol name whose callers you want.
     """
     root, _ = _effective_root(project_root)
-    callers, err = _callers_of(symbol, project_root)
+    sources: dict[tuple[str, int], str] = {}
+    callers, err = _callers_of(symbol, project_root, sources)
     if err:
-        if format == "json":
-            hints = ["summarize_references"] if "too broad" in err else None
-            return output.error("find_callers", err, root, hints=hints)
-        return err
+        hints = ["find_references"] if "too broad" in err else None
+        return output.error("find_callers", err, root, hints=hints)
     ranked = sorted(callers.items(), key=lambda kv: (-len(kv[1]), kv[0]))
-    if format == "json":
-        items = [
-            {"caller": caller, "path": path, "sites": sites}
-            for (caller, path), sites in ranked
-        ]
-        page, total, truncated = output.paginate(items, limit, offset)
-        extra = {} if items else {"message": f"No references found for symbol '{symbol}'."}
-        return output.envelope(
-            "find_callers",
-            root,
-            page,
-            total=total,
-            offset=offset,
-            truncated=truncated,
-            **extra,
-        )
-    if not callers:
-        return f"No references found for symbol '{symbol}'."
-    rows = []
-    for (caller, path), sites in ranked:
-        shown = ", ".join(str(n) for n in sites[:5])
-        more = f", +{len(sites) - 5} more" if len(sites) > 5 else ""
-        plural = "s" if len(sites) != 1 else ""
-        rows.append(f"{caller}  {path}  {len(sites)} call site{plural} at line(s) {shown}{more}")
-    return _paginate("\n".join(rows), limit, offset)
-
-
-@_gtags_tool("Summarize references")
-def summarize_references(
-    symbol: str,
-    project_root: str | None = None,
-    limit: int = DEFAULT_LIMIT,
-    offset: int = 0,
-    format: Format = "json",
-) -> str:
-    """Per-file reference counts for a symbol — the cheapest wide view.
-
-    Use this FIRST for very widely used symbols (thousands of references):
-    one line per file, sorted by count, shows where usage concentrates;
-    then drill in with find_references or find_callers. JSON results:
-    {path, count} items plus total_references.
-
-    Args:
-        symbol: Exact symbol name.
-    """
-    stdout, root, err = _raw_global(["-rx", "--", symbol], project_root)
-    if err:
-        return output.error("summarize_references", err, root) if format == "json" else err
-    refs = [r for line in stdout.splitlines() if (r := _parse_cxref(line))]
-    counts: dict[str, int] = {}
-    for _, _, path, _ in refs:
-        counts[path] = counts.get(path, 0) + 1
-    ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
-    if format == "json":
-        items = [{"path": path, "count": count} for path, count in ranked]
-        page, total, truncated = output.paginate(items, limit, offset)
-        extra = {} if items else {"message": f"No references found for symbol '{symbol}'."}
-        return output.envelope(
-            "summarize_references",
-            root,
-            page,
-            total=total,
-            offset=offset,
-            truncated=truncated,
-            total_references=len(refs),
-            **extra,
-        )
-    if not refs:
-        return f"No references found for symbol '{symbol}'."
-    rows = [f"{count:6d}  {path}" for path, count in ranked]
-    header = f"{len(refs)} references across {len(counts)} files:"
-    return header + "\n" + _paginate("\n".join(rows), limit, offset)
+    items = [
+        {
+            "caller": caller,
+            "path": path,
+            "sites": sites,
+            "call": sources.get((path, sites[0]), "")[: output.MAX_SNIPPET_CHARS],
+        }
+        for (caller, path), sites in ranked
+    ]
+    page, total, truncated = output.paginate(items, limit, offset)
+    extra = {} if items else {"message": f"No references found for symbol '{symbol}'."}
+    return output.envelope(
+        "find_callers",
+        root,
+        page,
+        total=total,
+        offset=offset,
+        truncated=truncated,
+        symbol=symbol,
+        **extra,
+    )
 
 
 @_gtags_tool("Find callees")
 def find_callees(
     symbol: str,
     project_root: str | None = None,
-    format: Format = "json",
 ) -> str:
-    """What functions does this function CALL? (the outgoing call graph)
+    """What does this function call? Callees / outgoing calls of a function.
 
-    Use this to see a function's dependencies without reading any file:
-    call sites are detected in its body and verified against the index.
+    Shows a function's dependencies without reading any file: call sites
+    are detected in its body and verified against the index, split into
+    in-tree functions (with locations) and external/unresolved names.
     Macro-generated and parser-missed (EXPORT_SYMBOL-recovered) definitions
     resolve too, flagged resolved_via. JSON results:
     {in_tree: [{symbol, path, line}], external: [names]}.
@@ -1440,19 +1602,17 @@ def find_callees(
     """
     defs, root, resolved_via, err = _resolve_definitions(symbol, project_root)
     if err:
-        return output.error("find_callees", err, root) if format == "json" else err
+        return output.error("find_callees", err, root)
     if not defs:
-        message = f"No definition found for symbol '{symbol}'."
-        if format == "json":
-            return output.envelope(
-                "find_callees",
-                root,
-                {"in_tree": [], "external": []},
-                total=0,
-                hints=output.next_tools("get_symbol_body", False),
-                message=message,
-            )
-        return message
+        return output.envelope(
+            "find_callees",
+            root,
+            {"in_tree": [], "external": []},
+            total=0,
+            hints=output.next_tools("get_symbol_body", False),
+            message=f"No definition found for symbol '{symbol}'.",
+            symbol=symbol,
+        )
     _, lineno, path, _ = defs[0]
     body = "\n".join(_extract_body(root / path, lineno))
 
@@ -1476,38 +1636,23 @@ def find_callees(
         else:
             external.append(name)
 
-    if format == "json":
-        extra: dict = {"resolved_via": resolved_via} if resolved_via else {}
-        if not candidates:
-            extra["message"] = f"{symbol} ({path}:{lineno}) makes no detectable calls."
-        return output.envelope(
-            "find_callees",
-            root,
-            {"in_tree": in_tree, "external": external},
-            total=len(in_tree) + len(external),
-            truncated=capped > 0,
-            definition={"path": path, "line": lineno},
-            capped_call_targets=capped,
-            **extra,
-        )
+    extra: dict = {"resolved_via": resolved_via} if resolved_via else {}
     if not candidates:
-        return f"{symbol} ({path}:{lineno}) makes no detectable calls."
-    note = (
-        f"\n(analysis capped at 40 of {len(candidates) + capped} distinct call targets)"
-        if capped
-        else ""
+        extra["message"] = f"{symbol} ({path}:{lineno}) makes no detectable calls."
+    return output.envelope(
+        "find_callees",
+        root,
+        {"in_tree": in_tree, "external": external},
+        total=len(in_tree) + len(external),
+        truncated=capped > 0,
+        definition={"path": path, "line": lineno},
+        capped_call_targets=capped,
+        symbol=symbol,
+        **extra,
     )
-    via_note = f" (resolved via {resolved_via})" if resolved_via else ""
-    sections = [f"Callees of {symbol} ({path}:{lineno}){via_note}:"]
-    if in_tree:
-        sections.append("In-tree (use get_symbol_body to read them):")
-        sections.extend(f"  {c['symbol']}  {c['path']}:{c['line']}" for c in in_tree)
-    if external:
-        sections.append(f"External/unresolved: {', '.join(external)}")
-    return "\n".join(sections) + note
 
 
-# Caller-graph walks (reachability / blast_radius) expand at most this many
+# Caller-graph walks (reachability) expand at most this many
 # functions per call — beyond that the answer is "too widely connected".
 MAX_GRAPH_EXPANSIONS = 200
 
@@ -1524,9 +1669,9 @@ def reachability(
     to_symbol: str,
     project_root: str | None = None,
     max_depth: int = 8,
-    format: Format = "json",
 ) -> str:
-    """Does FROM transitively call TO — and through which call chain?
+    """Call path / call chain: does FROM transitively call TO, and through
+    which functions?
 
     Use this instead of chaining find_callers rounds when the question is
     "can this function end up in that one?". BFS over the caller graph
@@ -1543,7 +1688,7 @@ def reachability(
     max_depth = max(1, min(max_depth, 12))
     stdout, root, err = _raw_global(["-x", "--", to_symbol], project_root)
     if err:
-        return output.error("reachability", err, root) if format == "json" else err
+        return output.error("reachability", err, root)
     defs = [r for line in stdout.splitlines() if (r := _parse_cxref(line))]
     to_location = {"path": defs[0][2], "line": defs[0][1]} if defs else {}
 
@@ -1618,398 +1763,23 @@ def reachability(
             "indirect path (ops structs, callbacks) may still exist."
         )
 
-    if format == "json":
-        result = {
-            "from": from_symbol,
-            "to": to_symbol,
-            "path_found": found,
-            "hops": hops,
-            "depth": len(hops) - 1 if found else None,
-            "nodes_explored": explored,
-        }
-        extra = {"message": message} if message else {}
-        return output.envelope(
-            "reachability",
-            root,
-            result,
-            total=len(hops),
-            hints=output.next_tools("reachability", found),
-            **extra,
-        )
-
-    if not found:
-        return message
-    chain = " -> ".join(hop["symbol"] for hop in hops)
-    lines = [f"reachable in {len(hops) - 1} call(s): {chain}"]
-    for hop in hops[:-1]:
-        plural = "s" if hop["call_sites"] != 1 else ""
-        lines.append(
-            f"  {hop['symbol']} calls {hop['calls']} at {hop['path']}:{hop['line']}"
-            f" ({hop['call_sites']} site{plural})"
-        )
-    return "\n".join(lines)
-
-
-@_gtags_tool("Change blast radius")
-def blast_radius(
-    git_ref: str = "HEAD",
-    project_root: str | None = None,
-    depth: int = 1,
-    limit: int = DEFAULT_LIMIT,
-    offset: int = 0,
-    format: Format = "json",
-) -> str:
-    """Which functions are impacted by a change? (refactoring blast radius)
-
-    Use this after editing or before merging: maps every line of
-    `git diff <git_ref>` to its enclosing function via the index, then walks
-    the caller graph outward. Ranked by distance — changed functions first,
-    direct callers next. JSON results: {symbol, path, line, distance, via,
-    call_sites} records.
-
-    Args:
-        git_ref: Diff base for `git diff` (default HEAD = uncommitted
-            changes; "HEAD~1" for the last commit, "main..." for a branch).
-        depth: Caller levels to expand beyond the changed functions (0-3,
-            default 1; 0 = just list the changed functions).
-    """
-    depth = max(0, min(depth, 3))
-    if git_ref.startswith("-"):
-        msg = f"Error: invalid git_ref: {git_ref!r}"
-        return output.error("blast_radius", msg) if format == "json" else msg
-    if err := _ensure_toolchain():
-        return output.error("blast_radius", err) if format == "json" else err
-    root, err = _effective_root(project_root)
-    if err:
-        return output.error("blast_radius", err) if format == "json" else err
-    if err := _ensure_index(root):
-        return output.error("blast_radius", err, root) if format == "json" else err
-    diff_out, diff_err, code = _run(
-        ["git", "diff", "--no-color", "--unified=0", git_ref, "--"], root
+    result = {
+        "from": from_symbol,
+        "to": to_symbol,
+        "path_found": found,
+        "hops": hops,
+        "depth": len(hops) - 1 if found else None,
+        "nodes_explored": explored,
+    }
+    extra = {"message": message} if message else {}
+    return output.envelope(
+        "reachability",
+        root,
+        result,
+        total=len(hops),
+        hints=output.next_tools("reachability", found),
+        **extra,
     )
-    if code != 0:
-        msg = f"Error: git diff {git_ref} failed: {diff_err.strip() or 'unknown error'}"
-        return output.error("blast_radius", msg, root) if format == "json" else msg
-
-    # Changed line ranges per (new-side) file, from the unified-diff hunks.
-    changed_ranges: dict[str, list[tuple[int, int]]] = {}
-    current_file: str | None = None
-    for line in diff_out.splitlines():
-        if line.startswith("+++ "):
-            target = line[4:].strip()
-            current_file = None if target == "/dev/null" else target.removeprefix("b/")
-        elif line.startswith("@@") and current_file:
-            hunk = re.match(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", line)
-            if hunk:
-                start = int(hunk.group(1))
-                count = int(hunk.group(2)) if hunk.group(2) is not None else 1
-                # A pure deletion (count 0) still touches the code around
-                # `start`; treat it as a one-line change there.
-                changed_ranges.setdefault(current_file, []).append(
-                    (start, start + max(count, 1) - 1)
-                )
-
-    # Map each changed range to the definitions whose span intersects it.
-    impacted: dict[str, dict] = {}
-    for path, ranges in sorted(changed_ranges.items()):
-        defs = _file_definitions(path, project_root, root)
-        if not defs:
-            continue  # deleted, unindexed, or non-source file
-        for start, end in ranges:
-            for i, (def_line, def_sym) in enumerate(defs):
-                next_line = defs[i + 1][0] if i + 1 < len(defs) else float("inf")
-                if def_line <= end and start < next_line:
-                    impacted.setdefault(
-                        def_sym,
-                        {
-                            "symbol": def_sym,
-                            "path": path,
-                            "line": def_line,
-                            "distance": 0,
-                            "via": None,
-                            "call_sites": None,
-                        },
-                    )
-
-    results = sorted(impacted.values(), key=lambda r: (r["path"], r["line"]))
-    seen = set(impacted)
-    frontier = [r["symbol"] for r in results]
-    explored = 0
-    skipped_broad = 0
-    capped = False
-    for distance in range(1, depth + 1):
-        next_frontier: list[str] = []
-        for sym in frontier:
-            if explored >= MAX_GRAPH_EXPANSIONS:
-                capped = True
-                break
-            explored += 1
-            callers, cerr = _callers_of(sym, project_root)
-            if cerr:
-                skipped_broad += 1
-                continue
-            for (caller, path), sites in sorted(callers.items()):
-                if caller in seen or caller == "(file scope)":
-                    continue
-                seen.add(caller)
-                results.append(
-                    {
-                        "symbol": caller,
-                        "path": path,
-                        "line": sorted(sites)[0],
-                        "distance": distance,
-                        "via": sym,
-                        "call_sites": len(sites),
-                    }
-                )
-                if not _MACROISH_RE.fullmatch(caller):
-                    next_frontier.append(caller)
-        if capped:
-            break
-        frontier = next_frontier
-
-    message = None
-    if not changed_ranges:
-        message = f"git diff {git_ref} reports no changes."
-    elif not impacted:
-        message = (
-            f"No indexed definitions overlap the changes against {git_ref} "
-            "(non-source files, or files not in the index)."
-        )
-
-    if format == "json":
-        page, total, truncated = output.paginate(results, limit, offset)
-        extra = {"message": message} if message else {}
-        return output.envelope(
-            "blast_radius",
-            root,
-            page,
-            total=total,
-            offset=offset,
-            truncated=truncated or capped,
-            git_ref=git_ref,
-            changed_files=len(changed_ranges),
-            changed_functions=len(impacted),
-            skipped_broad=skipped_broad,
-            hints=output.next_tools("blast_radius", bool(results)),
-            **extra,
-        )
-
-    if message:
-        return message
-    lines = [
-        f"Blast radius of `git diff {git_ref}`: {len(impacted)} changed "
-        f"function(s), {len(results)} impacted within {depth} caller level(s):"
-    ]
-    for rec in results[offset : offset + max(1, limit)]:
-        if rec["distance"] == 0:
-            lines.append(f"  [changed] {rec['symbol']}  {rec['path']}:{rec['line']}")
-        else:
-            plural = "s" if rec["call_sites"] != 1 else ""
-            lines.append(
-                f"  [d={rec['distance']}] {rec['symbol']}  {rec['path']}:{rec['line']}"
-                f"  via {rec['via']} ({rec['call_sites']} site{plural})"
-            )
-    if skipped_broad:
-        lines.append(
-            f"  ({skipped_broad} function(s) too widely referenced to expand — "
-            "use summarize_references on them)"
-        )
-    return "\n".join(lines)
-
-
-def _describe_definition(rec: dict, source: str) -> str:
-    """Render one enriched definition record for the symbol_info text card.
-
-    Falls back to the raw source line when no ctags metadata matched.
-    """
-    kind = rec.get("kind")
-    if not kind:
-        return source.strip()
-    name = rec["symbol"]
-    typeref = rec.get("typeref")
-    scope = rec.get("scope")
-    signature = rec.get("signature")
-    if kind in ("function", "prototype"):
-        desc = f"{kind} {name}{signature or '()'}"
-        return f"{desc} -> {typeref}" if typeref else desc
-    if kind == "macro":
-        return f"macro {name}{signature or ''}"
-    if kind == "typedef":
-        return f"typedef {name} = {typeref}" if typeref else f"typedef {name}"
-    if kind == "member":
-        desc = f"member {name}" + (f": {typeref}" if typeref else "")
-        return desc + (f" ({scope})" if scope else "")
-    # enumerator, struct, union, enum, class, variable, ...
-    desc = f"{kind} {name}"
-    if typeref:
-        desc += f": {typeref}"
-    if scope:
-        desc += f" ({scope})"
-    return desc
-
-
-@_gtags_tool("Symbol overview")
-def symbol_info(
-    symbol: str,
-    project_root: str | None = None,
-    format: Format = "json",
-    active_config: str | None = None,
-) -> str:
-    """One-shot overview card for a symbol — the best FIRST query.
-
-    One call returns where a symbol is defined, WHAT it is (kind, signature,
-    scope), under WHICH #ifdef guards each definition lives (guard_variants
-    > 1 means the flat list is really a config choice), how widely it's used
-    and where, plus the tool to use next. Macro-generated symbols resolve
-    (resolved_via); definitions the index parser missed are recovered from
-    their EXPORT_SYMBOL* site via ctags; kernel symbols report their
-    EXPORT_SYMBOL* variant in "exported". JSON results: {definitions, definition_count, guard_variants,
-    resolved_via, exported, reference_count, file_count, top_files}.
-
-    Args:
-        symbol: Exact symbol name.
-        active_config: Kernel .config path or macro list; definitions whose
-            guard stack is definitely false under it are dropped
-            (config_filtered).
-    """
-    defs_out, root, err = _raw_global(["-x", "--", symbol], project_root)
-    if err:
-        return output.error("symbol_info", err, root) if format == "json" else err
-    defs = [r for line in defs_out.splitlines() if (r := _parse_cxref(line))]
-
-    resolved, resolved_via = _macro_resolve(symbol, project_root, root, not defs)
-    if resolved:
-        known = {(path, lineno) for _, lineno, path, _ in defs}
-        defs = [h for h in resolved if (h[2], h[1]) not in known] + defs
-
-    refs_out, _, rerr = _raw_global(["-rx", "--", symbol], project_root)
-    refs = (
-        [r for line in refs_out.splitlines() if (r := _parse_cxref(line))]
-        if refs_out and not rerr
-        else []
-    )
-    exported = macros.exported_via(symbol, (src for _, _, _, src in refs))
-
-    # Parser-missed definitions recovered from EXPORT_SYMBOL* sites (the refs
-    # are already in hand, so this costs at most one cached ctags scan).
-    recovered, recovered_via = _export_recovery(
-        symbol, project_root, root, {p for _, _, p, _ in defs}, refs=refs
-    )
-    if recovered:
-        defs = recovered + defs
-        resolved_via = resolved_via or recovered_via
-        if not exported and recovered_via:
-            # Recovery is proof of export even when every occurrence sits in
-            # the symbol-usage DB (fully missed definition -> no -rx records).
-            exported = recovered_via.removeprefix("ctags:")
-    counts: dict[str, int] = {}
-    for _, _, path, _ in refs:
-        counts[path] = counts.get(path, 0) + 1
-    top = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:5]
-
-    if defs and refs:
-        if len(counts) > 50:
-            hint = "summarize_references (usage is very widespread), then find_callers on hot files"
-            hint_tools = ["summarize_references", "find_callers"]
-        else:
-            hint = "get_symbol_body to read it; find_callers for impact"
-            hint_tools = ["get_symbol_body", "find_callers"]
-    elif defs:
-        hint = "get_symbol_body to read it"
-        hint_tools = ["get_symbol_body"]
-    else:
-        hint = "find_references to see usage sites"
-        hint_tools = ["find_references"]
-
-    # Guard-scan EVERY definition (bounded), not just the first three: "N
-    # definitions under M distinct guards" must describe the whole set, and
-    # active_config must be able to drop any of them.
-    all_records = [
-        output.record(sym, path, lineno, source)
-        for sym, lineno, path, source in defs[:MAX_GUARDED_DEFS]
-    ]
-    cfg = None
-    if active_config:
-        if not _guards_enabled(root):
-            msg = (
-                "Error: active_config needs guard scanning, which is disabled "
-                "(--no-guards / GTAGS_MCP_GUARDS / `guards = false`)."
-            )
-            return output.error("symbol_info", msg, root) if format == "json" else msg
-        cfg, cfg_err = guards.load_active_config(active_config, root)
-        if cfg_err:
-            return (
-                output.error("symbol_info", cfg_err, root)
-                if format == "json"
-                else cfg_err
-            )
-    kept, config_filtered = _maybe_guard(all_records, root, cfg)
-    live_defs = len(kept) + max(0, len(defs) - MAX_GUARDED_DEFS)
-    distinct = {tuple(rec["guard"]) for rec in kept if rec["guard"] is not None}
-    guard_variants = len(distinct) if distinct else None
-
-    def_records = kept[:3]
-    _maybe_enrich(def_records, root)
-
-    if format == "json":
-        info = {
-            "symbol": symbol,
-            "definitions": def_records,
-            "definition_count": live_defs,
-            "guard_variants": guard_variants,
-            "resolved_via": resolved_via,
-            "exported": exported,
-            "reference_count": len(refs),
-            "file_count": len(counts),
-            "top_files": [{"path": path, "count": count} for path, count in top],
-        }
-        if active_config:
-            info["config_filtered"] = config_filtered
-        return output.envelope(
-            "symbol_info",
-            root,
-            info,
-            total=live_defs + len(refs),
-            hints=hint_tools,
-        )
-
-    lines = [f"Symbol: {symbol}"]
-    if resolved_via:
-        lines.append(f"  macro-generated symbol (resolved via {resolved_via})")
-    if exported:
-        lines.append(f"  exported via {exported}")
-    if def_records:
-        if guard_variants is not None and guard_variants > 1:
-            lines.append(
-                f"  {live_defs} definitions under {guard_variants} distinct guards:"
-            )
-        for rec in def_records:
-            prefix = f"[{' && '.join(rec['guard'])}] " if rec["guard"] else ""
-            lines.append(
-                f"  {prefix}defined at {rec['path']}:{rec['line']} — "
-                f"{_describe_definition(rec, rec['snippet'])}"
-            )
-        if live_defs > 3:
-            lines.append(f"  ... {live_defs - 3} more definition(s)")
-        if config_filtered:
-            lines.append(
-                f"  ({config_filtered} definition(s) filtered out by active_config)"
-            )
-    elif defs:
-        lines.append(
-            f"  no definition is live under active_config "
-            f"({config_filtered} filtered out)"
-        )
-    else:
-        lines.append("  no in-tree definition (external symbol? try find_references)")
-    if refs:
-        lines.append(f"  referenced {len(refs)} time(s) across {len(counts)} file(s); top files:")
-        lines.extend(f"    {count:5d}  {path}" for path, count in top)
-    else:
-        lines.append("  no references found")
-    lines.append(f"  next: {hint}")
-    return "\n".join(lines)
 
 
 @_gtags_tool("List file symbols")
@@ -2018,13 +1788,11 @@ def list_file_symbols(
     project_root: str | None = None,
     limit: int = DEFAULT_LIMIT,
     offset: int = 0,
-    format: Format = "json",
 ) -> str:
-    """List every symbol defined in one source file.
+    """Outline of one source file: every function, struct and macro it
+    defines (document symbols), with kind, signature and #ifdef guards.
 
-    Use this INSTEAD of reading a file when you only need its API surface —
-    the functions, structs, and macros it defines — as a compact list with
-    ctags metadata and #ifdef guard stacks when available.
+    Use this INSTEAD of reading a file when you only need its API surface.
 
     Args:
         file_path: Source file, relative to the project root or absolute.
@@ -2036,9 +1804,9 @@ def list_file_symbols(
         f"No symbols found in '{file_path}' (is it inside the indexed tree?).",
         limit,
         offset,
-        format,
         enrich_records=True,
         guard_records=True,
+        file_path=file_path,
     )
 
 
@@ -2046,9 +1814,9 @@ def list_file_symbols(
 def update_index(
     project_root: str | None = None,
     full: bool = False,
-    format: Format = "json",
 ) -> str:
-    """Synchronously refresh the index — the guaranteed-freshness barrier.
+    """Refresh the code index synchronously after editing files — the
+    guaranteed-freshness barrier.
 
     Query tools refresh the index automatically in the background, so
     results can lag very recent edits by a few seconds. Call this right
@@ -2059,62 +1827,116 @@ def update_index(
             incrementally (rarely needed — large branch switch, suspected
             corruption).
     """
-    def _respond(message: str, error: bool = False) -> str:
-        if format != "json":
-            return message
-        if error:
-            return output.error("update_index", message, root)
+    if err := _ensure_toolchain():
+        return output.error("update_index", err)
+    root, err = _effective_root(project_root)
+    if err:
+        return output.error("update_index", err)
+
+    def ok(message: str) -> str:
         return output.envelope(
             "update_index", root, {"status": "ok", "message": message}, total=None
         )
 
-    root = None
-    if err := _ensure_toolchain():
-        return _respond(err, error=True)
-    root, err = _effective_root(project_root)
-    if err:
-        return _respond(err, error=True)
+    def build_failed(result: tuple[str, str, int]) -> str:
+        stdout, stderr, code = result
+        with _refresh_lock:
+            _build_errors.pop(root, None)  # reported right here
+        return output.error(
+            "update_index",
+            f"Error: gtags exited with code {code}: "
+            f"{stderr.strip() or stdout.strip()}{_loader_hint(stderr)}",
+            root,
+        )
+
     if full:
         # From-scratch means from scratch: drop any existing (possibly
         # corrupt) database first. Legacy root-level indexes are left for
         # gtags to overwrite in place so their location doesn't silently move.
-        _wait_for_refresh(root)
-        if (db_dir := _db_dir(root)) != root:
-            _delete_index_files(db_dir)
-        stdout, stderr, code = _run_index(root, incremental=False)
-        if code != 0:
-            return _respond(
-                f"Error: gtags exited with code {code}: "
-                f"{stderr.strip() or stdout.strip()}{_loader_hint(stderr)}",
-                error=True,
-            )
-        _last_update[root] = time.monotonic()
-        _bump_generation(root)
+        # Always blocking — this tool IS the synchronous barrier — and routed
+        # through the single-flight build, so parallel queries join it.
+        db_dir = _db_dir(root)
+        result = _build_index(root, wipe_dir=db_dir if db_dir != root else None)
+        if result[2] != 0:
+            return build_failed(result)
         db_dir = _db_dir(root)
         where = str(db_dir) if db_dir != root else f"{root} (legacy root-level index)"
         label = _gtags_label(root)
         parser = (
             f"parser label '{label}' (multi-language)" if label else "the native parser"
         )
-        return _respond(f"Rebuilt index for {root} (database in {where}) using {parser}.")
+        return ok(f"Rebuilt index for {root} (database in {where}) using {parser}.")
+    if _build_in_flight(root):
+        # A from-scratch build is already running; once it lands the index
+        # is as current as it gets.
+        result = _build_index(root)
+        if result[2] != 0:
+            return build_failed(result)
+        return ok(f"Index built for {root} (synchronous — results are now current).")
     if not (_db_dir(root) / "GTAGS").is_file():
-        return _respond(
+        return output.error(
+            "update_index",
             f"Error: no GTAGS index found for {root}. Any query tool builds "
             "it automatically, or call update_index with full=true.",
-            error=True,
+            root,
         )
     _wait_for_refresh(root)  # don't race an in-flight background refresh
     started = time.monotonic()
     _, stderr, code = _run_index(root, incremental=True)
     if code != 0:
-        return _respond(
-            f"Error: gtags -i exited with code {code}: {stderr.strip()}", error=True
+        return output.error(
+            "update_index", f"Error: gtags -i exited with code {code}: {stderr.strip()}", root
         )
     with _refresh_lock:
         _last_update[root] = time.monotonic()
         _update_cost[root] = _last_update[root] - started
         _index_generation[root] = _index_generation.get(root, 0) + 1
-    return _respond(f"Index updated for {root} (synchronous — results are now current).")
+    return ok(f"Index updated for {root} (synchronous — results are now current).")
+
+
+# --------------------------------------------------------------------------
+# MCP prompts: user-invoked recipes (slash commands in Claude Code, e.g.
+# /mcp__gtags__impact). They cost no tool-schema context, which is why the
+# multi-step "change impact" workflow lives here rather than as a tool.
+# --------------------------------------------------------------------------
+
+
+@mcp.prompt(
+    title="Change impact",
+    description="Which functions does a git diff affect, and who calls them?",
+)
+def impact(git_ref: str = "HEAD") -> str:
+    """Impact analysis of the changes against a git ref."""
+    return (
+        f"Analyze the impact of the code changes in `git diff {git_ref}` "
+        "(HEAD = uncommitted changes; e.g. HEAD~1 for the last commit).\n"
+        f"1. Run `git diff {git_ref}` and list every C/C++ function whose body or "
+        "signature changed (git's hunk headers usually name the enclosing function).\n"
+        "2. For each changed function, call find_callers (pass project_root if the "
+        "repository is ambiguous). A signature or semantics change needs every "
+        "caller reviewed; if a function is too widely used, call find_references "
+        "to see which subsystems concentrate the usage.\n"
+        "3. Report the changed functions and their callers ranked by risk, with "
+        "path:line for each, and name any caller you think needs updating."
+    )
+
+
+@mcp.prompt(
+    title="Explain a symbol",
+    description="What is this function/struct/macro, how does it work, who uses it?",
+)
+def explain(symbol: str) -> str:
+    """Explain one symbol using the index instead of file reads."""
+    return (
+        f"Explain `{symbol}` in this codebase.\n"
+        f"1. Call find_definition for {symbol}: note where it is defined, any "
+        "#ifdef variants, and how widely it is used.\n"
+        "2. Call get_symbol_body to read the implementation (not the whole file).\n"
+        "3. Call find_callers to see who depends on it (for a very widely used "
+        "symbol, find_references shows where usage concentrates instead).\n"
+        "4. Summarize: purpose, inputs/outputs, notable side effects or locking, "
+        "config-dependent variants, and the most important callers."
+    )
 
 
 def _package_version() -> str:
@@ -2155,12 +1977,23 @@ def _client_config_text(transport: str, host: str, port: int) -> str:
         return "\n".join(lines)
     return "\n".join(
         [
-            "MCP client configuration (stdio transport):",
+            "MCP client configuration (stdio transport). Install ONE way — a",
+            "plugin plus a manual entry would run two servers and show every tool twice.",
             "",
-            "  Claude Code (once per device, all repos):",
+            "  Claude Code plugin (server + navigation skill + prompts):",
+            "      /plugin marketplace add harshithsunku/mcp-gtags-server",
+            "      /plugin install mcp-gtags-server@mcp-gtags-server",
+            "",
+            "  Claude Code, manual (once per device, all repos):",
             "      claude mcp add --scope user gtags -- uvx mcp-gtags-server",
             "",
-            "  Cursor / any MCP client — global settings or .mcp.json:",
+            "  Codex — ~/.codex/config.toml:",
+            "      [mcp_servers.gtags]",
+            '      command = "uvx"',
+            '      args = ["mcp-gtags-server"]',
+            "      startup_timeout_sec = 30   # first run downloads the package",
+            "",
+            "  Cursor (~/.cursor/mcp.json) / any MCP client:",
             "      {",
             '        "mcpServers": {',
             '          "gtags": { "command": "uvx", "args": ["mcp-gtags-server"] }',
@@ -2178,7 +2011,7 @@ def _client_config_text(transport: str, host: str, port: int) -> str:
 def main() -> None:
     """Entry point: serve MCP over stdio/HTTP, or run a maintenance subcommand."""
     global _default_root, _forced_label, _bin_dir, _no_enrich, _no_guards
-    global _no_macro_resolve, _no_auto_setup
+    global _no_macro_resolve, _no_auto_setup, _no_cwd_fallback
     parser = argparse.ArgumentParser(
         prog="mcp-gtags-server",
         description=(
@@ -2268,6 +2101,15 @@ def main() -> None:
         "or `macro_resolve = false` in .gtags-mcp.toml).",
     )
     parser.add_argument(
+        "--no-cwd-fallback",
+        action="store_true",
+        help="Never fall back to the server's working directory as the project "
+        "root when it is not inside a repository; tools then ask for "
+        "project_root. Plugin installs set this, because clients launch the "
+        "server from the plugin folder (also: GTAGS_MCP_CWD_FALLBACK=0, or "
+        "`cwd_fallback = false` in the user config).",
+    )
+    parser.add_argument(
         "--no-auto-setup",
         action="store_true",
         help="Do not auto-install the gtags/ctags toolchain on first use; "
@@ -2305,6 +2147,7 @@ def main() -> None:
     _no_guards = args.no_guards
     _no_macro_resolve = args.no_macro_resolve
     _no_auto_setup = args.no_auto_setup
+    _no_cwd_fallback = args.no_cwd_fallback
     if args.bin_dir:
         os.environ["GTAGS_MCP_BIN_DIR"] = args.bin_dir
 

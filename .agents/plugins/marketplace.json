@@ -1,0 +1,11 @@
+{
+  "name": "mcp-gtags-server",
+  "plugins": [
+    {
+      "name": "mcp-gtags-server",
+      "source": { "source": "local", "path": "./plugin" },
+      "interface": { "displayName": "gtags code navigation" },
+      "category": "Developer Tools"
+    }
+  ]
+}

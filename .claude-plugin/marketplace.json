@@ -1,0 +1,14 @@
+{
+  "name": "mcp-gtags-server",
+  "owner": { "name": "Harshith Sunku", "url": "https://github.com/harshithsunku" },
+  "metadata": {
+    "description": "Indexed C/C++ code navigation (GNU Global) for coding agents."
+  },
+  "plugins": [
+    {
+      "name": "mcp-gtags-server",
+      "source": "./plugin",
+      "description": "Indexed C/C++ code navigation for agents: callers, references, call chains and #ifdef-aware definitions from a GNU Global index, with no build."
+    }
+  ]
+}

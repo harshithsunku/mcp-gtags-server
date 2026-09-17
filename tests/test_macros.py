@@ -305,7 +305,7 @@ def kernelish_project(tmp_path):
 @requires_global
 def test_find_definition_resolves_syscall(kernelish_project):
     result = json.loads(
-        server.find_definition("sys_read", project_root=str(kernelish_project))
+        server.find_definition("sys_read", project_root=str(kernelish_project), format="json")
     )
     assert result["resolved_via"] == "macro:SYSCALL_DEFINE"
     assert result["results"], result
@@ -319,7 +319,7 @@ def test_find_definition_resolves_syscall(kernelish_project):
 def test_find_definition_resolves_trace_event(kernelish_project):
     result = json.loads(
         server.find_definition(
-            "trace_sched_switch", project_root=str(kernelish_project)
+            "trace_sched_switch", project_root=str(kernelish_project), format="json"
         )
     )
     assert result["resolved_via"] == "macro:TRACE_EVENT"
@@ -329,7 +329,7 @@ def test_find_definition_resolves_trace_event(kernelish_project):
 @requires_global
 def test_find_definition_resolves_bare_definer(kernelish_project):
     result = json.loads(
-        server.find_definition("css_lock", project_root=str(kernelish_project))
+        server.find_definition("css_lock", project_root=str(kernelish_project), format="json")
     )
     assert result["resolved_via"] == "macro:DEFINE_SPINLOCK"
     assert "DEFINE_SPINLOCK(css_lock)" in result["results"][0]["snippet"]
@@ -338,7 +338,7 @@ def test_find_definition_resolves_bare_definer(kernelish_project):
 @requires_global
 def test_find_definition_fuzzy_fallback(kernelish_project):
     result = json.loads(
-        server.find_definition("__helper_fn", project_root=str(kernelish_project))
+        server.find_definition("__helper_fn", project_root=str(kernelish_project), format="json")
     )
     assert result["resolved_via"] == "fuzzy:helper_fn"
     assert result["results"][0]["symbol"] == "helper_fn"
@@ -347,7 +347,7 @@ def test_find_definition_fuzzy_fallback(kernelish_project):
 @requires_global
 def test_find_definition_no_resolved_via_on_plain_hits(kernelish_project):
     result = json.loads(
-        server.find_definition("helper_fn", project_root=str(kernelish_project))
+        server.find_definition("helper_fn", project_root=str(kernelish_project), format="json")
     )
     assert "resolved_via" not in result
     assert result["results"][0]["symbol"] == "helper_fn"
@@ -363,17 +363,17 @@ def test_find_definition_text_mode_fallback(kernelish_project):
 
 
 @requires_global
-def test_symbol_info_reports_resolution_and_export(kernelish_project):
+def test_definition_summary_reports_resolution_and_export(kernelish_project):
     info = json.loads(
-        server.symbol_info("sys_read", project_root=str(kernelish_project))
-    )["results"]
+        server.find_definition("sys_read", project_root=str(kernelish_project), format="json")
+    )
     assert info["resolved_via"] == "macro:SYSCALL_DEFINE"
     assert info["definition_count"] >= 1
 
     info = json.loads(
-        server.symbol_info("helper_fn", project_root=str(kernelish_project))
-    )["results"]
-    assert info["resolved_via"] is None
+        server.find_definition("helper_fn", project_root=str(kernelish_project), format="json")
+    )
+    assert "resolved_via" not in info
     assert info["exported"] == "EXPORT_SYMBOL"
 
 
@@ -381,7 +381,7 @@ def test_symbol_info_reports_resolution_and_export(kernelish_project):
 def test_macro_resolution_opt_out(kernelish_project, monkeypatch):
     monkeypatch.setenv("GTAGS_MCP_MACRO_RESOLVE", "0")
     result = json.loads(
-        server.find_definition("sys_read", project_root=str(kernelish_project))
+        server.find_definition("sys_read", project_root=str(kernelish_project), format="json")
     )
     assert "resolved_via" not in result
     assert result["results"] == []
@@ -391,7 +391,7 @@ def test_macro_resolution_opt_out(kernelish_project, monkeypatch):
 def test_macro_resolution_config_opt_out(kernelish_project):
     (kernelish_project / ".gtags-mcp.toml").write_text("macro_resolve = false\n")
     result = json.loads(
-        server.find_definition("sys_read", project_root=str(kernelish_project))
+        server.find_definition("sys_read", project_root=str(kernelish_project), format="json")
     )
     assert "resolved_via" not in result
     assert result["results"] == []

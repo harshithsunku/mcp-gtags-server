@@ -1,6 +1,6 @@
 [project]
 name = "mcp-gtags-server"
-version = "1.5.0"
+version = "2.0.0"
 description = "Indexed code navigation for AI coding agents — replace grep scans with GNU Global (gtags) lookups over MCP. ~100x faster and radically less noise on million-line C/C++ codebases."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -48,6 +48,8 @@ Issues = "https://github.com/harshithsunku/mcp-gtags-server/issues"
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
+    # Validates the Agent Plugins manifests against the vendored schemas.
+    "jsonschema>=4.0",
 ]
 
 [project.scripts]

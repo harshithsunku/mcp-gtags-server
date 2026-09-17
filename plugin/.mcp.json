@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "gtags": {
+      "command": "uvx",
+      "args": ["--from", "mcp-gtags-server>=2,<3", "mcp-gtags-server"]
+    }
+  }
+}

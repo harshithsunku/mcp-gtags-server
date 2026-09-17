@@ -150,7 +150,7 @@ def test_eval_tolerates_known_fail_within_threshold(c_project, tmp_path, capsys)
 
 
 def test_eval_new_tool_checks_pass(c_project, tmp_path, capsys):
-    """The five v1.3.1 tools and their expect checks, against the tiny project."""
+    """Per-tool expect checks, against the tiny project."""
     (c_project / "ext.c").write_text(
         "void wrapper(void)\n{\n    external_thing();\n}\n"
     )
@@ -174,8 +174,8 @@ def test_eval_new_tool_checks_pass(c_project, tmp_path, capsys):
             {
                 "id": "summary",
                 "category": "summary",
-                "tool": "summarize_references",
-                "args": {"symbol": "helper"},
+                "tool": "find_references",
+                "args": {"symbol": "helper", "group_by": "file"},
                 "expect": {"min_results": 1, "paths": ["code.c"]},
             },
             {
@@ -289,8 +289,7 @@ def test_repo_golden_set_is_well_formed():
     } <= categories
     # Every tool in the surface is exercised by at least one kernel case.
     tools_covered = {case["tool"] for case in cases}
-    assert tools_covered >= {
+    assert tools_covered == {
         "find_definition", "find_references", "get_symbol_body", "find_callers",
-        "summarize_references", "find_callees", "symbol_info",
-        "list_file_symbols", "reachability", "blast_radius", "update_index",
+        "find_callees", "list_file_symbols", "reachability", "update_index",
     }

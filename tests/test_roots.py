@@ -70,7 +70,7 @@ def _client(**kwargs) -> Client:
 
 
 async def _call(session, tool: str, **arguments) -> dict:
-    result = await session.call_tool(tool, arguments)
+    result = await session.call_tool(tool, {**arguments, "format": "json"})
     return json.loads(result.content[0].text)
 
 
@@ -224,8 +224,8 @@ def test_modern_protocol_client_falls_back_to_cwd(project_a, project_b, monkeypa
 
 
 @requires_global
-def test_tool_results_are_text_only(project_a):
-    """One copy of the envelope per response — no structuredContent echo."""
+def test_tool_results_are_single_compact_text(project_a):
+    """Default output is ONE compact text block — no structuredContent echo."""
 
     async def run():
         async with _client(list_roots_callback=_roots_callback(project_a)) as client:
@@ -233,5 +233,30 @@ def test_tool_results_are_text_only(project_a):
 
     result = anyio.run(run)
     assert result.structured_content is None
+    assert result.is_error is False
     assert len(result.content) == 1
-    assert json.loads(result.content[0].text)["results"][0]["path"] == "main.c"
+    assert "main.c:1: int alpha_fn(int x)" in result.content[0].text
+
+
+@requires_global
+def test_tool_errors_set_is_error(project_a):
+    """Tool failures come back as isError results the model can act on."""
+
+    async def run():
+        async with _client(list_roots_callback=_roots_callback(project_a)) as client:
+            text = await client.call_tool(
+                "find_definition", {"symbol": "alpha_fn", "active_config": "/no/such/.config"}
+            )
+            data = await client.call_tool(
+                "find_definition",
+                {"symbol": "alpha_fn", "active_config": "/no/such/.config", "format": "json"},
+            )
+            ok = await client.call_tool("find_definition", {"symbol": "alpha_fn"})
+            return text, data, ok
+
+    text, data, ok = anyio.run(run)
+    assert text.is_error is True
+    assert text.content[0].text.startswith("Error")
+    assert data.is_error is True
+    assert "error" in json.loads(data.content[0].text)
+    assert ok.is_error is False

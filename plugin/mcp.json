@@ -1,0 +1,11 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+  "mcpServers": {
+    "gtags": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["--from", "mcp-gtags-server>=2,<3", "mcp-gtags-server"],
+      "env": { "GTAGS_MCP_CWD_FALLBACK": "0" }
+    }
+  }
+}

@@ -42,11 +42,11 @@
 {"id": "macro-wq_pool_mutex", "category": "macro", "tool": "find_definition", "args": {"symbol": "wq_pool_mutex"}, "expect": {"paths": ["kernel/workqueue.c"], "top_path": ["kernel/workqueue.c"], "resolved_via": "macro:DEFINE_MUTEX"}}
 #
 # --- references: exhaustive usage lookups ----------------------------------
-{"id": "refs-kmalloc", "category": "references", "tool": "find_references", "args": {"symbol": "kmalloc", "limit": 1}, "expect": {"min_results": 2000}}
+{"id": "refs-kmalloc", "category": "references", "tool": "find_references", "args": {"symbol": "kmalloc", "limit": 1, "group_by": "line"}, "expect": {"min_results": 2000}}
 {"id": "refs-kfree", "category": "references", "tool": "find_references", "args": {"symbol": "kfree", "limit": 1}, "expect": {"min_results": 2000}}
 {"id": "refs-mutex_lock", "category": "references", "tool": "find_references", "args": {"symbol": "mutex_lock", "limit": 1}, "expect": {"min_results": 2000}}
 {"id": "refs-schedule", "category": "references", "tool": "find_references", "args": {"symbol": "schedule", "limit": 1}, "expect": {"min_results": 300}}
-{"id": "refs-task_struct", "category": "references", "tool": "find_references", "args": {"symbol": "task_struct", "limit": 1}, "expect": {"min_results": 2000}}
+{"id": "refs-task_struct", "category": "references", "tool": "find_references", "args": {"symbol": "task_struct", "limit": 1, "group_by": "line"}, "expect": {"min_results": 2000}}
 {"id": "refs-ext4_mark_inode_dirty", "category": "references", "tool": "find_references", "args": {"symbol": "ext4_mark_inode_dirty", "limit": 1}, "expect": {"min_results": 50}}
 {"id": "refs-vfs_read", "category": "references", "tool": "find_references", "args": {"symbol": "vfs_read"}, "expect": {"min_results": 3, "paths": ["fs/read_write.c"]}}
 {"id": "refs-rw_verify_area", "category": "references", "tool": "find_references", "args": {"symbol": "rw_verify_area"}, "expect": {"min_results": 5, "paths": ["fs/read_write.c"]}}
@@ -60,8 +60,8 @@
 {"id": "callers-generic_file_open", "category": "callers", "tool": "find_callers", "args": {"symbol": "generic_file_open", "limit": 1}, "expect": {"min_results": 10}}
 #
 # --- guards: #ifdef awareness (the v0.9.0 headline) ------------------------
-{"id": "guards-kmap-variants", "category": "guards", "tool": "symbol_info", "args": {"symbol": "kmap"}, "expect": {"guard_variants_min": 2, "definition_count_min": 2}}
-{"id": "guards-kmap_atomic-variants", "category": "guards", "tool": "symbol_info", "args": {"symbol": "kmap_atomic"}, "expect": {"guard_variants_min": 2}}
+{"id": "guards-kmap-variants", "category": "guards", "tool": "find_definition", "args": {"symbol": "kmap"}, "expect": {"guard_variants_min": 2, "definition_count_min": 2}}
+{"id": "guards-kmap_atomic-variants", "category": "guards", "tool": "find_definition", "args": {"symbol": "kmap_atomic"}, "expect": {"guard_variants_min": 2}}
 {"id": "guards-kmap-defs", "category": "guards", "tool": "find_definition", "args": {"symbol": "kmap"}, "expect": {"paths": ["include/linux/highmem-internal.h"], "min_results": 2}}
 {"id": "guards-kmap-config-filter", "category": "guards", "tool": "find_definition", "args": {"symbol": "kmap", "active_config": "CONFIG_HIGHMEM,CONFIG_SMP"}, "expect": {"paths": ["include/linux/highmem-internal.h"], "config_filtered_min": 1}}
 #
@@ -77,8 +77,8 @@
 {"id": "callees-kernel_clone", "category": "callees", "tool": "find_callees", "args": {"symbol": "kernel_clone"}, "expect": {"in_tree": ["copy_process"]}}
 #
 # --- summary: per-file reference distribution --------------------------------
-{"id": "summary-kmalloc", "category": "summary", "tool": "summarize_references", "args": {"symbol": "kmalloc", "limit": 2000}, "expect": {"min_results": 1000, "paths": ["crypto/testmgr.c", "drivers/usb/core/message.c"]}}
-{"id": "summary-schedule", "category": "summary", "tool": "summarize_references", "args": {"symbol": "schedule", "limit": 1}, "expect": {"min_results": 200}}
+{"id": "summary-kmalloc", "category": "summary", "tool": "find_references", "args": {"symbol": "kmalloc", "limit": 2000, "group_by": "file"}, "expect": {"min_results": 1000, "paths": ["crypto/testmgr.c", "drivers/usb/core/message.c"]}}
+{"id": "summary-schedule", "category": "summary", "tool": "find_references", "args": {"symbol": "schedule", "limit": 1, "group_by": "file"}, "expect": {"min_results": 200}}
 #
 # --- filesurface: one file's API surface -------------------------------------
 {"id": "files-read_write", "category": "filesurface", "tool": "list_file_symbols", "args": {"file_path": "fs/read_write.c", "limit": 500}, "expect": {"symbols": ["ksys_read", "vfs_read"], "min_results": 50}}
@@ -95,6 +95,5 @@
 {"id": "reach-ksys_read", "category": "workflow", "tool": "reachability", "args": {"from_symbol": "ksys_read", "to_symbol": "rw_verify_area"}, "expect": {"path_found": true}}
 {"id": "reach-openat-security", "category": "workflow", "tool": "reachability", "args": {"from_symbol": "do_sys_openat2", "to_symbol": "security_file_open"}, "expect": {"path_found": true}}
 {"id": "reach-fnptr-honesty", "category": "workflow", "tool": "reachability", "args": {"from_symbol": "vfs_read", "to_symbol": "ext4_file_read_iter", "max_depth": 4}, "expect": {"path_found": false}}
-{"id": "blast-clean-tree", "category": "workflow", "tool": "blast_radius", "args": {}, "expect": {"min_results": 0}}
-{"id": "exported-kernel_read", "category": "workflow", "tool": "symbol_info", "args": {"symbol": "kernel_read"}, "expect": {"exported": "EXPORT_SYMBOL"}}
-{"id": "exported-mutex_lock", "category": "workflow", "tool": "symbol_info", "args": {"symbol": "mutex_lock"}, "expect": {"exported": "EXPORT_SYMBOL"}}
+{"id": "exported-kernel_read", "category": "workflow", "tool": "find_definition", "args": {"symbol": "kernel_read"}, "expect": {"exported": "EXPORT_SYMBOL"}}
+{"id": "exported-mutex_lock", "category": "workflow", "tool": "find_definition", "args": {"symbol": "mutex_lock"}, "expect": {"exported": "EXPORT_SYMBOL"}}

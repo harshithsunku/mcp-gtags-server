@@ -116,7 +116,7 @@ def test_tool_returns_initializing_envelope(missing_toolchain, monkeypatch):
         return 0
 
     monkeypatch.setattr(toolchain, "run_setup", fake_setup)
-    envelope = json.loads(server.find_definition("anything"))
+    envelope = json.loads(server.find_definition("anything", format="json"))
     assert "being installed automatically" in envelope["error"]
     assert started.wait(timeout=10)
     _wait_for_bootstrap()

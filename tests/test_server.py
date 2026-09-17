@@ -7,7 +7,7 @@ import textwrap
 
 import pytest
 
-from gtags_mcp import config, enrich, guards, server, toolchain
+from gtags_mcp import config, enrich, guards, output, server, toolchain
 
 requires_global = pytest.mark.skipif(
     toolchain.find_global() is None or toolchain.find_gtags() is None,
@@ -23,8 +23,11 @@ requires_pygments = pytest.mark.skipif(
 
 
 def _drain_refresh_state():
+    for build in list(server._builds.values()):
+        build.done.wait(timeout=60)
     for thread in list(server._refresh_threads.values()):
         thread.join(timeout=30)
+    server._build_errors.clear()
     server._last_update.clear()
     server._update_cost.clear()
     server._refresh_errors.clear()
@@ -117,7 +120,7 @@ def test_query_flow(c_project):
 
     # printf has no in-tree reference records: find_references falls back to
     # the symbol-usage database (`global -sx`) and flags it in the envelope.
-    usages = json.loads(server.find_references("printf", root))
+    usages = json.loads(server.find_references("printf", root, format="json"))
     assert usages["fallback"] == "symbol_usages"
     assert any(r["path"] == "main.c" for r in usages["results"])
 
@@ -125,11 +128,12 @@ def test_query_flow(c_project):
 @requires_global
 def test_definition_miss_carries_prefix_suggestions(c_project):
     root = str(c_project)
-    miss = json.loads(server.find_definition("add_", root))
+    miss = json.loads(server.find_definition("add_", root, format="json"))
     assert miss["results"] == []
     assert "add_numbers" in miss["suggestions"]
-    text = server.find_definition("add_", root, format="text")
-    assert "Similar defined symbols: add_numbers" in text
+    text = server.find_definition("add_", root)
+    assert "similar symbols: add_numbers" in text
+    assert "0 definitions" not in text  # no empty summary header on a miss
 
 
 @requires_global
@@ -306,18 +310,17 @@ def many_symbols_project(c_project):
 @requires_global
 def test_pagination(many_symbols_project):
     root = str(many_symbols_project)
-    full = server.list_file_symbols("many.c", root, limit=100, format="text")
-    total = len(full.splitlines())
+    total = json.loads(server.list_file_symbols("many.c", root, format="json"))["total"]
     assert total >= 3
 
-    page = server.list_file_symbols("many.c", root, limit=2, format="text")
-    assert f"showing 1-2 of {total} matches" in page
-    assert "pass offset=2 to continue" in page
+    page = server.list_file_symbols("many.c", root, limit=2)
+    assert f"[1-2 of {total} · offset=2 for more]" in page
+    assert len([line for line in page.splitlines() if line[:1].isdigit()]) == 2
 
-    page2 = server.list_file_symbols("many.c", root, limit=2, offset=2, format="text")
-    assert f"showing 3-{min(4, total)} of {total} matches" in page2
+    page2 = server.list_file_symbols("many.c", root, limit=2, offset=2)
+    assert f"[3-{min(4, total)} of {total}" in page2
 
-    past_end = server.list_file_symbols("many.c", root, offset=999, format="text")
+    past_end = server.list_file_symbols("many.c", root, offset=999)
     assert "past the last" in past_end
 
 
@@ -335,20 +338,20 @@ def test_long_lines_are_truncated(c_project):
     long_line = "int long_named_fn(void) { return 0; } /* " + "x" * 500 + " */\n"
     (c_project / "long.c").write_text(long_line)
 
-    result = server.find_definition("long_named_fn", root, format="text")
+    result = server.find_definition("long_named_fn", root)
     assert "long.c" in result
-    assert all(len(line) <= server.MAX_LINE_CHARS + 4 for line in result.splitlines())
+    # Row = "path:line: " + snippet (capped) + tags — never the 500-char line.
+    assert all(len(line) <= output.MAX_SNIPPET_CHARS + 80 for line in result.splitlines())
 
-    # JSON snippets are truncated too.
-    record = json.loads(server.find_definition("long_named_fn", root))["results"][0]
-    assert len(record["snippet"]) <= server.MAX_LINE_CHARS + 4
+    record = json.loads(server.find_definition("long_named_fn", root, format="json"))["results"][0]
+    assert len(record["snippet"]) <= output.MAX_SNIPPET_CHARS + 4
 
 
 @requires_global
 def test_get_symbol_body_returns_only_the_function(c_project):
     root = str(c_project)
-    body = server.get_symbol_body("add_numbers", root, format="text")
-    assert "=== util.c:3 ===" in body
+    body = server.get_symbol_body("add_numbers", root)
+    assert "== util.c:3 ==" in body
     assert "return a + b;" in body
     # It must not leak the rest of the file or other files.
     assert "#include" not in body
@@ -368,23 +371,29 @@ def test_get_symbol_body_multiline_macro(c_project):
 @requires_global
 def test_find_callers_maps_refs_to_enclosing_function(c_project):
     root = str(c_project)
-    result = server.find_callers("add_numbers", root, format="text")
+    result = server.find_callers("add_numbers", root)
     # gtags also counts the util.h prototype as a reference; the call from
-    # main() must be attributed to the enclosing function `main`.
-    assert "main  main.c  1 call site at line(s) 7" in result
+    # main() must be attributed to the enclosing function `main`, shown with
+    # the call site's source so the agent needs no follow-up grep.
+    assert 'main  main.c:7: printf("%d\\n", add_numbers(2, 3));' in result
 
-    callers = json.loads(server.find_callers("add_numbers", root))["results"]
-    assert {"caller": "main", "path": "main.c", "sites": [7]} in callers
+    callers = json.loads(server.find_callers("add_numbers", root, format="json"))["results"]
+    main = next(c for c in callers if c["caller"] == "main")
+    assert main["path"] == "main.c" and main["sites"] == [7]
+    assert "add_numbers(2, 3)" in main["call"]
 
 
 @requires_global
-def test_summarize_references(c_project):
+def test_find_references_grouped_by_file(c_project):
     root = str(c_project)
-    result = server.summarize_references("add_numbers", root, format="text")
-    assert "2 references across 2 files:" in result
+    result = server.find_references("add_numbers", root, group_by="file")
+    assert "add_numbers: 2 references in 2 files" in result
     assert "main.c" in result and "util.h" in result
 
-    summary = json.loads(server.summarize_references("add_numbers", root))
+    summary = json.loads(
+        server.find_references("add_numbers", root, group_by="file", format="json")
+    )
+    assert summary["grouped_by"] == "file"
     assert summary["total_references"] == 2
     assert {r["path"] for r in summary["results"]} == {"main.c", "util.h"}
 
@@ -392,28 +401,35 @@ def test_summarize_references(c_project):
 @requires_global
 def test_find_callees(c_project):
     root = str(c_project)
-    result = server.find_callees("main", root, format="text")
-    assert "add_numbers  util.c:3" in result
-    assert "External/unresolved: printf" in result
+    result = server.find_callees("main", root)
+    assert "  add_numbers  util.c:3" in result
+    assert "external/unresolved: printf" in result
 
-    callees = json.loads(server.find_callees("main", root))["results"]
+    callees = json.loads(server.find_callees("main", root, format="json"))["results"]
     assert {"symbol": "add_numbers", "path": "util.c", "line": 3} in callees["in_tree"]
     assert "printf" in callees["external"]
 
 
 @requires_global
-def test_symbol_info(c_project):
+def test_find_definition_usage_summary(c_project):
     root = str(c_project)
-    result = server.symbol_info("add_numbers", root, format="text")
-    assert "defined at util.c:3" in result
-    assert "referenced 2 time(s) across 2 file(s)" in result
+    result = server.find_definition("add_numbers", root)
+    assert result.splitlines()[0].startswith("add_numbers: 1 definition · 2 refs in 2 files")
+    assert "util.c:3: int add_numbers(int a, int b)" in result
     assert "next: get_symbol_body" in result
 
-    info = json.loads(server.symbol_info("add_numbers", root))
-    card = info["results"]
-    assert card["definitions"][0]["path"] == "util.c"
-    assert card["reference_count"] == 2 and card["file_count"] == 2
+    info = json.loads(server.find_definition("add_numbers", root, format="json"))
+    assert info["results"][0]["path"] == "util.c"
+    assert info["reference_count"] == 2 and info["file_count"] == 2
+    assert info["definition_count"] == 1
+    assert {t["path"] for t in info["top_files"]} == {"main.c", "util.h"}
     assert "get_symbol_body" in info["next_tools"]
+
+    # case_insensitive may match several names: no single-symbol summary.
+    ci = json.loads(
+        server.find_definition("ADD_NUMBERS", root, case_insensitive=True, format="json")
+    )
+    assert "reference_count" not in ci
 
 
 @pytest.fixture
@@ -489,7 +505,7 @@ def test_index_reports_multilanguage_label(mixed_project):
 
 
 def test_bad_project_root():
-    result = json.loads(server.find_definition("main", "/nonexistent/path/xyz"))
+    result = json.loads(server.find_definition("main", "/nonexistent/path/xyz", format="json"))
     assert result["error"].startswith("Error")
     assert result["next_tools"]
     text = server.find_definition("main", "/nonexistent/path/xyz", format="text")
@@ -499,7 +515,7 @@ def test_bad_project_root():
 @requires_global
 def test_no_match_message(c_project):
     root = str(c_project)
-    result = json.loads(server.find_definition("does_not_exist_anywhere", root))
+    result = json.loads(server.find_definition("does_not_exist_anywhere", root, format="json"))
     assert result["results"] == [] and result["total"] == 0
     assert "No definition found" in result["message"]
 
@@ -516,7 +532,7 @@ RECORD_KEYS = {
 
 @requires_global
 def test_json_record_schema(c_project):
-    result = json.loads(server.find_definition("add_numbers", str(c_project)))
+    result = json.loads(server.find_definition("add_numbers", str(c_project), format="json"))
     assert result["tool"] == "find_definition"
     assert result["total"] == 1 and result["offset"] == 0
     assert result["truncated"] is False and result["warning"] is None
@@ -536,28 +552,28 @@ def test_json_record_schema(c_project):
 @requires_global
 def test_json_next_tools_hints(c_project):
     root = str(c_project)
-    hit = json.loads(server.find_definition("add_numbers", root))
+    hit = json.loads(server.find_definition("add_numbers", root, format="json"))
     assert "get_symbol_body" in hit["next_tools"]
-    miss = json.loads(server.find_definition("no_such_symbol", root))
+    miss = json.loads(server.find_definition("no_such_symbol", root, format="json"))
     assert "find_references" in miss["next_tools"]
 
 
 @requires_global
 def test_json_pagination(many_symbols_project):
     root = str(many_symbols_project)
-    full = json.loads(server.list_file_symbols("many.c", root, limit=100))
+    full = json.loads(server.list_file_symbols("many.c", root, limit=100, format="json"))
     total = full["total"]
     assert total >= 3 and full["truncated"] is False
 
-    page = json.loads(server.list_file_symbols("many.c", root, limit=2))
+    page = json.loads(server.list_file_symbols("many.c", root, limit=2, format="json"))
     assert len(page["results"]) == 2
     assert page["total"] == total and page["truncated"] is True
 
-    page2 = json.loads(server.list_file_symbols("many.c", root, limit=2, offset=2))
+    page2 = json.loads(server.list_file_symbols("many.c", root, limit=2, offset=2, format="json"))
     assert page2["offset"] == 2
     assert page2["results"][0] == full["results"][2]
 
-    past_end = json.loads(server.list_file_symbols("many.c", root, offset=999))
+    past_end = json.loads(server.list_file_symbols("many.c", root, offset=999, format="json"))
     assert past_end["results"] == [] and past_end["total"] == total
 
 
@@ -575,7 +591,7 @@ def git_project(c_project):
 def test_gitignored_files_are_not_indexed(git_project):
     root = str(git_project)
     assert "util.c" in server.find_definition("add_numbers", root)  # indexed fine
-    result = json.loads(server.find_definition("generated_fn", root))
+    result = json.loads(server.find_definition("generated_fn", root, format="json"))
     assert result["results"] == []
     paths, _, err = server._raw_global(["-P"], root)
     assert err is None and "build/generated.c" not in paths
@@ -587,7 +603,7 @@ def test_newly_ignored_file_dropped_on_refresh(git_project):
     server.find_definition("add_numbers", root)  # builds index
     (git_project / ".gitignore").write_text("build/\nutil.c\n")
     server.update_index(root)
-    result = json.loads(server.find_definition("add_numbers", root))
+    result = json.loads(server.find_definition("add_numbers", root, format="json"))
     assert result["results"] == []
 
 
@@ -597,7 +613,7 @@ def test_skip_globs_config(c_project):
     (c_project / config.PROJECT_CONFIG_NAME).write_text('skip_globs = ["*.gen.c"]\n')
     root = str(c_project)
     assert "util.c" in server.find_definition("add_numbers", root)
-    result = json.loads(server.find_definition("from_generator", root))
+    result = json.loads(server.find_definition("from_generator", root, format="json"))
     assert result["results"] == []
 
 
@@ -608,7 +624,7 @@ def test_root_autodetected_from_subdirectory(c_project, monkeypatch):
     subdir = c_project / "nested" / "deeper"
     subdir.mkdir(parents=True)
     monkeypatch.chdir(subdir)
-    result = json.loads(server.find_definition("add_numbers"))
+    result = json.loads(server.find_definition("add_numbers", format="json"))
     assert result["root"] == str(c_project.resolve())
     assert result["results"][0]["path"] == "util.c"
 
@@ -668,7 +684,7 @@ def rich_c_project(tmp_path):
 
 
 def _definition_record(symbol, root, path=None):
-    records = json.loads(server.find_definition(symbol, root))["results"]
+    records = json.loads(server.find_definition(symbol, root, format="json"))["results"]
     if path is not None:
         records = [r for r in records if r["path"] == path]
     assert records, f"no definition record for {symbol}"
@@ -710,7 +726,7 @@ def test_enriched_kinds_across_c_constructs(rich_c_project):
 @requires_global
 @requires_ctags_json
 def test_list_file_symbols_enriched(rich_c_project):
-    result = json.loads(server.list_file_symbols("types.c", str(rich_c_project)))
+    result = json.loads(server.list_file_symbols("types.c", str(rich_c_project), format="json"))
     kinds = {r["symbol"]: r["kind"] for r in result["results"]}
     assert kinds.get("process_items") == "function"
     assert kinds.get("item_t") == "typedef"
@@ -719,30 +735,24 @@ def test_list_file_symbols_enriched(rich_c_project):
 
 @requires_global
 @requires_ctags_json
-def test_symbol_info_card_enriched(rich_c_project):
+def test_find_definition_rows_enriched(rich_c_project):
     root = str(rich_c_project)
-    card = json.loads(server.symbol_info("process_items", root))["results"]
-    definition = card["definitions"][0]
+    info = json.loads(server.find_definition("process_items", root, format="json"))
+    definition = info["results"][0]
     assert definition["kind"] == "function"
     assert definition["typeref"] == "int"
     assert "struct item" in definition["signature"]
 
-    text = server.symbol_info("process_items", root, format="text")
-    assert "function process_items(" in text
-    assert "-> int" in text
-
-    enum_text = server.symbol_info("COLOR_GREEN", root, format="text")
-    assert "enumerator COLOR_GREEN (enum:color)" in enum_text
-
-    typedef_text = server.symbol_info("item_t", root, format="text")
-    assert "typedef item_t = struct:item" in typedef_text
+    assert "[function]" in server.find_definition("process_items", root)
+    assert "[enumerator]" in server.find_definition("COLOR_GREEN", root)
+    assert "[typedef]" in server.find_definition("item_t", root)
 
 
 @requires_global
 @requires_ctags_json
 def test_references_stay_unenriched(rich_c_project):
     root = str(rich_c_project)
-    refs = json.loads(server.find_references("SQUARE", root))["results"]
+    refs = json.loads(server.find_references("SQUARE", root, format="json"))["results"]
     assert refs and all(r["kind"] is None for r in refs)
 
 
@@ -846,7 +856,7 @@ def guarded_c_project(tmp_path):
 
 
 def _defs(symbol, root, **kwargs):
-    return json.loads(server.find_definition(symbol, root, **kwargs))
+    return json.loads(server.find_definition(symbol, root, **kwargs, format="json"))
 
 
 @requires_global
@@ -871,7 +881,7 @@ def test_guard_tagging_on_definitions(guarded_c_project):
 @requires_global
 def test_guard_tagging_on_references(guarded_c_project):
     root = str(guarded_c_project)
-    refs = json.loads(server.find_references("foo_mode", root))["results"]
+    refs = json.loads(server.find_references("foo_mode", root, format="json"))["results"]
     guards_by_line = {(r["path"], r["line"]): r["guard"] for r in refs}
     assert guards_by_line[("feature.c", 5)] == []  # call in always_here
     assert guards_by_line[("feature.c", 18)] == [
@@ -913,35 +923,36 @@ def test_active_config_bad_path_is_error(guarded_c_project):
 
 
 @requires_global
-def test_symbol_info_guard_card(guarded_c_project):
+def test_find_definition_guard_variants(guarded_c_project):
     root = str(guarded_c_project)
-    card = json.loads(server.symbol_info("foo_mode", root))["results"]
-    assert card["definition_count"] == 2
-    assert card["guard_variants"] == 2  # CONFIG_FOO vs !CONFIG_FOO
+    info = json.loads(server.find_definition("foo_mode", root, format="json"))
+    assert info["definition_count"] == 2
+    assert info["guard_variants"] == 2  # CONFIG_FOO vs !CONFIG_FOO
 
-    text = server.symbol_info("foo_mode", root, format="text")
-    assert "2 definitions under 2 distinct guards:" in text
-    assert "[CONFIG_FOO] defined at" in text
-    assert "[!CONFIG_FOO] defined at" in text
+    text = server.find_definition("foo_mode", root)
+    assert "foo_mode: 2 definitions under 2 #if variants" in text
+    assert "[#if CONFIG_FOO]" in text or "; #if CONFIG_FOO]" in text
+    assert "#if !CONFIG_FOO]" in text
 
     filtered = json.loads(
-        server.symbol_info("foo_mode", root, active_config="CONFIG_FOO")
-    )["results"]
+        server.find_definition("foo_mode", root, active_config="CONFIG_FOO", format="json")
+    )
     assert filtered["definition_count"] == 1
     assert filtered["config_filtered"] == 1
     assert filtered["guard_variants"] == 1
 
-    none_live = server.symbol_info(
-        "bar_only", root, format="text", active_config="CONFIG_FOO,CONFIG_BAR"
+    none_live = server.find_definition(
+        "bar_only", root, active_config="CONFIG_FOO,CONFIG_BAR"
     )
-    assert "no definition is live under active_config" in none_live
+    assert "filtered out by active_config" in none_live
+    assert "No definition found" in none_live
 
 
 @requires_global
-def test_symbol_info_single_guard_keeps_plain_card(c_project):
-    text = server.symbol_info("add_numbers", str(c_project), format="text")
-    assert "distinct guards" not in text
-    assert "defined at util.c:3" in text
+def test_find_definition_single_guard_keeps_plain_header(c_project):
+    text = server.find_definition("add_numbers", str(c_project))
+    assert "#if variants" not in text
+    assert "util.c:3:" in text
 
 
 @requires_global
@@ -966,7 +977,7 @@ def test_guards_opt_out(guarded_c_project, monkeypatch, how):
     result = _defs("foo_mode", root, active_config="CONFIG_FOO")
     assert "error" in result and "guard scanning" in result["error"]
 
-    info = json.loads(server.symbol_info("foo_mode", root))["results"]
+    info = json.loads(server.find_definition("foo_mode", root, format="json"))
     assert info["guard_variants"] is None
 
 
@@ -1010,7 +1021,7 @@ def test_legacy_root_index_respected(c_project):
     assert code == 0, stderr
     assert (c_project / "GTAGS").is_file()
 
-    result = json.loads(server.find_definition("add_numbers", root))
+    result = json.loads(server.find_definition("add_numbers", root, format="json"))
     assert result["results"][0]["path"] == "util.c"
     assert not (c_project / server.INDEX_DIR_NAME).exists()
 
@@ -1060,7 +1071,7 @@ def test_root_autodetected_via_index_dir(c_project, monkeypatch):
     subdir = c_project / "sub" / "deeper"
     subdir.mkdir(parents=True)
     monkeypatch.chdir(subdir)
-    result = json.loads(server.find_definition("add_numbers"))
+    result = json.loads(server.find_definition("add_numbers", format="json"))
     assert result["root"] == str(c_project.resolve())
 
 
@@ -1075,12 +1086,12 @@ def test_suggestions_capped_and_absent_on_hit(c_project):
         "".join(f"int sugg_fn_{i:02d}(void) {{ return {i}; }}\n" for i in range(12))
     )
     root = str(c_project)
-    miss = json.loads(server.find_definition("sugg_fn", root))
+    miss = json.loads(server.find_definition("sugg_fn", root, format="json"))
     assert miss["results"] == []
     assert len(miss["suggestions"]) == server.MAX_SUGGESTIONS
     assert all(s.startswith("sugg_fn_") for s in miss["suggestions"])
 
-    hit = json.loads(server.find_definition("add_numbers", root))
+    hit = json.loads(server.find_definition("add_numbers", root, format="json"))
     assert hit["results"] and "suggestions" not in hit
 
 
@@ -1093,7 +1104,7 @@ def test_suggestions_exclude_exact_name(c_project):
     )
     root = str(c_project)
     miss = json.loads(
-        server.find_definition("gated_fn", root, active_config="!CONFIG_ONLY")
+        server.find_definition("gated_fn", root, active_config="!CONFIG_ONLY", format="json")
     )
     assert miss["results"] == [] and miss["config_filtered"] == 1
     assert "gated_fn" not in miss["suggestions"]
@@ -1102,16 +1113,16 @@ def test_suggestions_exclude_exact_name(c_project):
 
 @requires_global
 def test_references_no_fallback_flag_on_real_references(c_project):
-    refs = json.loads(server.find_references("add_numbers", str(c_project)))
+    refs = json.loads(server.find_references("add_numbers", str(c_project), format="json"))
     assert refs["results"] and "fallback" not in refs
 
 
 @requires_global
 def test_references_fallback_preserves_case_insensitive(c_project):
     root = str(c_project)
-    sensitive = json.loads(server.find_references("PRINTF", root))
+    sensitive = json.loads(server.find_references("PRINTF", root, format="json"))
     assert sensitive["results"] == [] and "fallback" not in sensitive
-    ci = json.loads(server.find_references("PRINTF", root, case_insensitive=True))
+    ci = json.loads(server.find_references("PRINTF", root, case_insensitive=True, format="json"))
     assert ci["fallback"] == "symbol_usages"
     assert any(r["path"] == "main.c" for r in ci["results"])
 
@@ -1125,14 +1136,14 @@ def test_references_fallback_guards_and_config_filter(c_project):
         "static void log_it(void) { external_log_fn(1); }\n#endif\n"
     )
     root = str(c_project)
-    data = json.loads(server.find_references("external_log_fn", root))
+    data = json.loads(server.find_references("external_log_fn", root, format="json"))
     assert data["fallback"] == "symbol_usages"
     (rec,) = data["results"]
     assert rec["guard"] == ["CONFIG_LOGGING"]
 
     filtered = json.loads(
         server.find_references(
-            "external_log_fn", root, active_config="!CONFIG_LOGGING"
+            "external_log_fn", root, active_config="!CONFIG_LOGGING", format="json"
         )
     )
     assert filtered["fallback"] == "symbol_usages"
@@ -1162,7 +1173,7 @@ def test_get_symbol_body_truncates_at_max_lines(c_project, monkeypatch):
     monkeypatch.setattr(server, "MAX_BODY_LINES", 8)
     lines = "".join(f"    x += {i};\n" for i in range(30))
     (c_project / "big.c").write_text(f"int big_fn(int x)\n{{\n{lines}    return x;\n}}\n")
-    data = json.loads(server.get_symbol_body("big_fn", str(c_project)))
+    data = json.loads(server.get_symbol_body("big_fn", str(c_project), format="json"))
     body = data["results"][0]["body"]
     assert "... body truncated at 8 lines ..." in body
     assert len(body.splitlines()) == 9  # 8 body lines + the marker
@@ -1171,7 +1182,7 @@ def test_get_symbol_body_truncates_at_max_lines(c_project, monkeypatch):
 @requires_global
 def test_get_symbol_body_omitted_definitions(guarded_c_project):
     root = str(guarded_c_project)
-    data = json.loads(server.get_symbol_body("foo_mode", root, max_definitions=1))
+    data = json.loads(server.get_symbol_body("foo_mode", root, max_definitions=1, format="json"))
     assert data["total"] == 2 and data["truncated"] is True
     assert data["omitted_definitions"] == 1
     assert len(data["results"]) == 1
@@ -1189,7 +1200,7 @@ def test_find_callers_ranked_by_call_sites(c_project):
         "    add_numbers(3, 3);\n"
         "}\n"
     )
-    data = json.loads(server.find_callers("add_numbers", str(c_project)))
+    data = json.loads(server.find_callers("add_numbers", str(c_project), format="json"))
     top = data["results"][0]
     assert top["caller"] == "heavy_user" and len(top["sites"]) == 3
     site_counts = [len(r["sites"]) for r in data["results"]]
@@ -1200,13 +1211,17 @@ def test_find_callers_ranked_by_call_sites(c_project):
 def test_find_callers_file_scope_attribution(c_project):
     """A reference in a file with no definitions maps to '(file scope)'."""
     (c_project / "decl.c").write_text("int add_numbers(int a, int b);\n")
-    data = json.loads(server.find_callers("add_numbers", str(c_project)))
-    assert {"caller": "(file scope)", "path": "decl.c", "sites": [1]} in data["results"]
+    data = json.loads(server.find_callers("add_numbers", str(c_project), format="json"))
+    scoped = [r for r in data["results"] if r["path"] == "decl.c"]
+    assert scoped == [
+        {"caller": "(file scope)", "path": "decl.c", "sites": [1],
+         "call": "int add_numbers(int a, int b);"}
+    ]
 
 
 @requires_global
 def test_find_callers_breadth_guard(c_project, monkeypatch):
-    """>500 referencing files aborts with the summarize_references hint."""
+    """>500 referencing files aborts with the find_references hint."""
     root = str(c_project)
     server.find_definition("add_numbers", root)  # build the index first
     resolved = c_project.resolve()
@@ -1221,22 +1236,24 @@ def test_find_callers_breadth_guard(c_project, monkeypatch):
         return real_raw(flags, project_root, _retry)
 
     monkeypatch.setattr(server, "_raw_global", fake_raw)
-    data = json.loads(server.find_callers("wide_sym", root))
+    data = json.loads(server.find_callers("wide_sym", root, format="json"))
     assert "too broad" in data["error"]
     assert "501 files" in data["error"]
-    assert data["next_tools"] == ["summarize_references"]
-    text = server.find_callers("wide_sym", root, format="text")
-    assert "too broad" in text
+    assert data["next_tools"] == ["find_references"]
+    text = server.find_callers("wide_sym", root)
+    assert "too broad" in text and "next: find_references" in text
 
 
 @requires_global
-def test_summarize_references_sort_order(c_project):
+def test_find_references_file_grouping_sort_order(c_project):
     (c_project / "hot.c").write_text(
         '#include "util.h"\n'
         "int hot_a(void)\n{\n    return add_numbers(1, 1);\n}\n"
         "int hot_b(void)\n{\n    return add_numbers(2, 2);\n}\n"
     )
-    data = json.loads(server.summarize_references("add_numbers", str(c_project)))
+    data = json.loads(
+        server.find_references("add_numbers", str(c_project), group_by="file", format="json")
+    )
     # Count desc, then path asc: hot.c (2 refs) first, then main.c / util.h (1 each).
     assert [r["path"] for r in data["results"]] == ["hot.c", "main.c", "util.h"]
     assert [r["count"] for r in data["results"]] == [2, 1, 1]
@@ -1244,10 +1261,37 @@ def test_summarize_references_sort_order(c_project):
 
 
 @requires_global
+def test_find_references_auto_grouping_and_path_prefix(c_project, monkeypatch):
+    root = str(c_project)
+    (c_project / "sub").mkdir()
+    (c_project / "sub" / "more.c").write_text(
+        '#include "../util.h"\nint more(void)\n{\n    return add_numbers(3, 3);\n}\n'
+    )
+    server.update_index(root)
+    # Below the threshold, auto lists individual sites...
+    lines = json.loads(server.find_references("add_numbers", root, format="json"))
+    assert "grouped_by" not in lines and lines["total"] == 3
+    # ...above it, auto switches to per-file counts.
+    monkeypatch.setattr(server, "REFERENCE_GROUP_THRESHOLD", 2)
+    grouped = json.loads(server.find_references("add_numbers", root, format="json"))
+    assert grouped["grouped_by"] == "file" and grouped["total_references"] == 3
+    # group_by="line" always wins; path_prefix narrows to one directory.
+    narrowed = json.loads(
+        server.find_references(
+            "add_numbers", root, group_by="line", path_prefix="sub/", format="json"
+        )
+    )
+    assert [r["path"] for r in narrowed["results"]] == ["sub/more.c"]
+    assert narrowed["path_prefix"] == "sub"
+    text = server.find_references("add_numbers", root, group_by="line", path_prefix="sub")
+    assert "add_numbers: 1 reference under sub/" in text
+
+
+@requires_global
 def test_find_callees_caps_call_targets(c_project):
     calls = "".join(f"    t{i:02d}(x);\n" for i in range(45))
     (c_project / "wide.c").write_text(f"void wide_fn(int x)\n{{\n{calls}}}\n")
-    data = json.loads(server.find_callees("wide_fn", str(c_project)))
+    data = json.loads(server.find_callees("wide_fn", str(c_project), format="json"))
     res = data["results"]
     assert data["truncated"] is True
     assert data["capped_call_targets"] == 5
@@ -1268,32 +1312,31 @@ def test_find_callees_filters_keywords_and_self(c_project):
         "    return keywordy(x - 1);\n"
         "}\n"
     )
-    data = json.loads(server.find_callees("keywordy", str(c_project)))
+    data = json.loads(server.find_callees("keywordy", str(c_project), format="json"))
     res = data["results"]
     assert [c["symbol"] for c in res["in_tree"]] == ["add_numbers"]
     assert res["external"] == []  # keywords and the self-call are filtered
 
 
 @requires_global
-def test_symbol_info_exported_detection(c_project):
+def test_find_definition_exported_detection(c_project):
     source = (c_project / "util.c").read_text()
     (c_project / "util.c").write_text(source + "EXPORT_SYMBOL(add_numbers);\n")
-    card = json.loads(server.symbol_info("add_numbers", str(c_project)))["results"]
-    assert card["exported"] == "EXPORT_SYMBOL"
+    info = json.loads(server.find_definition("add_numbers", str(c_project), format="json"))
+    assert info["exported"] == "EXPORT_SYMBOL"
+    assert "exported via EXPORT_SYMBOL" in server.find_definition("add_numbers", str(c_project))
 
 
 @requires_global
-def test_symbol_info_config_kills_all_definitions(guarded_c_project):
+def test_find_definition_config_kills_all_definitions(guarded_c_project):
     root = str(guarded_c_project)
-    card = json.loads(
-        server.symbol_info("bar_only", root, active_config="CONFIG_FOO")
-    )["results"]
-    assert card["definition_count"] == 0 and card["config_filtered"] == 1
-    assert card["definitions"] == []
-    text = server.symbol_info(
-        "bar_only", root, active_config="CONFIG_FOO", format="text"
+    info = json.loads(
+        server.find_definition("bar_only", root, active_config="CONFIG_FOO", format="json")
     )
-    assert "no definition is live" in text
+    assert info["definition_count"] == 0 and info["config_filtered"] == 1
+    assert info["results"] == []
+    text = server.find_definition("bar_only", root, active_config="CONFIG_FOO")
+    assert "(1 filtered out by active_config)" in text
 
 
 @requires_global
@@ -1320,7 +1363,7 @@ def test_update_index_full_failure_keeps_envelope_and_recovers(c_project, monkey
     monkeypatch.setattr(
         server, "_run_index", lambda root_, incremental: ("", "simulated gtags crash", 1)
     )
-    data = json.loads(server.update_index(root, full=True))
+    data = json.loads(server.update_index(root, full=True, format="json"))
     assert set(data) == {"tool", "root", "error", "next_tools"}
     assert "simulated gtags crash" in data["error"]
     monkeypatch.undo()
@@ -1368,7 +1411,7 @@ def _skip_if_parser_fixed(data):
 @requires_ctags_json
 def test_export_recovery_finds_parser_missed_definition(export_gap_project):
     root = str(export_gap_project)
-    data = json.loads(server.find_definition("foo_lock", root))
+    data = json.loads(server.find_definition("foo_lock", root, format="json"))
     _skip_if_parser_fixed(data)
     assert data["resolved_via"] == "ctags:EXPORT_SYMBOL"
     top = data["results"][0]
@@ -1376,35 +1419,35 @@ def test_export_recovery_finds_parser_missed_definition(export_gap_project):
     assert top["kind"] == "function"  # enriched from the same (cached) ctags run
     assert "foo_lock(struct foo *lock)" in top["snippet"]
 
-    text = server.find_definition("foo_lock", root, format="text")
-    assert "recovered via ctags:EXPORT_SYMBOL" in text
+    text = server.find_definition("foo_lock", root)
+    assert "(resolved via ctags:EXPORT_SYMBOL)" in text
 
 
 @requires_global
 @requires_ctags_json
-def test_symbol_info_includes_recovered_definition(export_gap_project):
+def test_definition_summary_includes_recovered_definition(export_gap_project):
     root = str(export_gap_project)
-    card = json.loads(server.symbol_info("foo_lock", root))["results"]
-    if card["definitions"] and not card["resolved_via"]:
+    info = json.loads(server.find_definition("foo_lock", root, format="json"))
+    if info["results"] and not info.get("resolved_via"):
         pytest.skip("GNU Global's parser no longer derails on this fixture")
-    assert card["resolved_via"] == "ctags:EXPORT_SYMBOL"
-    assert card["exported"] == "EXPORT_SYMBOL"
-    assert card["definition_count"] >= 1
-    assert card["definitions"][0]["path"] == "foo.c"
+    assert info["resolved_via"] == "ctags:EXPORT_SYMBOL"
+    assert info["exported"] == "EXPORT_SYMBOL"
+    assert info["definition_count"] >= 1
+    assert info["results"][0]["path"] == "foo.c"
 
 
 @requires_global
 @requires_ctags_json
 def test_get_symbol_body_and_callees_read_recovered_definition(export_gap_project):
     root = str(export_gap_project)
-    data = json.loads(server.get_symbol_body("foo_lock", root))
+    data = json.loads(server.get_symbol_body("foo_lock", root, format="json"))
     _skip_if_parser_fixed(data)
     assert data["resolved_via"] == "ctags:EXPORT_SYMBOL"
     assert "lock->held = 1;" in data["results"][0]["body"]
     text = server.get_symbol_body("foo_lock", root, format="text")
     assert "(resolved via ctags:EXPORT_SYMBOL)" in text
 
-    callees = json.loads(server.find_callees("foo_lock", root))
+    callees = json.loads(server.find_callees("foo_lock", root, format="json"))
     assert callees["resolved_via"] == "ctags:EXPORT_SYMBOL"
     assert callees["definition"] == {"path": "foo.c", "line": 5}
 
@@ -1413,13 +1456,13 @@ def test_get_symbol_body_and_callees_read_recovered_definition(export_gap_projec
 @requires_ctags_json
 def test_export_recovery_respects_enrich_optout(export_gap_project, monkeypatch):
     monkeypatch.setattr(server, "_no_enrich", True)
-    data = json.loads(server.find_definition("foo_lock", str(export_gap_project)))
+    data = json.loads(server.find_definition("foo_lock", str(export_gap_project), format="json"))
     assert "resolved_via" not in data
 
 
 @requires_global
 def test_export_recovery_inert_on_plain_projects(c_project):
-    data = json.loads(server.find_definition("add_numbers", str(c_project)))
+    data = json.loads(server.find_definition("add_numbers", str(c_project), format="json"))
     assert "resolved_via" not in data
 
 
@@ -1432,11 +1475,8 @@ ALL_TOOLS = [
     ("find_references", {"symbol": "add_numbers"}),
     ("get_symbol_body", {"symbol": "add_numbers"}),
     ("find_callers", {"symbol": "add_numbers"}),
-    ("summarize_references", {"symbol": "add_numbers"}),
     ("find_callees", {"symbol": "main"}),
     ("reachability", {"from_symbol": "main", "to_symbol": "add_numbers"}),
-    ("blast_radius", {}),
-    ("symbol_info", {"symbol": "add_numbers"}),
     ("list_file_symbols", {"file_path": "util.c"}),
     ("update_index", {"full": True}),
 ]
@@ -1459,7 +1499,7 @@ def committed_project(git_project):
 @pytest.mark.parametrize("tool_name,args", ALL_TOOLS, ids=[t[0] for t in ALL_TOOLS])
 def test_envelope_contract_all_tools(committed_project, tool_name, args):
     root = str(committed_project)
-    data = json.loads(getattr(server, tool_name)(project_root=root, **args))
+    data = json.loads(getattr(server, tool_name)(project_root=root, **args, format="json"))
     assert data["tool"] == tool_name
     assert data["root"] == str(committed_project.resolve())
     assert "results" in data and "error" not in data
@@ -1470,13 +1510,24 @@ def test_envelope_contract_all_tools(committed_project, tool_name, args):
 @pytest.mark.parametrize("tool_name,args", ALL_TOOLS, ids=[t[0] for t in ALL_TOOLS])
 def test_envelope_error_contract_all_tools(tool_name, args):
     bad_root = "/nonexistent/path/xyz"
-    data = json.loads(getattr(server, tool_name)(project_root=bad_root, **args))
+    data = json.loads(getattr(server, tool_name)(project_root=bad_root, **args, format="json"))
     assert data["tool"] == tool_name
     assert data["error"].startswith("Error")
     assert "results" not in data
     assert isinstance(data["next_tools"], list)
-    text = getattr(server, tool_name)(project_root=bad_root, format="text", **args)
+    text = getattr(server, tool_name)(project_root=bad_root, **args)
     assert isinstance(text, str) and text.startswith("Error")
+
+
+@requires_global
+@pytest.mark.parametrize("tool_name,args", ALL_TOOLS, ids=[t[0] for t in ALL_TOOLS])
+def test_text_is_default_and_renders_every_tool(committed_project, tool_name, args):
+    root = str(committed_project)
+    text = getattr(server, tool_name)(project_root=root, **args)
+    assert text and not text.lstrip().startswith("{")  # compact text, not JSON
+    assert text == output.render_text(
+        json.loads(getattr(server, tool_name)(project_root=root, **args, format="json"))
+    )
 
 
 @requires_global
@@ -1490,14 +1541,14 @@ def test_concurrent_queries_during_refresh(many_symbols_project):
     server._last_update.clear()  # the next query kicks a background refresh
 
     calls = [
-        lambda: server.find_definition("add_numbers", root),
-        lambda: server.find_references("add_numbers", root),
-        lambda: server.symbol_info("add_numbers", root),
-        lambda: server.summarize_references("add_numbers", root),
-        lambda: server.list_file_symbols("util.c", root),
-        lambda: server.get_symbol_body("add_numbers", root),
-        lambda: server.find_callees("main", root),
-        lambda: server.find_definition("fn_a", root),
+        lambda: server.find_definition("add_numbers", root, format="json"),
+        lambda: server.find_references("add_numbers", root, format="json"),
+        lambda: server.find_references("add_numbers", root, group_by="file", format="json"),
+        lambda: server.find_callers("add_numbers", root, format="json"),
+        lambda: server.list_file_symbols("util.c", root, format="json"),
+        lambda: server.get_symbol_body("add_numbers", root, format="json"),
+        lambda: server.find_callees("main", root, format="json"),
+        lambda: server.find_definition("fn_a", root, format="json"),
     ]
     with ThreadPoolExecutor(max_workers=8) as pool:
         futures = [pool.submit(call) for call in calls * 3]
@@ -1513,7 +1564,10 @@ def test_mcp_tool_schemas_stable():
     import anyio
 
     tools = {t.name: t for t in anyio.run(server.mcp.list_tools)}
-    assert len(tools) == 11
+    assert set(tools) == {
+        "find_definition", "find_references", "get_symbol_body", "find_callers",
+        "find_callees", "reachability", "list_file_symbols", "update_index",
+    }
     props = tools["find_definition"].input_schema["properties"]
     assert {
         "symbol", "project_root", "case_insensitive",
@@ -1523,10 +1577,12 @@ def test_mcp_tool_schemas_stable():
     for name, tool in tools.items():
         # Every tool keeps the per-call project_root escape hatch.
         assert "project_root" in tool.input_schema["properties"], name
+        # Compact text is the default output; JSON on request.
+        assert tool.input_schema["properties"]["format"]["default"] == "text", name
         # The injected Context stays out of the agent-facing schema.
         assert "ctx" not in tool.input_schema["properties"], name
-        # Bodies return a JSON/text string: no derived {"result": str}
-        # outputSchema, or every response is sent twice.
+        # Bodies return a string: no derived {"result": str} outputSchema,
+        # or every response is sent twice.
         assert tool.output_schema is None, name
         assert tool.title, name
 
@@ -1544,3 +1600,129 @@ def test_mcp_tool_annotations():
     update = tools["update_index"].annotations
     assert update.destructive_hint is False
     assert update.idempotent_hint is True
+
+
+# ---------------------------------------------------------------------------
+# Index lifecycle: single-flight full builds, live-call cold start, cwd guard
+# ---------------------------------------------------------------------------
+
+
+def _slow_full_builds(monkeypatch, delay: float) -> list[int]:
+    """Count full (non-incremental) builds and make each take `delay` seconds."""
+    import threading
+    import time as _time
+
+    builds: list[int] = []
+    real_run_index = server._run_index
+
+    def slow(root, incremental):
+        if not incremental:
+            builds.append(threading.get_ident())
+            _time.sleep(delay)
+        return real_run_index(root, incremental)
+
+    monkeypatch.setattr(server, "_run_index", slow)
+    return builds
+
+
+@requires_global
+def test_concurrent_first_queries_share_one_build(c_project, monkeypatch):
+    """Regression (v1.5.0): parallel first queries on an unindexed repo each
+    started their own `gtags` over the same database — "GTAGS not found",
+    "chmod(2) failed", corruption. Now they join one single-flight build."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    builds = _slow_full_builds(monkeypatch, 0.5)
+    root = str(c_project)
+    calls = [
+        lambda: server.find_definition("add_numbers", root, format="json"),
+        lambda: server.find_references("add_numbers", root, format="json"),
+        lambda: server.find_callers("add_numbers", root, format="json"),
+        lambda: server.get_symbol_body("add_numbers", root, format="json"),
+        lambda: server.update_index(root, full=True, format="json"),
+    ]
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        outputs = [f.result(timeout=60) for f in [pool.submit(c) for c in calls * 2]]
+    for raw in outputs:
+        data = json.loads(raw)
+        assert "error" not in data, data
+    # update_index(full=True) may legitimately start ONE more build after the
+    # first finished; what must never happen is overlapping builds.
+    assert 1 <= len(builds) <= 3
+    assert "util.c" in server.find_definition("add_numbers", root)
+
+
+@requires_global
+def test_live_call_cold_start_returns_retry_status(c_project, monkeypatch):
+    """A live MCP call must not block past INDEX_BUILD_WAIT_SECONDS on a first
+    build (clients enforce ~60 s timeouts); it gets a retry status instead."""
+    import time as _time
+
+    import anyio
+    from mcp import Client
+
+    _slow_full_builds(monkeypatch, 1.5)
+    monkeypatch.setattr(server, "INDEX_BUILD_WAIT_SECONDS", 0.2)
+    root = str(c_project)
+
+    async def call():
+        async with Client(server.mcp, mode="legacy") as client:
+            return await client.call_tool(
+                "find_definition", {"symbol": "add_numbers", "project_root": root}
+            )
+
+    started = _time.monotonic()
+    first = anyio.run(call)
+    assert _time.monotonic() - started < 1.2
+    assert first.is_error is True
+    assert "for the first time" in first.content[0].text
+    assert "Retry this call shortly" in first.content[0].text
+
+    server._builds[c_project.resolve()].done.wait(timeout=30)
+    second = anyio.run(call)
+    assert second.is_error is False
+    assert "util.c:3:" in second.content[0].text
+
+    # Direct (non-MCP) calls keep blocking until the build is done.
+    assert server._live_mcp_call.get() is False
+
+
+@requires_global
+def test_failed_build_reported_once_then_retried(c_project, monkeypatch):
+    calls: list[bool] = []
+    real_run_index = server._run_index
+
+    def failing_once(root, incremental):
+        if not incremental and not calls:
+            calls.append(True)
+            return "", "gtags: simulated failure", 1
+        return real_run_index(root, incremental)
+
+    monkeypatch.setattr(server, "_run_index", failing_once)
+    root = str(c_project)
+    failed = json.loads(server.find_definition("add_numbers", root, format="json"))
+    assert "simulated failure" in failed["error"]
+    assert c_project.resolve() not in server._build_errors  # reported, not re-reported
+    assert "util.c" in server.find_definition("add_numbers", root)  # retried
+
+
+@requires_global
+def test_cwd_fallback_disabled_asks_for_project_root(c_project, tmp_path_factory, monkeypatch):
+    plugin_dir = tmp_path_factory.mktemp("plugin-install")  # not a repository
+    monkeypatch.chdir(plugin_dir)
+    monkeypatch.setenv("GTAGS_MCP_CWD_FALLBACK", "0")
+
+    data = json.loads(server.find_definition("add_numbers", format="json"))
+    assert "Pass project_root=<absolute path" in data["error"]
+    assert not (plugin_dir / server.INDEX_DIR_NAME).exists()  # never indexed
+
+    # An explicit root, or a repo marker walking up from cwd, still works.
+    assert "util.c" in server.find_definition("add_numbers", str(c_project))
+    (c_project / ".git").mkdir()
+    monkeypatch.chdir(c_project)
+    assert "util.c" in server.find_definition("add_numbers")
+
+    monkeypatch.setattr(server, "_no_cwd_fallback", True)
+    monkeypatch.delenv("GTAGS_MCP_CWD_FALLBACK")
+    monkeypatch.chdir(plugin_dir)
+    assert "project_root" in server.find_definition("add_numbers")

@@ -2,21 +2,16 @@
 """Kernel-scale stability exercise: run every tool against a real tree.
 
 Complements the golden-set eval (correctness) with an operational view:
-per-call latency (cold + warm), response size, and envelope sanity for a
-representative input matrix over all 11 tools — including deliberate
-stress inputs (a breadth-guard trigger, a fallback query, a suggestion
-miss, a no-path reachability pair).
+per-call latency (cold + warm), response size — both the JSON envelope and
+the compact text agents get by default — and envelope sanity for a
+representative input matrix over all 8 tools, including deliberate stress
+inputs (a breadth-guard trigger, a fallback query, a suggestion miss, a
+no-path reachability pair).
 
 Usage::
 
     python scripts/stability_exercise.py --root /path/to/linux
     python scripts/stability_exercise.py --root /path/to/linux --json out.json
-    python scripts/stability_exercise.py --root /path/to/linux --allow-edit
-
-``--allow-edit`` additionally exercises blast_radius against a real change:
-it appends a trailing space inside fs/read_write.c (whitespace-only), runs
-the tool, and restores the file with ``git checkout --``. The edit is only
-made when the file is clean in git; the restore runs even on failure.
 
 ``--json`` writes machine-readable results for diffing between runs.
 Exit code 0 = zero anomalies, 1 = at least one.
@@ -26,7 +21,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
@@ -34,7 +28,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from gtags_mcp import server  # noqa: E402
+from gtags_mcp import output, server  # noqa: E402
 
 
 @dataclass
@@ -115,9 +109,18 @@ def _matrix(root: str) -> list[Case]:
             "def-miss-suggestions", "find_definition", {"symbol": "tcp_v4_r"},
             min_results=0, extra_check=has_suggestions,
         ),
-        # find_references: moderate, huge (paginated), fallback.
+        # find_references: moderate, huge (raw sites, paginated), huge
+        # (auto-grouped by file), drill-down by directory, fallback.
         Case("refs-moderate", "find_references", {"symbol": "rw_verify_area"}),
-        Case("refs-hot-kmalloc", "find_references", {"symbol": "kmalloc", "limit": 100}, min_results=2000),
+        Case(
+            "refs-hot-kmalloc", "find_references",
+            {"symbol": "kmalloc", "limit": 100, "group_by": "line"}, min_results=2000,
+        ),
+        Case("refs-hot-grouped", "find_references", {"symbol": "kmalloc", "limit": 20}, min_results=1000),
+        Case(
+            "refs-prefix", "find_references",
+            {"symbol": "mutex_lock", "path_prefix": "fs/ext4", "group_by": "line"},
+        ),
         Case("refs-fallback", "find_references", {"symbol": "__GNUC__", "limit": 10}, min_results=50),
         # get_symbol_body: big function, struct, continuation macro.
         Case("body-function", "get_symbol_body", {"symbol": "tcp_v4_rcv"}),
@@ -132,15 +135,16 @@ def _matrix(root: str) -> list[Case]:
             "callers-breadth-guard", "find_callers", {"symbol": "kmalloc"},
             expect_error="too broad",
         ),
-        # summarize_references: the cheap wide view.
-        Case("summary-hot", "summarize_references", {"symbol": "kmalloc", "limit": 10}, min_results=1000),
-        Case("summary-medium", "summarize_references", {"symbol": "schedule", "limit": 10}, min_results=200),
+        # find_references grouped by file: the cheap wide view.
+        Case(
+            "summary-medium", "find_references",
+            {"symbol": "schedule", "limit": 10, "group_by": "file"}, min_results=200,
+        ),
         # find_callees.
         Case("callees-vfs_read", "find_callees", {"symbol": "vfs_read"}, extra_check=callees_in_tree("rw_verify_area")),
         Case("callees-kernel_clone", "find_callees", {"symbol": "kernel_clone"}, extra_check=callees_in_tree("copy_process")),
-        # symbol_info: widespread symbol, guard-variant symbol.
-        Case("info-hot", "symbol_info", {"symbol": "kmalloc"}),
-        Case("info-guarded", "symbol_info", {"symbol": "kmap"}),
+        # find_definition's usage summary on a very widespread symbol.
+        Case("def-summary-hot", "find_definition", {"symbol": "kmalloc"}),
         # reachability: known path and honest no-path (function pointers).
         Case(
             "reach-path", "reachability",
@@ -154,8 +158,6 @@ def _matrix(root: str) -> list[Case]:
         ),
         # list_file_symbols.
         Case("filesurface", "list_file_symbols", {"file_path": "fs/read_write.c", "limit": 500}, min_results=50),
-        # blast_radius on the clean tree (the edit variant runs separately).
-        Case("blast-clean", "blast_radius", {}, min_results=0, expect_message="no changes"),
         # update_index: synchronous incremental refresh timing.
         Case("maint-incremental", "update_index", {}, min_results=0, extra_check=status_ok),
     ]
@@ -167,11 +169,13 @@ def _run_case(case: Case, root: str) -> None:
     raw = ""
     for _ in range(2):  # cold, then warm
         started = time.monotonic()
-        raw = tool(**{**case.args, "project_root": root})
+        raw = tool(**{**case.args, "project_root": root, "format": "json"})
         timings.append((time.monotonic() - started) * 1000.0)
+    text = ""
     try:
         data = json.loads(raw)
         anomaly = _check(case, data)
+        text = output.render_text(data)  # exactly what agents get by default
     except json.JSONDecodeError as exc:
         anomaly = f"response is not JSON: {exc}"
     case.result = {
@@ -180,69 +184,16 @@ def _run_case(case: Case, root: str) -> None:
         "cold_ms": round(timings[0], 1),
         "warm_ms": round(timings[1], 1),
         "bytes": len(raw),
+        "text_bytes": len(text),
         "ok": anomaly is None,
         "anomaly": anomaly,
     }
-
-
-def _git(root: str, *args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["git", "-C", root, *args], capture_output=True, text=True
-    )
-
-
-BLAST_EDIT_FILE = "fs/read_write.c"
-
-
-def _blast_with_edit(root: str) -> Case:
-    """Whitespace-edit one indexed file, run blast_radius, always restore."""
-    case = Case("blast-real-edit", "blast_radius", {"depth": 1})
-    status = _git(root, "status", "--porcelain", "--", BLAST_EDIT_FILE)
-    if status.returncode != 0 or status.stdout.strip():
-        case.result = {
-            "name": case.name, "tool": case.tool, "cold_ms": None, "warm_ms": None,
-            "bytes": 0, "ok": False,
-            "anomaly": f"{BLAST_EDIT_FILE} is not clean in git; refusing to edit",
-        }
-        return case
-    target = Path(root) / BLAST_EDIT_FILE
-    source = target.read_text()
-    # Whitespace-only change INSIDE a function so the diff maps to it.
-    needle = "\treturn ret;"
-    target.write_text(source.replace(needle, needle + " ", 1), encoding="utf-8")
-    try:
-        server.update_index(project_root=root)  # freshness barrier before diffing
-        started = time.monotonic()
-        raw = server.blast_radius(project_root=root, depth=1)
-        elapsed = (time.monotonic() - started) * 1000.0
-        data = json.loads(raw)
-        anomaly = None
-        if "error" in data:
-            anomaly = f"unexpected error: {data['error']}"
-        elif not data.get("changed_functions"):
-            anomaly = "whitespace edit mapped to no changed function"
-        elif not any(r["distance"] == 1 for r in data["results"]):
-            anomaly = "no direct caller found at depth 1"
-        case.result = {
-            "name": case.name, "tool": case.tool, "cold_ms": round(elapsed, 1),
-            "warm_ms": None, "bytes": len(raw), "ok": anomaly is None,
-            "anomaly": anomaly,
-        }
-    finally:
-        _git(root, "checkout", "--", BLAST_EDIT_FILE)
-        server.update_index(project_root=root)  # drop the edit from the index too
-    return case
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--root", required=True, help="indexed tree to exercise")
     parser.add_argument("--json", help="write machine-readable results to this file")
-    parser.add_argument(
-        "--allow-edit", action="store_true",
-        help=f"exercise blast_radius via a whitespace edit to {BLAST_EDIT_FILE} "
-        "(restored with `git checkout --` afterwards)",
-    )
     args = parser.parse_args()
     root = str(Path(args.root).expanduser().resolve())
 
@@ -250,21 +201,24 @@ def main() -> int:
     for case in cases:  # sequential on purpose: measurements, small machines
         _run_case(case, root)
         print(".", end="", flush=True)
-    if args.allow_edit:
-        cases.append(_blast_with_edit(root))
-        print(".", end="", flush=True)
     print()
 
     rows = [case.result for case in cases]
     name_w = max(len(r["name"]) for r in rows)
     tool_w = max(len(r["tool"]) for r in rows)
     print(f"\nstability exercise against {root} ({len(rows)} calls)\n")
-    print(f"  {'case':<{name_w}}  {'tool':<{tool_w}}  {'cold ms':>8}  {'warm ms':>8}  {'bytes':>8}")
+    print(
+        f"  {'case':<{name_w}}  {'tool':<{tool_w}}  {'cold ms':>8}  {'warm ms':>8}"
+        f"  {'json B':>8}  {'text B':>8}"
+    )
     for r in rows:
         cold = f"{r['cold_ms']:.0f}" if r["cold_ms"] is not None else "-"
         warm = f"{r['warm_ms']:.0f}" if r["warm_ms"] is not None else "-"
         flag = "" if r["ok"] else "  <-- ANOMALY"
-        print(f"  {r['name']:<{name_w}}  {r['tool']:<{tool_w}}  {cold:>8}  {warm:>8}  {r['bytes']:>8}{flag}")
+        print(
+            f"  {r['name']:<{name_w}}  {r['tool']:<{tool_w}}  {cold:>8}  {warm:>8}"
+            f"  {r['bytes']:>8}  {r['text_bytes']:>8}{flag}"
+        )
 
     anomalies = [r for r in rows if not r["ok"]]
     print(f"\n  {len(rows) - len(anomalies)}/{len(rows)} sane; "

@@ -30,8 +30,8 @@ Supported ``expect`` checks (all optional, all must hold for a pass):
 - ``status``           — update_index: results.status equals this exactly
 - ``suggestions_contain`` — every name among the envelope ``suggestions``
 - ``fallback``         — envelope ``fallback`` field equals this exactly
-- ``guard_variants_min`` / ``definition_count_min`` — symbol_info fields
-- ``exported``         — symbol_info field equals this exactly
+- ``guard_variants_min`` / ``definition_count_min`` — find_definition summary fields
+- ``exported``         — find_definition summary field equals this exactly
 - ``path_found``       — reachability outcome equals this boolean
 - ``config_filtered_min`` — at least this many results config-filtered
 
@@ -126,13 +126,13 @@ def _check(case: dict, data: dict) -> tuple[list[str], bool | None, bool | None]
         got = data.get("resolved_via") or info.get("resolved_via")
         content(got == via, f"resolved_via {got!r} != {via!r}")
     if (n := expect.get("guard_variants_min")) is not None:
-        got = info.get("guard_variants") or 0
+        got = data.get("guard_variants") or 0
         content(got >= n, f"guard_variants {got} < {n}")
     if (n := expect.get("definition_count_min")) is not None:
-        got = info.get("definition_count") or 0
+        got = data.get("definition_count") or 0
         content(got >= n, f"definition_count {got} < {n}")
     if (exported := expect.get("exported")) is not None:
-        got = info.get("exported")
+        got = data.get("exported")
         content(got == exported, f"exported {got!r} != {exported!r}")
     if (found := expect.get("path_found")) is not None:
         got = info.get("path_found")
@@ -168,12 +168,9 @@ def run(golden: str, root: str | None, threshold: float) -> int:
         "find_references": server.find_references,
         "get_symbol_body": server.get_symbol_body,
         "find_callers": server.find_callers,
-        "summarize_references": server.summarize_references,
         "find_callees": server.find_callees,
-        "symbol_info": server.symbol_info,
         "list_file_symbols": server.list_file_symbols,
         "reachability": server.reachability,
-        "blast_radius": server.blast_radius,
         "update_index": server.update_index,
     }
 
@@ -187,7 +184,7 @@ def run(golden: str, root: str | None, threshold: float) -> int:
         if tool is None:
             print(f"error: {case['id']}: unknown tool {case['tool']}", file=sys.stderr)
             return 2
-        raw = tool(**{**case["args"], "project_root": root})
+        raw = tool(**{**case["args"], "project_root": root, "format": "json"})
         data = json.loads(raw)
         if "error" in data:
             failures: list[str] = [data["error"]]

@@ -32,7 +32,7 @@ Every AI coding agent — Claude Code, Cursor, Codex, you name it — answers *"
 - **Radically less noise** — the definition, not 7,873 lines of matches
 - **Speaks kernel** — `#ifdef` guard stacks with `.config` filtering, macro-generated symbols (`sys_read` → its `SYSCALL_DEFINE3` site) that no other tagging tool resolves, and definitions the parser misses recovered from their `EXPORT_SYMBOL` site via ctags
 - **Zero index management** — first query builds the index, every query auto-refreshes it
-- **Correctness measured in CI** — a 65-case golden eval covering all 11 tools against a pinned kernel: 100% recall, 100% precision@1 ([docs/capability.md](docs/capability.md))
+- **Correctness measured in CI** — a 64-case golden eval covering all 8 tools against a pinned kernel: 100% recall, 100% precision@1 ([docs/capability.md](docs/capability.md))
 - **Works everywhere MCP does** — Claude Code, Claude Desktop, Cursor, any MCP client
 
 ## The numbers (real Linux kernel, not a toy)
@@ -49,7 +49,7 @@ Measured on a full Linux kernel checkout — **65,163 C/C++ files, 37.1 million 
 | Where is `sys_read` *really* defined? | *no answer — the name is macro-generated* | **0.03 s** | `fs/read_write.c SYSCALL_DEFINE3(read, ...)`, flagged `resolved_via` |
 | Where is `mutex_lock` defined? | 24,774 noisy match lines | **0.2 s** | `kernel/locking/mutex.c:314` — recovered via `EXPORT_SYMBOL` + ctags after gtags' parser derails on it |
 | Does `ksys_read` ever reach `rw_verify_area`? | *N rounds of grep + reading* | **0.6 s** | the shortest call chain, with every call site's file:line |
-| What does my uncommitted diff impact? | *not answerable* | **0.1 s** | `blast_radius`: changed functions + callers, ranked by distance |
+| Every `mutex_lock` call in `fs/ext4`? | 22,905 tree-wide match lines | **0.01 s** | `find_references(path_prefix="fs/ext4")`: the 18 real sites |
 
 One-time index build: **66 s** for the whole kernel. Incremental refresh after edits: well under a second. Reproduce it yourself with [`scripts/benchmark.sh`](scripts/benchmark.sh):
 
@@ -59,7 +59,7 @@ One-time index build: **66 s** for the whole kernel. Incremental refresh after e
 
 The speed is nice. The real win is **precision**: an agent that gets 5 exact lines instead of 7,873 noisy ones keeps its context window for actual reasoning.
 
-And the answers are *measured*, not assumed: CI runs a [65-case golden eval](evals/golden.jsonl) against pinned kernel v6.16 on every push — currently **100% recall, 100% precision@1** across definitions, macro resolution, export recovery, references, callers, callees, definition bodies, `#ifdef` guards, and reachability, covering all 11 tools. The full methodology, numbers, and honest limitations live in [docs/capability.md](docs/capability.md).
+And the answers are *measured*, not assumed: CI runs a [64-case golden eval](evals/golden.jsonl) against pinned kernel v6.16 on every push — currently **100% recall, 100% precision@1** across definitions, macro resolution, export recovery, references, callers, callees, definition bodies, `#ifdef` guards, and reachability, covering all 8 tools. The full methodology, numbers, and honest limitations live in [docs/capability.md](docs/capability.md).
 
 ## Quick start (60 seconds)
 
@@ -87,7 +87,24 @@ On the very first tool call the server bootstraps everything else by itself: GNU
 
 The prebuilt Linux binaries run on any distro with glibc ≥ 2.28 (RHEL/Rocky 8+, Ubuntu 18.10+, Debian 10+). On older hosts — or if a downloaded binary fails its post-install execution check — setup automatically compiles GNU Global from source instead, which only needs `make` and a C compiler.
 
-### Option B — one-line installer (shared background server)
+### Option B — install the plugin (server + skill + slash commands)
+
+The plugin bundles this server, a **"C/C++ code navigation" skill** that tells
+the agent which tool answers which question, and two slash commands
+(`/gtags:impact`, `/gtags:explain`). Installing it registers the MCP server for
+you — there is no config file to edit.
+
+| Client | Install |
+|---|---|
+| **Claude Code** | `/plugin marketplace add harshithsunku/mcp-gtags-server` then `/plugin install mcp-gtags-server@mcp-gtags-server` |
+| **Codex** | `codex plugin marketplace add harshithsunku/mcp-gtags-server`, then install it from the Plugins Directory in the ChatGPT desktop app |
+| **Cursor** | Loads [Agent Plugins](https://agent-plugins.org) 1.0.0, but installs only from the Cursor Marketplace or a team marketplace — until this plugin is listed there, use the one-click badge or Option A |
+
+> **Install one way, not both.** A plugin *and* a manual entry run two servers,
+> and the agent sees every tool twice. Switching to the plugin? Remove the
+> manual entry first (`claude mcp remove gtags`).
+
+### Option C — one-line installer (shared background server)
 
 **One command. No sudo. Works everywhere** — restricted corporate machines, containers, build servers:
 
@@ -102,6 +119,16 @@ Everything lands in your home directory — the server (via `uv`), GNU Global, u
 - Up to date? → *"Already installed and up to date — nothing to install"*, and the config is printed again.
 - New release on GitHub/PyPI? → the package updates, an outdated gtags toolchain is wiped and reinstalled automatically, and the background server restarts on the new version.
 
+### Slash commands (MCP prompts)
+
+Available with any install, in clients that support MCP prompts (Claude Code,
+Cursor). They cost no tool-schema context:
+
+| Command | What it runs |
+|---|---|
+| `/gtags:impact [git_ref]` | `git diff` → the changed functions → `find_callers` on each → callers ranked by risk |
+| `/gtags:explain <symbol>` | definition (+ `#ifdef` variants) → body → callers → a short explanation |
+
 ### One config, many repos
 
 However you install it, **one user-level entry serves every repo you open** — 20 repos need zero extra installs and zero extra config. Each tool call resolves its project root down this ladder:
@@ -111,6 +138,11 @@ However you install it, **one user-level entry serves every repo you open** — 
 3. `root` in a [config file](#config-files) *(note: pinning a root here defeats multi-repo)*
 4. **The client's workspace roots** (MCP roots protocol) — IDEs that advertise their open folders get the right repo automatically, even on the shared HTTP server; with several folders open, agents are asked to pass `project_root`. Roots exist only for clients on protocol revisions up to 2025-11-25: the 2026-07-28 revision deprecated them, so those clients skip this step (stdio servers still resolve through step 5; on the shared HTTP server, agents pass `project_root`)
 5. Walk up from the server's working directory to the nearest `.git`/`GTAGS` — this is why stdio servers spawned by Claude Code/Cursor inside a repo just work
+
+Step 5 can be switched off with `--no-cwd-fallback` / `GTAGS_MCP_CWD_FALLBACK=0`
+(the plugin sets it): the tools then ask for `project_root` instead of indexing
+whatever directory the server happens to run in. Plugin clients launch the
+server from the plugin's own folder, which is never your project.
 
 That's it. No indexing step, no configuration. Ask your agent *"who calls `tcp_v4_rcv`?"* — the first query in any repo builds that repo's index automatically, and every query after that is answered in milliseconds. Run `mcp-gtags-server doctor` any time to see what the server detects, or `mcp-gtags-server config` to re-print the client configuration.
 
@@ -207,20 +239,17 @@ Precedence: tool-call argument > CLI flag > environment variable > project confi
 
 | Tool | What the agent gets |
 |---|---|
-| `symbol_info` | **A one-shot overview card** — definitions (with kind, signature, scope, and `#ifdef` guard), reference count, hottest files, `EXPORT_SYMBOL*` status, and which tool to use next. Multiply-defined symbols are explained as "N definitions under M distinct guards"; macro-generated ones resolve with a `resolved_via` flag. The best first query for any unfamiliar symbol. |
 | `get_symbol_body` | **Just the source of a definition.** The 271-line `tcp_v4_rcv` function — not the 3,500-line file it lives in. Handles functions, structs, and multi-line macros. |
 | `find_callers` | **The call graph, deduplicated.** Every reference mapped to its enclosing function with call counts: 245 raw lines for `ext4_mark_inode_dirty` collapse to 62 callers. Iterate it to walk the caller graph as deep as you need. |
 | `find_callees` | **The outgoing call graph.** What does this function call? Body-extracted call sites, each verified against the index, split into in-tree (with locations) and external. |
 | `reachability` | **"Can this function end up in that one?"** — BFS over the caller graph returns the *shortest* call chain from A to B with the file:line of every call site (`ksys_read → vfs_read → rw_verify_area`), or an honest "no static path" that names the function-pointer caveat. One call instead of a dozen find_callers rounds. |
-| `blast_radius` | **What does my diff impact?** Takes `git diff <ref>`, maps changed lines to their enclosing functions via the index, then walks callers outward — results ranked by distance (changed functions first, direct callers next). The pre-merge "what else must I re-check" answer, tied to real git state. |
-| `summarize_references` | **A ranked per-file count.** The cheap first move for hot symbols — `kmalloc`'s 2,744 references become one screen of "where usage concentrates". |
 
 ### Core lookups
 
 | Tool | What it does | Underlying command |
 |---|---|---|
-| `find_definition` | Where is this symbol defined? Falls back to macro-family resolution (`sys_*`, `trace_*`, `DEFINE_*` names) when there's no literal definition, and suggests prefix matches when nothing matches at all | `global -x` + [macro resolution](#macro-generated-symbols-resolve-too-sys_read--syscall_define3) |
-| `find_references` | Raw reference lines for a symbol — falls back to symbol-usage records (libc calls, some variables) when the index has no in-tree references, flagged `fallback` | `global -rx`, fallback `global -sx` |
+| `find_definition` | **Where is this defined, and what is it?** Definitions with `#ifdef` guards and ctags metadata, plus a usage summary (reference/file counts, hottest files, `EXPORT_SYMBOL*` status). Falls back to macro-family resolution (`sys_*`, `trace_*`, `DEFINE_*` names) and suggests prefix matches on a miss | `global -x` + [macro resolution](#macro-generated-symbols-resolve-too-sys_read--syscall_define3) |
+| `find_references` | Every usage site, each with its guard stack. Above 200 references it returns a **per-file distribution** instead of a wall of lines (`kmalloc`'s 2,744 references become one screen); `path_prefix` drills into one directory, `group_by` forces either view. Falls back to symbol-usage records (libc calls, some variables), flagged `fallback` | `global -rx -S <dir>`, fallback `global -sx` |
 | `list_file_symbols` | A file's API surface — every symbol it defines | `global -fx` |
 | `update_index` | Synchronous freshness barrier after edits; `full=true` rebuilds from scratch (rarely needed — indexing is automatic) | `gtags -i` / `gtags` |
 
@@ -228,9 +257,29 @@ Every query tool supports `limit`/`offset` pagination, long-line truncation, and
 
 Every tool also declares MCP tool annotations: all are `readOnlyHint: true` except `update_index`, and none reach outside your machine (`openWorldHint: false`). Clients use these hints to auto-approve and parallelize read-only calls. Each response carries the envelope exactly once, as text content, with no duplicate `structuredContent` copy.
 
-### Structured output (JSON by default)
+### Output: compact text by default, JSON on request
 
-Since v0.8.0 every tool returns a **machine-readable JSON envelope by default** (pass `format="text"` for the previous human-readable rendering — a breaking change if you parsed the old text):
+Since **v2.0.0** every tool answers with grep-shaped text — the format agents
+read best, and 2–3× cheaper in tokens than the same answer as JSON:
+
+```text
+kmap: 4 definitions under 3 #if variants · 261 refs in 65 files (top: tools/perf/util/machine.c 26, …)
+include/linux/highmem-internal.h:40: static inline void *kmap(struct page *page)  [function; #if CONFIG_HIGHMEM]
+include/linux/highmem-internal.h:170: static inline void *kmap(struct page *page)  [function; #if !CONFIG_HIGHMEM]
+next: get_symbol_body, find_callers, find_references
+```
+
+`path:line: source` rows carry a tag with what the symbol is and the
+`#if`/`#ifdef` stack it lives under. Paginated results end with a footer like
+`[1-100 of 5290 · offset=100 for more]`.
+
+Against v1.x's JSON default the same seven kernel questions cost **20% fewer
+tokens** overall — up to 68% on individual lookups. `find_callers` is the one
+call that got *bigger* (about 9%), on purpose: it now includes each call site's
+source line, which is exactly what agents used to spend an extra grep to see.
+
+Pass `format="json"` for the machine-readable envelope — the same data, rendered
+from one source of truth:
 
 ```json
 {
@@ -243,18 +292,27 @@ Since v0.8.0 every tool returns a **machine-readable JSON envelope by default** 
      "snippet": "static inline void *kmap(struct page *page)"}
   ],
   "total": 2, "offset": 0, "truncated": false,
-  "next_tools": ["get_symbol_body", "find_callers", "symbol_info"],
+  "definition_count": 2, "guard_variants": 2, "reference_count": 261,
+  "file_count": 65, "top_files": [{"path": "…", "count": 26}], "exported": null,
+  "next_tools": ["get_symbol_body", "find_callers", "find_references"],
   "warning": null
 }
 ```
 
-- Symbol locations always use the stable record schema `{symbol, path, line, col, kind, typeref, scope, signature, guard, snippet}` with repo-relative paths. Keys are only ever added, never renamed or removed — parsers never need to change shape.
-- **`kind` / `typeref` / `scope` / `signature` say *what* a symbol is** (since v0.8.1): function vs. macro vs. struct vs. typedef vs. enum constant, its return/target type, its enclosing scope (`enum:color`, `struct:item`), and its parameter list — extracted per file by universal-ctags with **no build and no compile database**, cached, and filled on definition-shaped results (`find_definition`, `symbol_info`, `list_file_symbols`). When universal-ctags isn't available the fields are simply `null`; disable explicitly with `--no-enrich`, `GTAGS_MCP_ENRICH=0`, or `enrich = false` in `.gtags-mcp.toml`.
+- Symbol locations always use the stable record schema `{symbol, path, line, col, kind, typeref, scope, signature, guard, snippet}` with repo-relative paths. Keys are only ever added, never renamed or removed within a major version.
+- **`kind` / `typeref` / `scope` / `signature` say *what* a symbol is** (since v0.8.1): function vs. macro vs. struct vs. typedef vs. enum constant, its return/target type, its enclosing scope (`enum:color`, `struct:item`), and its parameter list — extracted per file by universal-ctags with **no build and no compile database**, cached, and filled on definition-shaped results (`find_definition`, `list_file_symbols`). When universal-ctags isn't available the fields are simply `null`; disable explicitly with `--no-enrich`, `GTAGS_MCP_ENRICH=0`, or `enrich = false` in `.gtags-mcp.toml`.
 - **`guard` says *when* a symbol exists** (since v0.9.0): the enclosing `#if`/`#ifdef` stack, outermost first (`[]` = unconditional, `null` = scanning disabled or file unreadable). See the next section — this is the headline feature.
 - **`resolved_via` says *how* a symbol was found** when it took macro-family resolution rather than a literal index match (`"macro:SYSCALL_DEFINE"`, `"fuzzy:vfs_read"`) — see [Macro-generated symbols](#macro-generated-symbols-resolve-too-sys_read--syscall_define3).
 - `next_tools` tells the agent the highest-value follow-up call for what was (or wasn't) found.
-- `total`/`offset`/`truncated` replace the text continuation footer; errors keep the envelope with an `error` field.
-- Composite tools return tool-shaped `results` (e.g. `find_callees` `{in_tree, external}`, `symbol_info` an overview object, `reachability` a hop chain) inside the same envelope.
+- `total`/`offset`/`truncated` drive pagination; failures keep the envelope with an `error` field and are flagged `isError` on the protocol so the agent can self-correct.
+- Composite tools return tool-shaped `results` (e.g. `find_callees` `{in_tree, external}`, `reachability` a hop chain) inside the same envelope.
+- Every tool declares MCP **tool annotations**: all are `readOnlyHint: true` except `update_index`, and none reach outside your machine (`openWorldHint: false`) — clients use these to auto-approve and parallelize calls.
+
+**Upgrading from v1.x?** Pass `format="json"` explicitly wherever you parsed the
+old default. `symbol_info` is now part of `find_definition`,
+`summarize_references` is `find_references` (it groups by file automatically),
+and `blast_radius` is the `/gtags:impact` prompt — `git diff`, then
+`find_callers` on each changed function.
 
 ### `#ifdef`-aware: know which definition your config actually compiles
 
@@ -273,7 +331,7 @@ Symbol: kmap
 
 Pass `active_config` — a kernel `.config` path or a macro list like
 `"CONFIG_SMP,BITS_PER_LONG=64,!CONFIG_DEBUG"` — to `find_definition`,
-`find_references`, or `symbol_info`, and definitions whose guard stack is
+or `find_references`, and definitions whose guard stack is
 **definitely false** under it are dropped (the envelope reports the count as
 `config_filtered`). Filtering is deliberately conservative: a `.config` is a
 closed world for `CONFIG_*` macros (kbuild semantics, including
@@ -311,7 +369,7 @@ definers (`DEFINE_SPINLOCK`, `DEFINE_MUTEX`, `DEFINE_PER_CPU*`,
 plus a last-resort fuzzy tier that tries underscore-variant spellings.
 Resolved results are flagged with `resolved_via` in the envelope and ranked
 ahead of same-named textual shadows; `DEFINE_*` sites rank above their
-`DECLARE_*` counterparts. `symbol_info` additionally reports the
+`DECLARE_*` counterparts. `find_definition` additionally reports the
 `EXPORT_SYMBOL` / `EXPORT_SYMBOL_GPL` variant a kernel symbol is exported
 with, in an `exported` field. Costs nothing when a symbol resolves normally
 (only family-shaped names like `sys_*`/`trace_*` get the extra indexed
@@ -331,12 +389,12 @@ Incremental refreshes recollect the list, so newly ignored files drop out of the
 ### The flow that saves your context window
 
 ```text
-1. symbol_info("kmalloc")                    → definitions + usage spread + next step (12 lines)
-2. find_callers("ext4_mark_inode_dirty")     → deduped callers with counts (1 line/caller)
+1. find_definition("kmalloc")                → definitions + #ifdef variants + usage spread (3 lines)
+2. find_callers("ext4_mark_inode_dirty")     → deduped callers, each with its call line
 3. get_symbol_body("tcp_v4_rcv")             → read the ONE function that matters
 4. find_callees("tcp_v4_rcv")                → what it depends on, with locations
 5. reachability("ksys_read", "rw_verify_area") → the call chain, one line per hop
-6. blast_radius("HEAD")                      → what my edit impacts, ranked by distance
+6. find_references("mutex_lock", path_prefix="fs/ext4") → hot symbol, one subsystem
 ```
 
 A few hundred lines of context total — versus tens of thousands for the grep-and-read-files equivalent.
@@ -413,7 +471,7 @@ sequenceDiagram
 - **First query on a tree?** The index is built automatically (the only operation that ever blocks — and only once).
 - **Where do the index files go?** Into a single `.gtags-mcp/` folder at the project root — never loose files next to your code. The folder ships its own `.gitignore`, so `git status` stays clean without touching yours. A pre-existing root-level `GTAGS` (from older versions, or your own gtags runs) keeps being used as-is. `mcp-gtags-server doctor` shows the location.
 - **Files changed?** A debounced incremental refresh runs **in the background**: queries always answer instantly from the current index while `gtags -i` catches up behind the scenes. Measured on the kernel: queries return in 0.02s while the 25s freshness check runs invisibly. Staleness is bounded by the debounce window; call `update_index` for a synchronous, guaranteed-fresh barrier right after edits.
-- **Huge result?** Pagination footers tell the agent exactly how to fetch the next page — or the tool itself suggests a narrower one (`find_callers` on a symbol used in 500+ files points to `summarize_references`).
+- **Huge result?** Pagination footers tell the agent exactly how to fetch the next page — or the tool itself suggests a narrower one (`find_callers` on a symbol used in 500+ files points to `find_references`, which groups by file).
 
 ## FAQ
 
@@ -440,13 +498,13 @@ Releases up to v1.4.2 declared an uncapped `mcp` dependency, so installs made af
 ```bash
 git clone https://github.com/harshithsunku/mcp-gtags-server
 cd mcp-gtags-server
-uv run --extra dev pytest       # 318 tests; e2e tests auto-skip if GNU Global is absent
+uv run --extra dev pytest       # 325 tests; e2e tests auto-skip if GNU Global is absent
 npx @modelcontextprotocol/inspector mcp-gtags-server    # poke at it interactively
 ```
 
 Tests build a real C project in a temp dir and exercise auto-indexing, auto-refresh, caller mapping, body extraction, pagination, user-space binary discovery, and config layering end-to-end.
 
-Correctness is also measured, not assumed: `mcp-gtags-server eval --golden evals/golden.jsonl --root <kernel-tree>` runs a 65-case golden set covering all 11 tools (definitions, macro resolution, references, callers, callees, bodies, guards, reachability, maintenance) against a real kernel and prints recall / precision@1 — CI does this weekly against a pinned tag. See [docs/capability.md](docs/capability.md) for the current numbers.
+Correctness is also measured, not assumed: `mcp-gtags-server eval --golden evals/golden.jsonl --root <kernel-tree>` runs a 64-case golden set covering all 8 tools (definitions, macro resolution, references, callers, callees, bodies, guards, reachability, maintenance) against a real kernel and prints recall / precision@1 — CI does this weekly against a pinned tag. See [docs/capability.md](docs/capability.md) for the current numbers.
 
 Release flow: bump `version` in `pyproject.toml`, tag `vX.Y.Z`, push — CI publishes to PyPI and users pick the update up on their next installer re-run. Prebuilt GNU Global binaries are rebuilt by tagging `global-v<version>` (or `gh workflow run release-binaries.yml -f version=<version>` to replace the assets of an existing release in place); Linux builds run inside manylinux_2_28 containers so they work on any glibc ≥ 2.28 host, enforced by a CI symbol-ceiling check.
 
@@ -457,8 +515,8 @@ metadata enrichment (kind/signature/scope) in v0.8.1, `#ifdef`/config-guard
 awareness (the headline capability for kernel and firmware trees) in v0.9.0,
 then, all shipped in v1.0.0: macro-family symbol resolution (`sys_read` → its
 `SYSCALL_DEFINE3` site), the agent workflow tools (`reachability`,
-`blast_radius`), automatic recovery from corrupted index databases, and the
-correctness eval harness — a 65-case golden set against pinned kernel v6.16
+diff-impact analysis), automatic recovery from corrupted index databases, and the
+correctness eval harness — a 64-case golden set against pinned kernel v6.16
 scoring 100% recall / 100% precision@1 in CI, with the measured writeup in
 [docs/capability.md](docs/capability.md). Every technical milestone is done;
 what remains is distribution (MCP registry, directories, the writeup post).

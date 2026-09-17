@@ -1,0 +1,11 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "mcp-gtags-server",
+  "version": "2.0.0",
+  "description": "Indexed C/C++ code navigation for agents: callers, references, call chains and #ifdef-aware definitions from a GNU Global index, with no build.",
+  "author": { "name": "Harshith Sunku", "url": "https://github.com/harshithsunku" },
+  "homepage": "https://github.com/harshithsunku/mcp-gtags-server",
+  "repository": "https://github.com/harshithsunku/mcp-gtags-server",
+  "license": "MIT",
+  "keywords": ["c", "cpp", "kernel", "code-navigation", "gtags", "gnu-global", "mcp"]
+}

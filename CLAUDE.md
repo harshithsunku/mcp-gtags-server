@@ -19,18 +19,25 @@ kernel-.config-aware filtering (`active_config`).
 
 ```
 src/gtags_mcp/
-  server.py      (~2300 lines) MCP tools, root detection, index lifecycle, CLI main()
+  server.py      (~2000 lines) MCP tools + prompts, root detection, index lifecycle, CLI main()
   toolchain.py   toolchain install: managed GNU Global/ctags/Pygments in ~/.gtags-mcp
   guards.py      #if/#ifdef guard-stack scanner + active_config evaluation
   macros.py      macro-generated symbol resolution (SYSCALL_DEFINE etc.), EXPORT_SYMBOL detection
   enrich.py      ctags metadata enrichment (kind/typeref/scope/signature); probe_binary + cache
   config.py      settings: CLI flag > env var > project .gtags-mcp.toml > user config > default
                  user config: ${XDG_CONFIG_HOME:-~/.config}/gtags-mcp/config.toml
-  output.py      JSON envelope: {tool, root, results, total, truncated, hints, message, ...}
+  output.py      JSON envelope {tool, root, results, total, truncated, hints, ...} AND
+                 render_text(): the compact text agents get by default
   fileset.py     file listing helpers
   evalharness.py golden-set eval runner (see Evals below)
-tests/           pytest suite (318 tests, ~4s, no network; heavy use of tmp fixture projects)
-evals/golden.jsonl        65-case golden set run against a real kernel tree
+tests/           pytest suite (325 tests, ~7s, no network; heavy use of tmp fixture projects)
+  test_contract.py        client-facing budgets (2KB descriptions/instructions, 512-char
+                          Codex head), tool metadata, prompts, plugin manifests, version sync
+plugin/          cross-client plugin: Agent Plugins 1.0.0 (plugin.json + mcp.json, for
+                 Codex/Cursor) AND Claude Code (.claude-plugin/plugin.json + .mcp.json),
+                 sharing skills/c-code-navigation/SKILL.md. Marketplaces at the repo root:
+                 .claude-plugin/, .agents/plugins/, .cursor-plugin/
+evals/golden.jsonl        64-case golden set run against a real kernel tree
 evals/agent/              agent A/B eval harness (run_ab.py, grade.py, questions.jsonl)
 scripts/stability_exercise.py  operational latency/size matrix against a real tree
 docs/capability.md        capability matrix; docs/bringup-hurdles.md
@@ -38,30 +45,51 @@ mcpb/manifest.json        Claude Desktop bundle manifest
 .github/workflows/        ci.yml, eval.yml, publish.yml, publish-registry.yml, release-binaries.yml
 ```
 
-## The 11 MCP tools (all in server.py, decorated `@_gtags_tool("Title")`)
+## The 8 MCP tools (all in server.py, decorated `@_gtags_tool("Title")`)
 
-`find_definition`, `find_references`, `get_symbol_body`, `find_callers`,
-`summarize_references`, `find_callees`, `reachability`, `blast_radius`,
-`symbol_info` (the "best FIRST query" overview card), `list_file_symbols`,
-`update_index`.
+`find_definition` (definitions + usage summary; absorbed symbol_info),
+`find_references` (auto-groups by file above 200 refs; absorbed
+summarize_references), `get_symbol_body`, `find_callers`, `find_callees`,
+`reachability`, `list_file_symbols`, `update_index`.
+
+Plus two MCP **prompts** (slash commands, no schema cost): `impact` (the former
+blast_radius workflow: git diff → find_callers) and `explain`.
 
 Conventions shared by all tools:
-- Docstrings ARE the MCP tool descriptions — they are agent-facing prompt text
-  ("Use this INSTEAD of grep …"). Schema context cost matters; the surface was
-  deliberately consolidated 20 → 12 → 11 tools (v1.2.0/v1.3.0). Don't add tools
-  or bloat docstrings casually.
-- Every tool takes `project_root`, `format` ("json" default | "text"), and most take
-  `limit` (default 100) / `offset`. JSON output goes through `output.envelope()`.
+- Docstrings ARE the MCP tool descriptions — agent-facing prompt text whose
+  first sentence carries the words tool search matches ("who calls", "usages",
+  "go to definition"). Schema context cost matters; the surface was
+  deliberately consolidated 20 → 12 → 11 → 8 (v1.2.0/v1.3.0/v2.0.0). Don't add
+  tools or bloat docstrings casually; test_contract.py pins the budgets.
+- **Tool bodies return the JSON envelope only.** `_gtags_tool` wraps each body
+  in a sync function with the `format` parameter (default "text") that renders
+  through `output.render_text()`, so text and JSON can never drift. Never add a
+  second text code path (v1.x had one, and it silently skipped guards and
+  active_config).
+- Every tool takes `project_root`, `format` ("text" default | "json"), and most take
+  `limit` (default 100) / `offset`.
 - Results are best-effort-never-fail: enrichment/guards/macro-resolution degrade to
   null fields rather than erroring. Opt-out knobs exist for each
   (`--no-enrich/--no-guards/--no-macro-resolve`, env vars, config keys).
 - Index freshness: queries auto-refresh in the background (may lag a few seconds);
   `update_index` is the synchronous barrier. Index lives in `<root>/.gtags-mcp/`
   unless legacy root-level GTAGS files exist (`_db_dir` respects those).
-- Tool metadata (v1.5.0): every tool has a `title` and `ToolAnnotations`
-  (`readOnlyHint` true except `update_index`, `openWorldHint` false), and
-  `structured_output=False`. Without that flag the SDK derives a
-  `{"result": str}` outputSchema and sends each response twice.
+- **Full builds are single-flight per root** (`_build_index`/`_builds`). Parallel
+  first queries used to start one `gtags` each over the same database →
+  "GTAGS not found", "chmod(2) failed", corruption (reproduced on v1.5.0; clients
+  dispatch read-only tools concurrently). Live MCP calls wait
+  `INDEX_BUILD_WAIT_SECONDS` then return "indexing … retry shortly" (Codex's tool
+  timeout is 60 s); direct calls block. A query whose database vanishes mid-rebuild
+  joins the build and retries once (`_index_vanished`).
+- Errors: `output.error()` envelopes are returned as `CallToolResult(is_error=True)`
+  by the async wrapper. Do NOT raise ToolError — the SDK rewrites the message and
+  logs a failure line.
+- Tool metadata: every tool has a `title` and `ToolAnnotations` (`readOnlyHint`
+  true except `update_index`, `openWorldHint` false), and `structured_output=False`
+  (without it the SDK derives a `{"result": str}` outputSchema and sends each
+  response twice). find_definition/find_callers/get_symbol_body also carry
+  `_meta["anthropic/alwaysLoad"]`, which skips Claude Code's deferred tool search
+  (the A/B transcripts showed a ToolSearch round-trip before 40 of 50 first calls).
 
 ## MCP SDK (2.x, `mcp>=2.2,<3`)
 
@@ -118,7 +146,7 @@ uv run pytest -q                                   # full suite, ~4s, must stay 
 uv run mcp-gtags-server eval \
   --golden evals/golden.jsonl --root /home/ai/linux # kernel golden set: expect 65/65
 python scripts/stability_exercise.py \
-  --root /home/ai/linux --allow-edit                # 28-call latency matrix, zero anomalies
+  --root /home/ai/linux                             # 26-call latency/size matrix, zero anomalies
 uv run mcp-gtags-server doctor                      # what the server detects here
 ```
 
@@ -145,15 +173,17 @@ uv run mcp-gtags-server doctor                      # what the server detects he
   prove the CI eval passes.
 - CI installs BOTH ctags flavours (`universal-ctags exuberant-ctags`) — see the
   ctags section above for why both are needed.
-- Headline numbers as of v1.4.x: eval 65/65 recall, 14/14 precision@1;
+- Headline numbers as of v2.0.0: eval 64/64 recall, 14/14 precision@1;
   warm latencies: reachability ~46ms, find_callers ~2-3ms, recovered
   mutex_lock lookup ~0.22s.
 
 ## Release flow (authorized to run without per-release confirmation)
 
 1. Verify: full pytest + kernel eval (65/65) against `/home/ai/linux`.
-2. Bump version in **THREE files** (missing one has bitten before):
-   `pyproject.toml`, `src/gtags_mcp/__init__.py`, `server.json` (two spots).
+2. Bump version in **FIVE files** (missing one has bitten before):
+   `pyproject.toml`, `src/gtags_mcp/__init__.py`, `server.json` (two spots),
+   `plugin/plugin.json`, `plugin/.claude-plugin/plugin.json`.
+   `test_version_is_in_sync_across_every_manifest` catches a miss.
 3. Update README/ROADMAP in the same commit when behavior changed.
 4. Commit (detailed message), tag `vX.Y.Z`, push commits AND tags.
 5. Tag push triggers publish.yml: tests → PyPI (trusted publishing) → GitHub

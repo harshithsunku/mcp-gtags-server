@@ -54,6 +54,7 @@ Cheap, high-value — uses the parser already in the stack.
       enum-constant, show signature and enclosing scope.
 
 **Done when:** `symbol_info` shows kind + signature + scope for C symbols with no build.
+(v2.0.0 folded that card into `find_definition` — see milestone 9.)
 
 ### 3. `#ifdef` / config-guard awareness — headline capability ✅ (v0.9.0)
 The differentiator. Firmware and kernel code is conditional-compilation soup, and
@@ -89,6 +90,7 @@ Fewer round-trips, higher-value calls — built on the existing call-graph data.
 - [x] `reachability(from, to)` — does A transitively call B, and by what path?
 - [x] `blast_radius(git_ref)` — take a `git diff`, find changed functions, and return
       everything that references/calls them, ranked by distance. (Refactoring-impact use case.)
+      *v2.0.0 replaced the tool with the `impact` prompt — same workflow, no schema cost.*
 
 **Done when:** both return bounded, ranked results tied to real git state. ✅
 `reachability("do_sys_openat2", "security_file_open")` returns the 4-hop chain with
@@ -115,8 +117,8 @@ Trust through measurable quality — reported on its own terms.
       build, what it resolves, and its measured accuracy.
 
 **Done when:** an eval command prints a score in CI, and the capability writeup is live.
-✅ `mcp-gtags-server eval --golden evals/golden.jsonl --root <kernel>` runs 65
-path-level cases covering all 11 tools in ~14s — 100% recall and 100% precision@1
+✅ `mcp-gtags-server eval --golden evals/golden.jsonl --root <kernel>` runs 64
+path-level cases covering all 8 tools in ~14s — 100% recall and 100% precision@1
 on pinned v6.16 AND on a 2026 master snapshot. The one long-standing known-fail
 (a GNU Global parser gap triggered by the new `__acquires()` annotations that
 hid `mutex_lock`'s real definition) was closed in v1.4.0 by ctags export
@@ -148,6 +150,46 @@ Keep the transport layer current, and make the protocol metadata work for agents
 **Done when:** a fresh `uvx mcp-gtags-server` resolves SDK 2.x, and old and new
 clients both navigate the kernel. ✅
 
+### 9. Agent-fit pass: compact output, 8 tools, cross-client plugin ✅ (v2.0.0)
+Measured against how Claude Code, Codex and Cursor actually navigate code in 2026.
+Evidence: our own 100-run agent A/B transcripts, fresh kernel measurements, and
+published studies (agents adopt structured tools for 0–6% of "where is X defined"
+but 45–57% of reference-completeness questions; `path:line:content` plus context
+lines cut follow-up reads 15.2 → 3.2).
+
+- [x] **Compact text by default** (`path:line: source  [kind; #if …]`), JSON on
+      request — 2–4x cheaper per answer, rendered from the same envelope so the
+      two formats cannot drift. find_callers now shows each call site's source
+      line, which is what agents were re-grepping for.
+- [x] **11 → 8 tools**: symbol_info folded into find_definition (the name agents
+      actually pick: 20 calls vs 2 in the A/B), summarize_references into
+      find_references (auto-groups above 200 refs, plus `path_prefix` — which
+      uses `global -S`, 8 ms instead of 200 ms on mutex_lock), blast_radius
+      removed in favour of the `impact` prompt.
+- [x] **MCP prompts** `impact` and `explain`: multi-step recipes at zero
+      tool-schema cost.
+- [x] **Client fit**: `isError` on failures (spec SHOULD, lets the model
+      self-correct), `anthropic/alwaysLoad` on the three core tools (skips a
+      ToolSearch round-trip), task-routing server instructions inside Codex's
+      512-char head and Claude Code's 2 KB cap, all pinned by test_contract.py.
+- [x] **Single-flight index builds**: parallel first queries on a fresh repo used
+      to start one `gtags` each (reproduced on v1.5.0: "GTAGS not found",
+      "chmod(2) failed", corruption). Live calls now get an "indexing … retry
+      shortly" status instead of blocking past a client's tool timeout.
+- [x] **One plugin folder for three clients**: Agent Plugins 1.0.0 (Codex,
+      Cursor) + Claude Code's format, sharing one navigation skill.
+
+**Done when:** an agent gets the same answers for a fraction of the tokens, and
+installing takes one command. ✅
+
+### Deferred (evidence first)
+- [ ] **Function-pointer / ops-table resolution** — the biggest remaining kernel
+      gap (`.read_iter = ext4_file_read_iter`), which neither grep nor clangd
+      resolves. Heuristic and large; wants its own eval.
+- [ ] **A discriminating agent A/B** — the existing 50-question set ties 50/50
+      because frontier models answer public-kernel questions from memory. Needs
+      multi-step tasks on unfamiliar (renamed or private) code.
+
 ---
 
 ## Known limitations (track honestly)
@@ -156,6 +198,9 @@ clients both navigate the kernel. ✅
   (e.g. `->read()` through a `file_operations`). Documented; a candidate-target
   heuristic is a future stretch goal.
 - C++ templates/overloads are weaker than C. Enrichment in step 2 helps.
+- Clients on protocol 2026-07-28 have no MCP roots (SEP-2577 deprecated them). A
+  shared HTTP server can't infer their workspace, so agents pass `project_root`.
+  Stdio servers still auto-detect from cwd.
 - Clients on protocol 2026-07-28 have no MCP roots (SEP-2577 deprecated them). A
   shared HTTP server can't infer their workspace, so agents pass `project_root`.
   Stdio servers still auto-detect from cwd.
