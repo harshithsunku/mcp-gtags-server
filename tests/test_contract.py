@@ -175,3 +175,18 @@ def test_version_is_in_sync_across_every_manifest():
     assert server_json["packages"][0]["version"] == __version__
     assert _json(PLUGIN / "plugin.json")["version"] == __version__
     assert _json(PLUGIN / ".claude-plugin" / "plugin.json")["version"] == __version__
+    cursor_entry = _json(REPO / ".cursor-plugin" / "marketplace.json")["plugins"][0]
+    assert cursor_entry["version"] == __version__
+
+
+def test_cursor_listing_assets_exist():
+    """Cursor's submission checklist wants a committed logo referenced by a
+    relative path; the path resolves under the plugin directory."""
+    entry = _json(REPO / ".cursor-plugin" / "marketplace.json")["plugins"][0]
+    logo = entry["logo"]
+    assert not logo.startswith(("/", "http")), "commit the logo, use a relative path"
+    assert (PLUGIN / logo).is_file()
+    assert (PLUGIN / logo).read_text().lstrip().startswith("<svg")
+    # Components the entry points at must exist too.
+    assert (PLUGIN / entry["skills"]).is_dir()
+    assert (PLUGIN / entry["mcpServers"]).is_file()

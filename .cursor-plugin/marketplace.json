@@ -10,7 +10,28 @@
     {
       "name": "mcp-gtags-server",
       "source": "plugin",
-      "description": "Indexed C/C++ code navigation for coding agents, powered by GNU Global (gtags): who calls a function (with each call site's source line), every usage grouped by file, call chains, and definitions with their #ifdef guard stacks \u2014 filterable by a real kernel .config. Resolves macro-generated kernel symbols (sys_read to its SYSCALL_DEFINE3 site). No build, no compile_commands.json, no sudo: the toolchain installs itself on first use and scales to the 37M-line Linux kernel."
+      "description": "Indexed C/C++ code navigation for coding agents, powered by GNU Global (gtags): who calls a function (with each call site's source line), every usage grouped by file, call chains, and definitions with their #ifdef guard stacks \u2014 filterable by a real kernel .config. Resolves macro-generated kernel symbols (sys_read to its SYSCALL_DEFINE3 site). No build, no compile_commands.json, no sudo: the toolchain installs itself on first use and scales to the 37M-line Linux kernel.",
+      "version": "2.0.0",
+      "author": {
+        "name": "Harshith Sunku",
+        "url": "https://github.com/harshithsunku"
+      },
+      "homepage": "https://harshithsunku.github.io/mcp-gtags-server/",
+      "repository": "https://github.com/harshithsunku/mcp-gtags-server",
+      "license": "MIT",
+      "category": "development",
+      "keywords": [
+        "c",
+        "cpp",
+        "kernel",
+        "code-navigation",
+        "gtags",
+        "gnu-global",
+        "code-search"
+      ],
+      "logo": "assets/logo.svg",
+      "skills": "skills",
+      "mcpServers": "mcp.json"
     }
   ]
 }
