@@ -3,9 +3,15 @@
   "plugins": [
     {
       "name": "mcp-gtags-server",
-      "source": { "source": "local", "path": "./plugin" },
-      "interface": { "displayName": "gtags code navigation" },
-      "category": "Developer Tools"
+      "source": {
+        "source": "local",
+        "path": "./plugin"
+      },
+      "interface": {
+        "displayName": "gtags code navigation"
+      },
+      "category": "Developer Tools",
+      "description": "Indexed C/C++ code navigation for coding agents, powered by GNU Global (gtags): who calls a function (with each call site's source line), every usage grouped by file, call chains, and definitions with their #ifdef guard stacks \u2014 filterable by a real kernel .config. Resolves macro-generated kernel symbols (sys_read to its SYSCALL_DEFINE3 site). No build, no compile_commands.json, no sudo: the toolchain installs itself on first use and scales to the 37M-line Linux kernel."
     }
   ]
 }
