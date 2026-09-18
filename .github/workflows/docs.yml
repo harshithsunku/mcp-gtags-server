@@ -1,0 +1,57 @@
+name: Docs
+
+# Builds the MkDocs site and publishes it to GitHub Pages
+# (https://harshithsunku.github.io/mcp-gtags-server/). Docs are part of the
+# product surface: the tool reference mirrors what the server registers, so a
+# release that changes tools should update docs/ in the same commit.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - "mkdocs.yml"
+      - ".github/workflows/docs.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deployment at a time; never cancel a run that is mid-publish.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install MkDocs Material
+        # Both majors pinned: MkDocs 2.0 removes the plugin system Material 9
+        # builds on. An uncapped dependency is how the mcp 2.0 break reached
+        # users in the first place.
+        run: pip install "mkdocs-material==9.*" "mkdocs<2"
+
+      - name: Build site (warnings are errors)
+        run: mkdocs build --strict
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

@@ -1,0 +1,81 @@
+site_name: mcp-gtags-server
+site_description: >-
+  Indexed C/C++ code navigation for AI coding agents — GNU Global (gtags)
+  lookups over MCP instead of grep scans, at kernel scale, with no build.
+site_url: https://harshithsunku.github.io/mcp-gtags-server/
+site_author: Harshith Sunku
+repo_url: https://github.com/harshithsunku/mcp-gtags-server
+repo_name: harshithsunku/mcp-gtags-server
+edit_uri: edit/main/docs/
+copyright: MIT licensed. Powered by GNU Global (gtags).
+
+# Local-only working notes (gitignored) must never reach the site.
+exclude_docs: |
+  bringup-hurdles.md
+
+theme:
+  name: material
+  icon:
+    repo: fontawesome/brands/github
+  features:
+    - navigation.sections
+    - navigation.top
+    - navigation.tracking
+    - content.code.copy
+    - content.action.edit
+    - search.highlight
+    - toc.follow
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - tables
+  - md_in_html
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+
+nav:
+  - Home: index.md
+  - Install: install.md
+  - Tools reference: tools.md
+  - Output format: output.md
+  - Kernel & C features: kernel.md
+  - Configuration: configuration.md
+  - Plugin & slash commands: plugin.md
+  - Troubleshooting: troubleshooting.md
+  - Upgrading to v2: migration.md
+  - Measured capability: capability.md
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/harshithsunku/mcp-gtags-server
+    - icon: fontawesome/brands/python
+      link: https://pypi.org/project/mcp-gtags-server/

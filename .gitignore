@@ -26,3 +26,4 @@ GSYMS
 evals/agent/results/
 # local bring-up notes
 docs/bringup-hurdles.md
+site/

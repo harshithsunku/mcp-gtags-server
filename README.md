@@ -7,6 +7,7 @@
 [![Kernel eval](https://github.com/harshithsunku/mcp-gtags-server/actions/workflows/eval.yml/badge.svg)](https://github.com/harshithsunku/mcp-gtags-server/actions/workflows/eval.yml)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Docs](https://img.shields.io/badge/docs-harshithsunku.github.io-blue)](https://harshithsunku.github.io/mcp-gtags-server/)
 [![MCP](https://img.shields.io/badge/protocol-MCP-8A2BE2)](https://modelcontextprotocol.io/)
 [![Powered by GNU Global](https://img.shields.io/badge/powered%20by-GNU%20Global-orange)](https://www.gnu.org/software/global/)
 [![Install in Cursor](https://img.shields.io/badge/Cursor-one--click%20install-black)](https://cursor.com/en/install-mcp?name=gtags&config=eyJjb21tYW5kIjoidXZ4IiwiYXJncyI6WyJtY3AtZ3RhZ3Mtc2VydmVyIl19)
@@ -23,6 +24,8 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
 *One user-level config entry, no sudo, no pre-installed anything — the whole toolchain installs itself into user space on first use, and every repo you open is served automatically.*
+
+📖 **[Full documentation](https://harshithsunku.github.io/mcp-gtags-server/)** — install for every client, the tool reference, output format, kernel features, configuration and troubleshooting.
 
 Every AI coding agent — Claude Code, Cursor, Codex, you name it — answers *"where is this function defined?"* the same way: **grep the entire tree**. On a million-line C/C++ codebase that's a full scan per question, and the output is a firehose: every comment, string literal, and unrelated match, dumped straight into the model's context window.
 

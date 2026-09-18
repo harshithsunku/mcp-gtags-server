@@ -23,6 +23,8 @@ Recognised keys (all optional)::
     enrich = true                   # ctags kind/signature/scope on results
     guards = true                   # #ifdef guard stacks on results
     macro_resolve = true            # resolve macro-generated symbols (sys_*, ...)
+    cwd_fallback = true             # use the server's cwd as project root when
+                                    # nothing else resolves one
 """
 
 from __future__ import annotations
@@ -48,6 +50,7 @@ _VALID_KEYS = frozenset(
         "enrich",
         "guards",
         "macro_resolve",
+        "cwd_fallback",
     }
 )
 

@@ -13,7 +13,7 @@ This page is the measured version of that claim.
 `mcp-gtags-server eval --golden evals/golden.jsonl --root <kernel-tree>` runs
 a 64-case golden set — covering **all 8 tools** — against a real kernel
 checkout (CI pins one tag and publishes the score on every push to main — see
-[eval.yml](../.github/workflows/eval.yml)). Cases assert expected paths,
+[eval.yml](https://github.com/harshithsunku/mcp-gtags-server/blob/main/.github/workflows/eval.yml)). Cases assert expected paths,
 callers, definition bodies, callees, per-file counts, guard variants,
 suggestions, fallbacks, and reachability outcomes; expectations are
 path-level so they hold across kernel versions.
@@ -105,7 +105,7 @@ costs ~0.25 s once (then cached). Disabled together with enrichment
 
 ## Operational profile (measured)
 
-[scripts/stability_exercise.py](../scripts/stability_exercise.py) runs a
+[scripts/stability_exercise.py](https://github.com/harshithsunku/mcp-gtags-server/blob/main/scripts/stability_exercise.py) runs a
 26-call matrix over all 8 tools against a real kernel tree and records
 latency and response size, both for the JSON envelope and for the compact
 text agents get by default (`--json` for diffing between runs). Measured on

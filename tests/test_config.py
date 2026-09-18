@@ -92,3 +92,19 @@ def test_project_config_cached_per_directory(tmp_path, user_config):
     assert config.get_setting("label", tmp_path) == "default"
     config.reset_cache()
     assert config.get_setting("label", tmp_path) == "changed"
+
+
+def test_cwd_fallback_is_a_recognised_setting(tmp_path, monkeypatch):
+    """The knob is advertised by --no-cwd-fallback's help, so a config file
+    must actually be able to set it (unknown keys are silently dropped)."""
+    from gtags_mcp import server
+
+    (tmp_path / config.PROJECT_CONFIG_NAME).write_text("cwd_fallback = false\n")
+    assert config.load_project_config(tmp_path) == {"cwd_fallback": False}
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(server, "_no_cwd_fallback", False)
+    monkeypatch.delenv("GTAGS_MCP_CWD_FALLBACK", raising=False)
+    # A user-config-only knob: the project config for a root we haven't resolved
+    # yet can't gate root resolution, so read it the way the server does.
+    assert config.get_bool_setting("cwd_fallback", tmp_path, default=True) is False
