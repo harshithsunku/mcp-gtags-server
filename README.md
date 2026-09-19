@@ -234,7 +234,20 @@ Precedence: tool-call argument > CLI flag > environment variable > project confi
 
 </details>
 
-## The tools
+## Tools
+
+Eight tools, all read-only except `update_index`. Each takes `project_root` and
+`format` (`"text"` default, `"json"`); list-shaped tools also take `limit`/`offset`.
+Full parameter reference: [docs → Tools](https://harshithsunku.github.io/mcp-gtags-server/tools/).
+
+- **find_definition** — Go to definition: every definition with its `#ifdef` guard stack and ctags kind/signature, plus a usage summary (reference/file counts, hottest files, `EXPORT_SYMBOL*` status). Resolves macro-generated names (`sys_read` → `SYSCALL_DEFINE3`).
+- **find_references** — Every usage site with its guard stack; above 200 references it returns a per-file distribution, and `path_prefix` narrows it to one directory.
+- **get_symbol_body** — The source of one definition (function, struct, or multi-line macro), not the whole file.
+- **find_callers** — Who calls this function: references mapped to their enclosing functions, deduplicated, with call counts and call lines.
+- **find_callees** — What this function calls: call sites taken from its body and checked against the index, split into in-tree (with locations) and external.
+- **reachability** — The shortest static call chain from function A to function B, with the file:line of every hop, or "no static path".
+- **list_file_symbols** — Every symbol a file defines (its API surface).
+- **update_index** — Synchronous index refresh after edits; `full=true` rebuilds from scratch. The only tool that writes.
 
 ### Symbol-level tools — the noise killers
 
@@ -259,6 +272,21 @@ Precedence: tool-call argument > CLI flag > environment variable > project confi
 Every query tool supports `limit`/`offset` pagination, long-line truncation, and (where it makes sense) `case_insensitive` — output is *engineered* to never flood a context window.
 
 Every tool also declares MCP tool annotations: all are `readOnlyHint: true` except `update_index`, and none reach outside your machine (`openWorldHint: false`). Clients use these hints to auto-approve and parallelize read-only calls. Each response carries the envelope exactly once, as text content, with no duplicate `structuredContent` copy.
+
+### The flow that saves your context window
+
+```text
+1. find_definition("kmalloc")                → definitions + #ifdef variants + usage spread (3 lines)
+2. find_callers("ext4_mark_inode_dirty")     → deduped callers, each with its call line
+3. get_symbol_body("tcp_v4_rcv")             → read the ONE function that matters
+4. find_callees("tcp_v4_rcv")                → what it depends on, with locations
+5. reachability("ksys_read", "rw_verify_area") → the call chain, one line per hop
+6. find_references("mutex_lock", path_prefix="fs/ext4") → hot symbol, one subsystem
+```
+
+A few hundred lines of context total — versus tens of thousands for the grep-and-read-files equivalent.
+
+## Output and kernel smarts
 
 ### Output: compact text by default, JSON on request
 
@@ -388,19 +416,6 @@ Indexing feeds `gtags` an explicit file list instead of letting it walk the tree
 - `skip_globs` in `.gtags-mcp.toml` drops anything else you never want indexed.
 
 Incremental refreshes recollect the list, so newly ignored files drop out of the index and new files appear — automatically.
-
-### The flow that saves your context window
-
-```text
-1. find_definition("kmalloc")                → definitions + #ifdef variants + usage spread (3 lines)
-2. find_callers("ext4_mark_inode_dirty")     → deduped callers, each with its call line
-3. get_symbol_body("tcp_v4_rcv")             → read the ONE function that matters
-4. find_callees("tcp_v4_rcv")                → what it depends on, with locations
-5. reachability("ksys_read", "rw_verify_area") → the call chain, one line per hop
-6. find_references("mutex_lock", path_prefix="fs/ext4") → hot symbol, one subsystem
-```
-
-A few hundred lines of context total — versus tens of thousands for the grep-and-read-files equivalent.
 
 ## Multi-language projects (C + Python + more)
 
